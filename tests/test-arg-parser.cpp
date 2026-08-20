@@ -339,6 +339,47 @@ static void test(void) {
         assert(common_context_params_to_llama(mode_params).moe_cache_mode == LLAMA_MOE_CACHE_MODE_OFF);
     }
 
+printf("test-arg-parser: test fit-strategy flags\n\n");
+
+    // unknown strategy value -> parse fails, and the converter throws with a message
+    {
+        common_params fit_params;
+        argv = {"binary_name", "--fit-strategy", "bogus"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), fit_params, LLAMA_EXAMPLE_CLI));
+
+        bool threw = false;
+        try {
+            common_fit_strategy_from_string("bogus");
+        } catch (const std::invalid_argument & e) {
+            threw = true;
+            assert(std::string(e.what()).find("unknown fit strategy") != std::string::npos);
+        }
+        assert(threw);
+    }
+
+    // rpc-aware without the required floor -> parse fails
+    {
+        common_params fit_params;
+        argv = {"binary_name", "--fit-strategy", "rpc-aware"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), fit_params, LLAMA_EXAMPLE_CLI));
+    }
+
+    // rpc-aware with the floor but fit disabled -> parse fails
+    {
+        common_params fit_params;
+        argv = {"binary_name", "--fit-strategy", "rpc-aware", "--fit-strategy-min-ctx", "1024", "-fit", "off"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), fit_params, LLAMA_EXAMPLE_CLI));
+    }
+
+    // case-insensitive strategy name with the floor -> parses OK
+    {
+        common_params fit_params;
+        argv = {"binary_name", "-m", "model.gguf", "--fit-strategy", "MAXCTX", "--fit-strategy-min-ctx", "1024"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), fit_params, LLAMA_EXAMPLE_CLI));
+        assert(fit_params.fit_strategy == COMMON_FIT_STRATEGY_MAXCTX);
+        assert(fit_params.fit_strategy_min_ctx == 1024);
+    }
+
 // skip this part on windows, because setenv is not supported
 #ifdef _WIN32
     printf("test-arg-parser: skip on windows build\n");

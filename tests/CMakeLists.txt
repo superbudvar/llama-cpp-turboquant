@@ -293,6 +293,9 @@ endif()
 
 llama_build_and_test(test-moe-cache-fit.cpp)
 
+llama_build_and_test(test-fit-strategy.cpp ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-fit-strategy PROPERTIES FIXTURES_REQUIRED test-download-model)
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
