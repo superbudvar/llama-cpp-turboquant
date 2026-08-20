@@ -5,9 +5,12 @@
 
 #include "log.h"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <cinttypes>
 #include <cstring>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -916,4 +919,29 @@ common_fit_strategy common_fit_strategy_from_string(const std::string & s) {
     if (s == "rpc-aware") { return COMMON_FIT_STRATEGY_RPC_AWARE; }
     if (s == "maxctx")    { return COMMON_FIT_STRATEGY_MAXCTX;    }
     throw std::invalid_argument("unknown fit strategy: " + s);
+}
+
+bool common_activation_profile_sink(const common_activation_profile & profile, const std::string & path) {
+    nlohmann::ordered_json row;
+    row["version"]  = profile.version;
+    row["model_id"] = profile.model_id;
+
+    nlohmann::ordered_json counters = nlohmann::ordered_json::array();
+    for (const auto & c : profile.counters) {
+        nlohmann::ordered_json j;
+        j["tensor_id"]  = c.tensor_id;
+        j["role"]       = (int) c.role;
+        j["n_tokens"]   = c.n_tokens;
+        j["expert_set"] = c.expert_set;
+        j["kv_touched"] = c.kv_touched;
+        counters.push_back(j);
+    }
+    row["counters"] = counters;
+
+    std::ofstream out(path, std::ios::app);
+    if (!out.is_open()) {
+        return false;
+    }
+    out << row.dump() << '\n';
+    return (bool) out;
 }
