@@ -462,6 +462,14 @@ struct common_moe_cache_params {
     bool fit_selected          = false;
 };
 
+enum common_fit_strategy {
+    COMMON_FIT_STRATEGY_UPSTREAM = 0,
+    COMMON_FIT_STRATEGY_RPC_AWARE,
+    COMMON_FIT_STRATEGY_MAXCTX,
+};
+
+common_fit_strategy common_fit_strategy_from_string(const std::string & s);
+
 struct common_params {
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
@@ -493,6 +501,9 @@ struct common_params {
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
     bool    fit_params_print   = false; // print the estimated required memory to run the model
     int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use
+
+    common_fit_strategy fit_strategy       = COMMON_FIT_STRATEGY_UPSTREAM; // selectable fit engine
+    int32_t             fit_strategy_min_ctx = 0; // strategy floor, 0 = unset -> required for non-upstream
 
     // margin per device in bytes for fitting parameters to free memory:
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);
