@@ -915,5 +915,5 @@ common_fit_strategy common_fit_strategy_from_string(const std::string & s) {
     if (s == "upstream")  { return COMMON_FIT_STRATEGY_UPSTREAM;  }
     if (s == "rpc-aware") { return COMMON_FIT_STRATEGY_RPC_AWARE; }
     if (s == "maxctx")    { return COMMON_FIT_STRATEGY_MAXCTX;    }
-    return COMMON_FIT_STRATEGY_UPSTREAM;
+    throw std::invalid_argument("unknown fit strategy: " + s);
 }
