@@ -3042,6 +3042,34 @@ int32_t llama_model_n_expert(const struct llama_model * model) {
     return model->hparams.n_expert;
 }
 
+int32_t llama_model_n_expert_used(const struct llama_model * model) {
+    return model->hparams.n_expert_used;
+}
+
+size_t llama_model_get_tensor_devices(
+        const llama_model * model,
+        llama_tensor_device_info * info,
+        size_t capacity) {
+    size_t count = 0;
+    for (const auto & [name, tensor] : model->tensors_by_name) {
+        ggml_backend_dev_t dev = nullptr;
+        bool host = false;
+        if (tensor->buffer != nullptr) {
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(tensor->buffer);
+            dev  = ggml_backend_buft_get_device(buft);
+            host = ggml_backend_buft_is_host(buft);
+        }
+        if (info != nullptr && count < capacity) {
+            info[count].name  = name.c_str();
+            info[count].dev   = dev;
+            info[count].bytes = ggml_nbytes(tensor);
+            info[count].host  = host;
+        }
+        count++;
+    }
+    return count;
+}
+
 size_t llama_model_get_moe_tensor_info(
         const llama_model * model,
         llama_moe_tensor_info * info,

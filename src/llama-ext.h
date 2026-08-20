@@ -84,6 +84,7 @@ struct llama_device_memory_data {
 using llama_memory_breakdown = std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data>;
 
 LLAMA_API int32_t llama_model_n_expert (const struct llama_model * model);
+LLAMA_API int32_t llama_model_n_expert_used(const struct llama_model * model);
 LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 
 struct llama_moe_tensor_info {
@@ -103,6 +104,22 @@ LLAMA_API size_t llama_model_get_moe_tensor_info(
         size_t capacity);
 
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
+
+// Per-tensor device assignment, only meaningful after buffers are assigned
+// (e.g. after a no_alloc model load, which sets dummy buffers).
+struct llama_tensor_device_info {
+    const char * name;       // stable GGUF tensor name, valid while the model is alive
+    ggml_backend_dev_t dev;  // device the tensor is assigned to; nullptr for host (CPU) buffers
+    size_t bytes;            // ggml_nbytes(tensor)
+    bool host;               // buffer is host-accessible (CPU override path can use device host buffers)
+};
+
+// Fills info with the per-tensor device assignment. Returns the number of tensors.
+// If info is nullptr, only returns the count.
+LLAMA_API size_t llama_model_get_tensor_devices(
+        const struct llama_model * model,
+        struct llama_tensor_device_info * info,
+        size_t capacity);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
