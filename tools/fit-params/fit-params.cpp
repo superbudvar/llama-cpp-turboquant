@@ -4,6 +4,7 @@
 #include "arg.h"
 #include "common.h"
 #include "fit.h"
+#include "fit-strategy.h"
 #include "log.h"
 
 #include <cinttypes>
@@ -31,10 +32,13 @@ int llama_fit_params(int argc, char ** argv) {
     auto cparams = common_context_params_to_llama(params);
 
     if (!params.fit_params_print) {
-        const common_params_fit_status status = common_fit_params(params.model.path.c_str(), &mparams, &cparams,
-                params.tensor_split, params.tensor_buft_overrides.data(), &params.moe_cache,
-                params.fit_params_target.data(), params.fit_params_min_ctx,
-                params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+        const common_params_fit_status status =
+            params.fit_strategy != COMMON_FIT_STRATEGY_UPSTREAM
+            ? common_fit_strategy_apply(params, &mparams, &cparams)
+            : common_fit_params(params.model.path.c_str(), &mparams, &cparams,
+                    params.tensor_split, params.tensor_buft_overrides.data(), &params.moe_cache,
+                    params.fit_params_target.data(), params.fit_params_min_ctx,
+                    params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
         if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
             LOG_ERR("%s: failed to fit CLI arguments to free memory, exiting...\n", __func__);
             exit(1);

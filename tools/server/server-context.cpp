@@ -10,6 +10,7 @@
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
+#include "fit-strategy.h"
 #include "llama.h"
 #include "log.h"
 #include "sampling.h"
@@ -67,6 +68,11 @@ struct server_shared_draft_device_config {
     std::vector<float> tensor_split;
 };
 
+static bool server_device_is_rpc(ggml_backend_dev_t device) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+    return reg && std::string(ggml_backend_reg_name(reg)) == "RPC";
+}
+
 static std::vector<ggml_backend_dev_t> server_configured_devices(const common_params & params) {
     std::vector<ggml_backend_dev_t> result;
     if (!params.devices.empty()) {
@@ -95,8 +101,7 @@ static std::vector<ggml_backend_dev_t> server_configured_devices(const common_pa
             continue;
         }
 
-        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
-        if (reg && std::string(ggml_backend_reg_name(reg)) == "RPC") {
+        if (server_device_is_rpc(device)) {
             rpc_devices.push_back(device);
             continue;
         }
@@ -122,15 +127,43 @@ static std::vector<ggml_backend_dev_t> server_configured_devices(const common_pa
     return result;
 }
 
-static std::vector<ggml_backend_dev_t> server_target_fit_devices(const common_params & params) {
+// Fit margin attribution target devices, given an explicit main-gpu index.
+// This runs BEFORE the fit-strategy candidate loop (which runs later), so the
+// caller passes the strategy's effective main gpu, not the user's raw one.
+static std::vector<ggml_backend_dev_t> server_target_fit_devices_for(const common_params & params, int main_gpu_override) {
     std::vector<ggml_backend_dev_t> devices = server_configured_devices(params);
     if (params.split_mode != LLAMA_SPLIT_MODE_NONE) {
         return devices;
     }
-    if (params.main_gpu < 0 || (size_t) params.main_gpu >= devices.size()) {
+    if (main_gpu_override < 0 || (size_t) main_gpu_override >= devices.size()) {
         return {};
     }
-    return { devices[params.main_gpu] };
+    return { devices[main_gpu_override] };
+}
+
+static std::vector<ggml_backend_dev_t> server_target_fit_devices(const common_params & params) {
+    return server_target_fit_devices_for(params, params.main_gpu);
+}
+
+// The rpc-aware strategy overrides main_gpu when the user's main_gpu device is
+// an RPC endpoint (which the strategy cannot use as a compute target). Return
+// the first non-RPC device in that case so margins land where the strategy
+// will actually measure. Other strategies keep params.main_gpu as-is.
+static int server_effective_main_gpu(const common_params & params) {
+    if (params.fit_strategy != COMMON_FIT_STRATEGY_RPC_AWARE) {
+        return params.main_gpu;
+    }
+    const std::vector<ggml_backend_dev_t> devices = server_configured_devices(params);
+    if (params.main_gpu < 0 || (size_t) params.main_gpu >= devices.size() ||
+            !server_device_is_rpc(devices[params.main_gpu])) {
+        return params.main_gpu;
+    }
+    for (size_t i = 0; i < devices.size(); i++) {
+        if (!server_device_is_rpc(devices[i])) {
+            return (int) i;
+        }
+    }
+    return params.main_gpu;
 }
 
 static server_shared_draft_device_config server_prepare_shared_draft_devices(const common_params & params) {
@@ -1254,6 +1287,10 @@ private:
         params_base = params_load;
         params_base.n_outputs_max = server_n_outputs_max(params_base);
 
+        // Re-attribute the mtmd/MTP margins to the fit strategy's effective
+        // main gpu. This runs BEFORE the strategy's own candidate loop.
+        const int fit_main_gpu = server_effective_main_gpu(params_base);
+
         const bool has_mmproj = !params_base.mmproj.path.empty();
         const bool has_draft = params_base.speculative.has_dft();
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
@@ -1330,7 +1367,7 @@ private:
                 }
                 SRV_TRC("[mtmd] estimated worst-case memory usage of mmproj is %.2f MiB (took %.2f ms)\n", total / (1024.0 * 1024.0), t_elapsed / 1000.0);
                 GGML_ASSERT(!params_base.fit_params_target.empty());
-                const std::vector<ggml_backend_dev_t> target_fit_devices = server_target_fit_devices(params_base);
+                const std::vector<ggml_backend_dev_t> target_fit_devices = server_target_fit_devices_for(params_base, fit_main_gpu);
                 for (auto & [dev, size] : mmproj_mem) {
                     for (size_t i = 0; i < target_fit_devices.size(); i++) {
                         if (target_fit_devices[i] == dev) {
@@ -1434,7 +1471,7 @@ private:
                     GGML_ASSERT(!params_base.fit_params_target.empty());
                     size_t total = 0;
 
-                    const std::vector<ggml_backend_dev_t> tgt_devices = server_target_fit_devices(params_base);
+                    const std::vector<ggml_backend_dev_t> tgt_devices = server_target_fit_devices_for(params_base, fit_main_gpu);
 
                     for (const auto & [device, bytes] : reservations) {
                         total += bytes;

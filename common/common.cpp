@@ -4,6 +4,7 @@
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
+#include "fit-strategy.h"
 #include "log.h"
 #include "llama.h"
 #include "sampling.h"
@@ -1255,14 +1256,17 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.tensor_buft_overrides;
         const common_moe_cache_params moe_cache_before = params.moe_cache;
 
-        const common_params_fit_status fit_status = common_fit_params(
-            params.model.path.c_str(), &mparams, &cparams,
-            params.tensor_split,
-            params.tensor_buft_overrides.data(),
-            &params.moe_cache,
-            params.fit_params_target.data(),
-            params.fit_params_min_ctx,
-            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+        const common_params_fit_status fit_status =
+            params.fit_strategy != COMMON_FIT_STRATEGY_UPSTREAM
+            ? common_fit_strategy_apply(params, &mparams, &cparams)
+            : common_fit_params(
+                params.model.path.c_str(), &mparams, &cparams,
+                params.tensor_split,
+                params.tensor_buft_overrides.data(),
+                &params.moe_cache,
+                params.fit_params_target.data(),
+                params.fit_params_min_ctx,
+                params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
         if (fit_status == COMMON_PARAMS_FIT_STATUS_ERROR) {
             throw std::runtime_error(
                 "failed to fit parameters to device memory (hard error); retry with -fit off");

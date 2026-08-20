@@ -505,6 +505,8 @@ struct common_params {
     common_fit_strategy fit_strategy       = COMMON_FIT_STRATEGY_UPSTREAM; // selectable fit engine
     int32_t             fit_strategy_min_ctx = 0; // strategy floor, 0 = unset -> required for non-upstream
 
+    std::vector<std::string> rpc_hosts; // RPC server hosts captured at parse time (cold-start signal)
+
     // margin per device in bytes for fitting parameters to free memory:
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);
 

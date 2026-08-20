@@ -25,6 +25,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cinttypes>
 #include <climits>
@@ -1262,6 +1263,18 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
         const bool adaptive_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != params.speculative.types.end();
         if (adaptive_mtp && (params.speculative.draft.n_min_adaptive < 1 || params.speculative.draft.n_min_adaptive > params.speculative.draft.n_max)) {
             throw std::invalid_argument("error: --spec-draft-n-min-adaptive must be in [1, --spec-draft-n-max]");
+        }
+
+        // fit-strategy cross-flag validation, scoped to fit-capable tools.
+        // tokenize, batched-bench, and export-lora accept --fit-strategy but ignore it.
+        if (params.fit_strategy != COMMON_FIT_STRATEGY_UPSTREAM &&
+                ex != LLAMA_EXAMPLE_TOKENIZE && ex != LLAMA_EXAMPLE_BENCH && ex != LLAMA_EXAMPLE_EXPORT_LORA) {
+            if (params.fit_strategy_min_ctx == 0) {
+                throw std::invalid_argument("--fit-strategy requires --fit-strategy-min-ctx");
+            }
+            if (!params.fit_params) {
+                throw std::invalid_argument("--fit-strategy cannot be used with -fit off");
+            }
         }
 
         params.lr.init();
@@ -2592,7 +2605,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "comma-separated list of RPC servers (host:port)",
             [](common_params & params, const std::string & value) {
                 add_rpc_devices(value);
-                GGML_UNUSED(params);
+                for (const auto & host : string_split<std::string>(value, ',')) {
+                    params.rpc_hosts.push_back(host);
+                }
             }
         ).set_env("LLAMA_ARG_RPC"));
     }
@@ -2748,6 +2763,50 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_MOE_CACHE"));
+    add_opt(common_arg(
+        {"--fit-strategy"}, "NAME",
+        "fit engine to use: upstream, rpc-aware, or maxctx "
+        "(requires --fit-strategy-min-ctx; cannot be combined with -fit off)",
+        [](common_params & params, const std::string & value) {
+            std::string name = value;
+            std::transform(name.begin(), name.end(), name.begin(),
+                [](unsigned char c) { return std::tolower(c); });
+            params.fit_strategy = common_fit_strategy_from_string(name);
+        }
+    ).set_examples({
+        LLAMA_EXAMPLE_CLI,
+        LLAMA_EXAMPLE_SERVER,
+        LLAMA_EXAMPLE_PERPLEXITY,
+        LLAMA_EXAMPLE_IMATRIX,
+        LLAMA_EXAMPLE_TTS,
+        LLAMA_EXAMPLE_COMPLETION,
+        LLAMA_EXAMPLE_RESULTS,
+        LLAMA_EXAMPLE_CVECTOR_GENERATOR,
+        LLAMA_EXAMPLE_MTMD,
+        LLAMA_EXAMPLE_FIT_PARAMS,
+    }).set_env("LLAMA_ARG_FIT_STRATEGY"));
+    add_opt(common_arg(
+        {"--fit-strategy-min-ctx"}, "N",
+        string_format("minimum context size to set when reducing memory use with --fit-strategy (default: %" PRIu32 ")",
+            params.fit_strategy_min_ctx),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("--fit-strategy-min-ctx must be a positive integer");
+            }
+            params.fit_strategy_min_ctx = value;
+        }
+    ).set_examples({
+        LLAMA_EXAMPLE_CLI,
+        LLAMA_EXAMPLE_SERVER,
+        LLAMA_EXAMPLE_PERPLEXITY,
+        LLAMA_EXAMPLE_IMATRIX,
+        LLAMA_EXAMPLE_TTS,
+        LLAMA_EXAMPLE_COMPLETION,
+        LLAMA_EXAMPLE_RESULTS,
+        LLAMA_EXAMPLE_CVECTOR_GENERATOR,
+        LLAMA_EXAMPLE_MTMD,
+        LLAMA_EXAMPLE_FIT_PARAMS,
+    }).set_env("LLAMA_ARG_FIT_STRATEGY_MIN_CTX"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",
