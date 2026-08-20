@@ -66,3 +66,12 @@ llama-quantize model-f16.gguf model-tq4.gguf TQ4_1S
 `TQ3_1S` and `TQ4_1S` are first-class weight types with CUDA/HIP (warp
 cooperative mmvq), Metal, and Vulkan kernels. MoE models disable CUDA graphs
 for TQ `MUL_MAT_ID` automatically.
+
+## Fit strategies
+
+`--fit-strategy` selects the fit engine that sizes the model placement and the
+KV cache together (`docs/fit-strategies.md`). `maxctx` and `rpc-aware` take a
+context floor from `--fit-strategy-min-ctx`. When the cache types are set (for
+example `--cache-type-k q8_0 --cache-type-v turbo3`), the fit measurement
+accounts for the quantized KV working set, so the fitted `n_ctx` respects the
+selected cache types.

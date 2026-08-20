@@ -77,6 +77,17 @@ The cache only sees experts assigned to host memory. Cache-aware fit uses a no-a
 
 The cache considers only backends selected for the scheduler. It does not discover or use an unselected device.
 
+### Budget policy with fit strategies
+
+The `rpc-aware` and `maxctx` fit strategies (`docs/fit-strategies.md`) compute a
+bounded pool grant with `common_fit_strategy_pool_budget`:
+
+- explicit `--moe-cache N` wins over the strategy budget;
+- otherwise `min(clamp(remaining/2, max(2*working_set, 256 MiB), 4 GiB), remaining)`;
+- when `remaining < floor` the grant is 0 and the strategy disables the cache
+  explicitly (`mode=off`). A 0 budget with `mode=on` means "unlimited" in the
+  cache layer, so the disable must be explicit.
+
 ## Eligibility and allocation
 
 With default settings, a node must satisfy all of these conditions:
