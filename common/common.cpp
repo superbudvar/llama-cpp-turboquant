@@ -1374,6 +1374,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         return;
     }
 
+    LOG_TMPL(GGML_LOG_LEVEL_INFO, LOG_LEVEL_INFO, "MODEL READY - device memory breakdown for '%s':", params.model.path.c_str());
+    common_memory_breakdown_print(lctx);
+
     pimpl->context.reset(lctx);
 }
 
@@ -1510,6 +1513,11 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         llama_memory_clear(llama_get_memory(lctx), true);
         llama_synchronize(lctx);
         llama_perf_context_reset(lctx);
+
+        // record post-warmup per-device overhead into the fit stats cache so
+        // later loads honor the per-device margin (captures draft model +
+        // graph scratch + ROCm lazy-map internals the reserved-size breakdown omits)
+        common_fit_record_stats(params.model.path, lctx);
 
         // reset samplers to reset RNG state after warmup to the seeded state
         res->reset_samplers();

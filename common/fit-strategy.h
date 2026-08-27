@@ -122,3 +122,10 @@ struct common_activation_profile {
 
 // JSONL sink: write one profile row. Returns true on success.
 bool common_activation_profile_sink(const common_activation_profile & profile, const std::string & path);
+
+// Device ID query functions for proper backend device mapping
+// Get the actual GGML backend device index for a logical device index
+LLAMA_API int llama_model_get_backend_device_id(const struct llama_model * model, int device_index);
+
+// Get a device handle by backend device index
+LLAMA_API ggml_backend_dev_t llama_model_get_device_by_backend_id(const struct llama_model * model, int backend_device_id);

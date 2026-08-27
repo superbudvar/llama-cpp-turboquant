@@ -1416,6 +1416,18 @@ private:
                             path_dft, &mparams_measure, &cparams_dft,
                             params_base.model.path.c_str(), &mparams_parent, &cparams_tgt,
                             measured_devs, measured_ngl, measured_nct, measured_nex, GGML_LOG_LEVEL_ERROR);
+                        if (!spec_mtp) {
+                            return data;
+                        }
+
+                        // MTP runs a separate predictor context that reuses the target
+                        // model's mmap'd weights. its incremental VRAM (the predictor's
+                        // own KV cache and compute buffers) is already captured by the
+                        // spec measurement above (data[i].context + data[i].compute).
+                        // the target model's compute is reserved separately by the fit's
+                        // own main-model measurement, so do NOT add it here: that would
+                        // double-count the target's compute buffers and over-reserve VRAM,
+                        // which makes rpc-aware reject every split and fall back to stock.
                         return data;
                     };
 

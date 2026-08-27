@@ -3,6 +3,7 @@
 #include "../src/llama-ext.h" // llama_model_get_moe_tensor_info, llama_model_get_tensor_devices (internal)
 #include "common.h"
 
+
 #include "log.h"
 
 #include <nlohmann/json.hpp>
@@ -11,6 +12,7 @@
 #include <cinttypes>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -126,24 +128,6 @@ static int fit_effective_main_gpu(const common_fit_analysis & analysis, int user
     return analysis.devices.empty() ? -1 : analysis.devices[0].id;
 }
 
-// rpc-aware: shift the margin of an RPC main_gpu onto the first non-RPC device.
-// margins are indexed by model device order (same space as analysis.devices).
-static void fit_reattribute_margins(
-        std::vector<size_t> & margins, const common_fit_analysis & analysis, int user_main_gpu) {
-    if (user_main_gpu < 0 || user_main_gpu >= (int) analysis.devices.size()) {
-        return;
-    }
-    if (!analysis.devices[user_main_gpu].is_rpc) {
-        return;
-    }
-    for (const auto & d : analysis.devices) {
-        if (!d.is_rpc && d.id < (int) margins.size() && user_main_gpu < (int) margins.size()) {
-            std::swap(margins[user_main_gpu], margins[d.id]);
-            return;
-        }
-    }
-}
-
 struct fit_measure_result {
     common_device_memory_data_vec memory;
     std::vector<ggml_backend_dev_t> devs;
@@ -183,22 +167,38 @@ static bool fit_measure_plan(
                 out.devs, out.hp_ngl, out.hp_nct, out.hp_nex, GGML_LOG_LEVEL_INFO);
     } catch (const std::runtime_error & e) {
         if (std::string(e.what()).find("failed to create llama_context") != std::string::npos) {
+            LOG_DBG("%s: fit_measure_plan FAIL (no context) n_ctx=%u split0=%.3f\n",
+                    __func__, cc.n_ctx, cp.tensor_split ? cp.tensor_split[0] : -1.0f);
             return false;
         }
         throw;
     }
+    LOG_DBG("%s: fit_measure_plan OK n_ctx=%u split0=%.3f ndevs=%zu\n",
+            __func__, cc.n_ctx, cp.tensor_split ? cp.tensor_split[0] : -1.0f,
+            out.devs.size());
     return true;
 }
 
 static bool fit_same_devices(const std::vector<ggml_backend_dev_t> & devs, const common_fit_analysis & analysis) {
     if (devs.size() != analysis.devices.size()) {
+        LOG_DBG("%s: fit_same_devices FAIL size devs=%zu analysis=%zu\n",
+                __func__, devs.size(), analysis.devices.size());
         return false;
     }
     for (size_t i = 0; i < devs.size(); i++) {
-        if (devs[i] != analysis.devices[i].dev) {
+        const char * ndev = devs[i] ? ggml_backend_dev_name(devs[i]) : "(null)";
+        const char * nad  = analysis.devices[i].dev ? ggml_backend_dev_name(analysis.devices[i].dev) : "(null)";
+        const bool same = devs[i] == analysis.devices[i].dev;
+        LOG_DBG("%s: fit_same_devices[%zu] probe=%s (%p) analysis=%s (%p) match=%d\n",
+                __func__, i, ndev, (const void *) devs[i], nad, (const void *) analysis.devices[i].dev,
+                same ? 1 : 0);
+        if (!same) {
+            LOG_DBG("%s: fit_same_devices FAIL at index %zu (name probe=%s analysis=%s)\n",
+                    __func__, i, ndev, nad);
             return false;
         }
     }
+    LOG_DBG("%s: fit_same_devices PASS (%zu devices)\n", __func__, devs.size());
     return true;
 }
 
@@ -210,16 +210,41 @@ static int64_t fit_device_used(const common_device_memory_data & dmd) {
 static bool fit_fits_margins(
         const common_device_memory_data_vec & memory,
         const std::vector<int64_t> & margins,
-        size_t nd) {
+        const common_fit_analysis & analysis) {
+    const size_t nd = analysis.devices.size();
+    LOG_DBG("%s: memory.size()=%zu nd+1=%zu margins.size()=%zu nd=%zu\n",
+            __func__, memory.size(), nd + 1, margins.size(), nd);
     if (memory.size() != nd + 1 || margins.size() < nd) {
+        LOG_DBG("%s: fit_fits_margins FAIL size guard\n", __func__);
         return false;
     }
     for (size_t id = 0; id < nd; id++) {
-        if (fit_device_used(memory[id]) > INT64_MAX ||
-            memory[id].free - fit_device_used(memory[id]) < margins[id]) {
+        const int64_t used = (int64_t) fit_device_used(memory[id]);
+        // Use the cold-captured free VRAM (analysis.devices[id].free_bytes), not
+        // the live free re-queried inside each measurement probe. Every candidate
+        // measurement allocates a context on the GPU and ROCm's buffer pool
+        // retains those allocations, so the live free shrinks across the loop.
+        // The last candidate's check would then see a falsely-small headroom and
+        // collapse to the minimum context, while the larger contexts the earlier
+        // passes proved are discarded. The real model load reuses the same pool
+        // buffers, so the cold free is the correct basis for the fit. The model,
+        // context and compute sizes come from the GGUF/tensor metadata via
+        // llama_get_memory_breakdown, so `used` is exact.
+        const int64_t free_cold = analysis.devices[id].free_bytes;
+        const int64_t rem = free_cold - used;
+        LOG_DBG("%s: dev[%zu] free_cold=%lld used=%lld (m%d c%d k%d) rem=%lld margin=%lld -> %s\n",
+                __func__, id,
+                (long long) free_cold, (long long) used,
+                (int) memory[id].model, (int) memory[id].context, (int) memory[id].compute,
+                (long long) rem, (long long) margins[id],
+                (used > INT64_MAX || rem < margins[id]) ? "REJECT" : "ok");
+        if (used > INT64_MAX ||
+            rem < margins[id]) {
+            LOG_DBG("%s: fit_fits_margins FAIL dev[%zu]\n", __func__, id);
             return false;
         }
     }
+    LOG_DBG("%s: fit_fits_margins PASS\n", __func__);
     return true;
 }
 
@@ -362,47 +387,210 @@ struct fit_candidate_spec {
 };
 
 // build a plan from a candidate spec. n_ctx <= 0 means "leave cparams untouched".
+// ngl_override >= 0 forces a partial offload (CPU spill); -1 means full offload.
 static common_fit_plan fit_plan_from_spec(
         const common_fit_analysis & analysis,
         const fit_candidate_spec & spec,
         uint32_t hp_ngl,
-        int32_t n_ctx) {
+        int32_t n_ctx,
+        float rpc_frac_override = -1.0f,
+        int32_t ngl_override = -1) {
     common_fit_plan plan;
     plan.role_devices.assign(8, -1);
     const int dense_main = spec.dense_main;
 
+    // device ID mapping guard: dense_main and pool must be valid logical indices
+    if (dense_main < 0 || dense_main >= (int) analysis.devices.size()) {
+        throw std::runtime_error("fit_plan_from_spec: dense_main " + std::to_string(dense_main) +
+                " is out of range for " + std::to_string(analysis.devices.size()) + " devices");
+    }
+    if (spec.pool >= (int) analysis.devices.size()) {
+        throw std::runtime_error("fit_plan_from_spec: pool " + std::to_string(spec.pool) +
+                " is out of range for " + std::to_string(analysis.devices.size()) + " devices");
+    }
+
     for (size_t r = 0; r < plan.role_devices.size(); r++) {
         if (r == COMMON_FIT_ROLE_EXPERT_UP || r == COMMON_FIT_ROLE_EXPERT_GATE ||
             r == COMMON_FIT_ROLE_EXPERT_DOWN) {
+            // Expert-weight override anchor. The MoE cache is a scheduler-level
+            // session that spans every backend in the split (see
+            // ggml_backend_sched_set_moe_cache), so it is NOT confined to one
+            // device. role_devices[EXPERT_UP] is only used to derive the MoE
+            // cache budget and as a backwards-compatible allowed device in
+            // validation; the per-device split is handled by tensor_split.
             plan.role_devices[r] = spec.pool;
         } else {
             plan.role_devices[r] = dense_main;
         }
     }
 
-    plan.n_gpu_layers = (int32_t) (hp_ngl + 1);
+    plan.n_gpu_layers = (ngl_override >= 0) ? ngl_override : (int32_t) (hp_ngl + 1);
     plan.n_ctx = n_ctx;
 
+    // tensor_split: distribute the FULL model across split devices, proportional
+    // to available VRAM. This is "best endeavours" weight splitting: dense prefers
+    // local (local has more VRAM, so it gets the larger share), experts overflow
+    // to RPC. KV cache follows the weights because the whole layer lands on one
+    // device.
     plan.tensor_split.assign(llama_max_devices(), 0.0f);
-    const float frac = 1.0f / spec.split_devices.size();
-    for (int id : spec.split_devices) {
-        plan.tensor_split[id] = frac;
+    if (spec.split_devices.size() == 1) {
+        plan.tensor_split[spec.split_devices[0]] = 1.0f;
+    } else {
+        const int local_device = spec.split_devices.front();
+        // derive the RPC member of the weight split from split_devices, not from
+        // spec.pool. pool only selects the MoE expert cache device; the tensor
+        // split must follow the devices actually named in split_devices. using
+        // pool here (which can be CPU or the local device) wrongly zeroes the
+        // RPC share and can dump the whole model onto one GPU.
+        int rpc_device = -1;
+        for (int d : spec.split_devices) {
+            if (d != local_device && analysis.devices[d].is_rpc) {
+                rpc_device = d;
+                break;
+            }
+        }
+
+        const int64_t context_reserve = 2LL * 1024 * 1024 * 1024; // 2 GiB per device for KV/compute
+        // The RPC backend stages weight copies on the local GPU and keeps its
+        // own command/staging buffers, so it cannot use the full reported VRAM.
+        // Leave headroom so the offload does not OOM the RPC device mid-load.
+        const int64_t rpc_overhead = 2LL * 1024 * 1024 * 1024;
+        const int64_t local_avail = analysis.devices[local_device].total_bytes - context_reserve;
+        const int64_t rpc_avail   = rpc_device >= 0 ? analysis.devices[rpc_device].total_bytes - context_reserve - rpc_overhead : 0;
+
+        size_t total_model = 0;
+        for (const auto & t : analysis.tensors) {
+            total_model += t.bytes;
+        }
+
+        // RPC gets as much of the full model as it can hold; local gets the rest.
+        float rpc_frac = 0.0f;
+        if (rpc_device >= 0 && total_model > 0) {
+            rpc_frac = std::min(1.0f, (float)rpc_avail / (float)total_model);
+        }
+        if (rpc_frac_override >= 0.0f) {
+            rpc_frac = rpc_frac_override;
+        }
+        plan.tensor_split[local_device] = 1.0f - rpc_frac;
+        if (rpc_device >= 0) {
+            plan.tensor_split[rpc_device] = rpc_frac;
+        }
+        LOG_DBG("%s: VRAM-prop tensor_split: total_model=%zu MiB, local_avail=%zu MiB, rpc_avail=%zu MiB, rpc_frac=%.4f\n",
+                __func__, total_model / 1024 / 1024, local_avail / 1024 / 1024,
+                rpc_avail / 1024 / 1024, rpc_frac);
     }
 
     if (analysis.moe.n_expert > 0) {
-        ggml_backend_buffer_type_t pool_buft = spec.pool >= 0
-            ? ggml_backend_dev_buffer_type(analysis.devices[spec.pool].dev)
-            : ggml_backend_cpu_buffer_type();
-        plan.tensor_buft_overrides = {
-            { common_moe_cache_tensor_override_pattern(), pool_buft },
-            { nullptr, nullptr },
-        };
+        // The MoE cache is a scheduler-level session that already spans every
+        // split backend (see ggml_backend_sched_set_moe_cache), so it follows
+        // the expert placement automatically. The fit only derives its total
+        // budget from the free VRAM across all split devices; it does not pin
+        // the cache to a single device.
     }
 
     return plan;
 }
 
+// grow the context for a fixed candidate placement, from the minimum context
+// (fit_strategy_min_ctx) up to the upper bound (params.n_ctx, or the full train
+// context when 0), honoring per-device margins. rpc_frac_override selects the
+// weight split for an rpc-split placement; pass -1.0f for a single-device
+// placement. returns the chosen n_ctx (>= 0) or -1 when even the minimum context
+// does not fit. sets out_plan/out_measure to the confirming placement.
+static int32_t fit_grow_context(
+        const common_fit_analysis & analysis,
+        const std::vector<int64_t> & margins,
+        const common_params & params,
+        llama_model_params * mparams,
+        llama_context_params * cparams,
+        const common_fit_probe & decode_probe,
+        const fit_candidate_spec & spec,
+        float rpc_frac_override,
+        uint32_t hp_ngl,
+        const std::string & path_model,
+        common_fit_plan & out_plan,
+        fit_measure_result & out_measure,
+        int32_t ngl_override = -1) {
+    const size_t nd = analysis.devices.size();
+    // an explicit --ctx-size is a hard requirement: fit model + exactly that
+    // context and never grow or shrink it. the fit then only sheds model layers
+    // (n_gpu_layers) to CPU/RPC if the full offload does not fit. when only
+    // --fit-strategy-min-ctx is set we maximize context from the minimum upward
+    // (the hi bound below is then the train context).
+    const int32_t target_ctx = (params.n_ctx > 0)
+        ? (int32_t) params.n_ctx
+        : (int32_t) params.fit_strategy_min_ctx;
+
+    const auto fits = [&](const common_fit_plan & p, fit_measure_result & m) -> bool {
+        const bool ok_m = fit_measure_plan(decode_probe, p, mparams, cparams, path_model, m);
+        if (!ok_m) { LOG_DBG("%s: grow fits FAIL measure n_ctx=%u\n", __func__, p.n_ctx); return false; }
+        if (!fit_same_devices(m.devs, analysis)) { LOG_DBG("%s: grow fits FAIL devs n_ctx=%u\n", __func__, p.n_ctx); return false; }
+        const bool ok_fm = fit_fits_margins(m.memory, margins, analysis);
+        LOG_DBG("%s: grow fits n_ctx=%u measure=%d margins=%d -> %s\n", __func__, p.n_ctx, ok_m ? 1 : 0, ok_fm ? 1 : 0, ok_fm ? "ok" : "FAIL");
+        return ok_fm;
+    };
+
+    // the floor (minimum context) must fit, otherwise this placement is infeasible
+    common_fit_plan plan_lo = fit_plan_from_spec(analysis, spec, hp_ngl, target_ctx, rpc_frac_override, ngl_override);
+    fit_measure_result m_lo;
+    if (!fits(plan_lo, m_lo)) {
+        return -1;
+    }
+
+    // upper bound: capped by --ctx-size, else the model's full train context
+    int32_t hi = params.n_ctx > 0 ? (int32_t) params.n_ctx
+        : (int32_t) (m_lo.hp_nct > 0 ? m_lo.hp_nct : (target_ctx * 4));
+    if (hi <= target_ctx) {
+        out_plan = plan_lo;
+        out_measure = m_lo;
+        return target_ctx;
+    }
+
+    // if the upper bound already fits there is nothing to search
+    common_fit_plan plan_hi = fit_plan_from_spec(analysis, spec, hp_ngl, hi, rpc_frac_override, ngl_override);
+    fit_measure_result m_hi;
+    if (fits(plan_hi, m_hi)) {
+        out_plan = plan_hi;
+        out_measure = m_hi;
+        return hi;
+    }
+
+    // binary search the largest context that still fits within margins
+    int32_t lo = target_ctx;
+    int32_t best_ctx = target_ctx;
+    common_fit_plan best_plan = plan_lo;
+    fit_measure_result best_m = m_lo;
+    while (hi - lo > 256) {
+        int32_t mid = lo + (hi - lo) / 2;
+        mid -= mid % 256;
+        if (mid <= lo) mid = lo + 256;
+        common_fit_plan pm = fit_plan_from_spec(analysis, spec, hp_ngl, mid, rpc_frac_override, ngl_override);
+        fit_measure_result mm;
+        if (fits(pm, mm)) {
+            lo = mid;
+            best_ctx = mid;
+            best_plan = pm;
+            best_m = mm;
+        } else {
+            hi = mid;
+        }
+    }
+    out_plan = best_plan;
+    out_measure = best_m;
+    return best_ctx;
+}
+
 // solve for rpc-aware: dense decode-hot on local non-RPC devices, experts on a
+// a candidate whose split set spans an RPC device offloads part of the model
+// over RPC. this is true for both MoE (pool == RPC device) and dense mixes
+// (pool stays the local main device, RPC is in split_devices).
+static bool fit_split_has_rpc(const common_fit_analysis & analysis, const std::vector<int> & split_devices) {
+    for (int d : split_devices) {
+        if (d >= 0 && analysis.devices[d].is_rpc) return true;
+    }
+    return false;
+}
+
 // pool that is never the main_gpu device. first fit wins; returns false when no
 // candidate fits (caller falls back to the stock solver).
 static bool fit_solve_rpc_aware(
@@ -428,19 +616,24 @@ static bool fit_solve_rpc_aware(
         throw std::runtime_error("rpc-aware strategy found no local (non-RPC) device to place the model on");
     }
 
-    // dense placements: single local, split across local, split local+rpc
+    // dense placements: prefer local-only first so decode-hot layers stay off the
+    // RPC link, then fall back to splitting across local+RPC only when local alone
+    // cannot reach the minimum context. RPC is used last to avoid per-token network
+    // lag on the dense path.
     std::vector<std::vector<int>> dense_splits;
-    dense_splits.push_back({ local_best });
     std::vector<int> all_local;
     for (const auto & d : analysis.devices) {
         if (!d.is_rpc && d.free_bytes > 0) {
             all_local.push_back(d.id);
         }
     }
-    if (all_local.size() > 1) {
-        dense_splits.push_back(all_local);
-    }
     const int rpc_best = fit_best_rpc(analysis);
+    if (!all_local.empty()) {
+        dense_splits.push_back({ local_best });
+        if (all_local.size() > 1) {
+            dense_splits.push_back(all_local);
+        }
+    }
     if (rpc_best >= 0 && !all_local.empty()) {
         std::vector<int> mix = all_local;
         mix.push_back(rpc_best);
@@ -475,26 +668,165 @@ static bool fit_solve_rpc_aware(
         }
     }
 
-    const int32_t n_ctx = cparams->n_ctx > 0 ? (int32_t) cparams->n_ctx : 0;
+    // spill bookkeeping: if no full-offload candidate reaches the minimum
+    // context, we reduce n_gpu_layers (CPU spill) on the first failing candidate
+    // that uses the widest split (rpc-split preferred for capacity).
+    bool have_spill = false;
+    fit_candidate_spec spill_spec;
+    float spill_rpc_frac = -1.0f;
+
     for (const auto & cand : candidates) {
-        const common_fit_plan plan = fit_plan_from_spec(analysis, cand, hp_ngl, n_ctx);
-        fit_measure_result m;
-        if (!fit_measure_plan(probe, plan, mparams, cparams, path_model, m)) {
-            LOG_INF("%s: candidate %s cannot create a context, skipping\n", __func__, cand.label.c_str());
+        // rpc-split candidates split the full model across local + RPC via
+        // tensor_split. rpc_frac feasibility is an interval: at low rpc_frac the
+        // local device overflows (too much model) and at high rpc_frac the RPC
+        // device overflows. We bracket that interval at the minimum context, then
+        // grow the context from the minimum upward and keep the split that
+        // maximizes it.
+        // a candidate whose split set spans an RPC device is an rpc-split
+        // candidate even for a dense model (where cand.pool stays the local
+        // main device). route it through the rpc_frac scan so we pick a
+        // feasible split instead of maximizing the RPC share and over-packing
+        // the RPC device past its margin.
+        const bool is_rpc_split = (cand.split_devices.size() > 1) &&
+                fit_split_has_rpc(analysis, cand.split_devices);
+
+        if (!is_rpc_split) {
+            // single-device placement: grow the context from the minimum upward
+            common_fit_plan plan;
+            fit_measure_result m;
+            const int32_t ctx = fit_grow_context(analysis, margins, params, mparams, cparams,
+                    probe, cand, -1.0f, hp_ngl, path_model, plan, m);
+            if (ctx >= 0) {
+                out_plan = plan;
+                out_measure = m;
+                LOG_DBG("%s: selected candidate %s with n_ctx=%d (min=%d)\n",
+                        __func__, cand.label.c_str(), ctx, params.fit_strategy_min_ctx);
+                return true;
+            }
+            LOG_DBG("%s: candidate %s cannot fit even the minimum context, skipping\n",
+                    __func__, cand.label.c_str());
+            if (!have_spill) {
+                spill_spec = cand;
+                spill_rpc_frac = -1.0f;
+                have_spill = true;
+            }
             continue;
         }
-        if (!fit_same_devices(m.devs, analysis)) {
-            LOG_WRN("%s: candidate %s changed the device set, skipping\n", __func__, cand.label.c_str());
+
+        // bracket the feasible rpc_frac interval at the minimum context
+        int rpc_device = -1;
+        for (int d : cand.split_devices) {
+            if (d >= 0 && analysis.devices[d].is_rpc) { rpc_device = d; break; }
+        }
+        GGML_ASSERT(rpc_device >= 0);
+        const int64_t context_reserve = 2LL * 1024 * 1024 * 1024;
+        const int64_t rpc_avail = analysis.devices[rpc_device].total_bytes - context_reserve;
+        size_t total_model = 0;
+        for (const auto & t : analysis.tensors) {
+            total_model += t.bytes;
+        }
+        const float hi = total_model > 0 ? std::min(1.0f, (float) rpc_avail / (float) total_model) : 0.0f;
+
+        // coarse floor scan (step 0.05) to find feasible rpc_frac values
+        std::vector<float> feas;
+        for (float f = hi; f >= 0.0f; f -= 0.05f) {
+            common_fit_plan plan = fit_plan_from_spec(analysis, cand, hp_ngl, (int32_t) params.fit_strategy_min_ctx, f);
+            fit_measure_result m;
+            const bool ok_measure = fit_measure_plan(probe, plan, mparams, cparams, path_model, m);
+            const bool ok_devs    = ok_measure && fit_same_devices(m.devs, analysis);
+            const bool ok_margin  = ok_devs && fit_fits_margins(m.memory, margins, analysis);
+            LOG_DBG("%s: rpc_frac=%.4f measure=%d devs=%d margin=%d -> %s\n",
+                    __func__, f, ok_measure ? 1 : 0, ok_devs ? 1 : 0, ok_margin ? 1 : 0,
+                    ok_margin ? "FEASIBLE" : "rejected");
+            if (ok_margin) {
+                feas.push_back(f);
+            }
+        }
+        if (feas.empty()) {
+            LOG_DBG("%s: candidate %s could not fit any rpc_frac at the minimum context, skipping\n",
+                    __func__, cand.label.c_str());
             continue;
         }
-        if (!fit_fits_margins(m.memory, margins, analysis.devices.size())) {
-            LOG_INF("%s: candidate %s does not fit within margins, skipping\n", __func__, cand.label.c_str());
-            continue;
+        // scanned top-down: front = largest rpc_frac (max offload), back = smallest
+        const float f_hi_off = feas.front();
+        const float f_lo_off = feas.back();
+        const float f_mid = (f_hi_off + f_lo_off) * 0.5f;
+
+        // pick the rpc_frac that maximizes the achievable context. with a layer
+        // split the KV cache follows the weights, so the device holding the larger
+        // layer share is the context bottleneck. a balanced split maximizes the
+        // global context; a min-offload split leaves the local device holding most
+        // layers and caps context far below the available headroom.
+        float best_ftry = -1.0f;
+        int32_t best_ctx = -1;
+        common_fit_plan best_plan;
+        fit_measure_result best_m;
+        for (float ftry = f_hi_off; ftry >= f_lo_off - 1e-6f; ftry -= 0.05f) {
+            common_fit_plan plan;
+            fit_measure_result m;
+            const int32_t ctx = fit_grow_context(analysis, margins, params, mparams, cparams,
+                    probe, cand, ftry, hp_ngl, path_model, plan, m);
+            if (ctx < 0) continue;
+            if (best_ctx < 0 || ctx > best_ctx) {
+                best_ctx = ctx;
+                best_ftry = ftry;
+                best_plan = plan;
+                best_m = m;
+            }
         }
-        out_plan = plan;
-        out_measure = m;
-        LOG_INF("%s: selected candidate %s\n", __func__, cand.label.c_str());
-        return true;
+        if (best_ctx >= 0) {
+            out_plan = best_plan;
+            out_measure = best_m;
+            LOG_DBG("%s: selected candidate %s rpc_frac=%.4f n_ctx=%d (min=%d, feasible rpc_frac [%.4f,%.4f], max-context)\n",
+                    __func__, cand.label.c_str(), best_ftry, best_ctx,
+                    params.fit_strategy_min_ctx, f_lo_off, f_hi_off);
+            return true;
+        }
+        LOG_DBG("%s: candidate %s could not grow the context at full offload, marking for CPU spill\n",
+                __func__, cand.label.c_str());
+        if (!have_spill) {
+            spill_spec = cand;
+            spill_rpc_frac = f_mid;
+            have_spill = true;
+        }
+    }
+
+    // CPU-spill phase: no full-offload candidate reached the minimum context.
+    // binary-search the largest n_gpu_layers (least spill) that still reaches it.
+    // as n_gpu_layers decreases, GPU footprint shrinks and KV cache grows, so the
+    // achievable context is monotonic non-decreasing -> standard upper-bound search.
+    if (have_spill) {
+        const bool spec_is_rpc_split = (spill_spec.split_devices.size() > 1) &&
+                fit_split_has_rpc(analysis, spill_spec.split_devices);
+        const int32_t min_ctx = (int32_t) (params.n_ctx > 0 ? params.n_ctx : params.fit_strategy_min_ctx);
+        int32_t lo_ngl = 0;            // all layers on CPU -> max context
+        int32_t hi_ngl = (int32_t) hp_ngl; // full offload (failed min_ctx)
+        int32_t best_ngl = -1;
+        common_fit_plan best_plan;
+        fit_measure_result best_m;
+        while (lo_ngl <= hi_ngl) {
+            const int32_t mid_ngl = lo_ngl + (hi_ngl - lo_ngl) / 2;
+            common_fit_plan plan;
+            fit_measure_result m;
+            const int32_t ctx = fit_grow_context(analysis, margins, params, mparams, cparams,
+                    probe, spill_spec, spec_is_rpc_split ? spill_rpc_frac : -1.0f,
+                    hp_ngl, path_model, plan, m, mid_ngl);
+            if (ctx >= min_ctx) {
+                best_ngl = mid_ngl;
+                best_plan = plan;
+                best_m = m;
+                lo_ngl = mid_ngl + 1; // try keeping more layers on GPU
+            } else {
+                hi_ngl = mid_ngl - 1;
+            }
+        }
+        if (best_ngl >= 0) {
+            out_plan = best_plan;
+            out_measure = best_m;
+            LOG_WRN("%s: spilling %u layers to CPU to reach min-ctx %d (n_gpu_layers=%d of %u)\n",
+                    __func__, (uint32_t) (hp_ngl - best_ngl), min_ctx, best_ngl, hp_ngl);
+            return true;
+        }
     }
 
     return false;
@@ -516,7 +848,6 @@ static common_fit_plan fit_solve_maxctx(
         throw common_params_fit_exception("maxctx strategy requires --fit-strategy-min-ctx");
     }
     const int32_t target_ctx = params.fit_strategy_min_ctx;
-    const int32_t upper_ctx = params.n_ctx > 0 ? params.n_ctx : 0; // 0 = full train context
 
     const int local_best = fit_best_local(analysis);
     if (local_best < 0) {
@@ -530,73 +861,21 @@ static common_fit_plan fit_solve_maxctx(
         placements.push_back({ "experts-cpu", local_best, { local_best }, -1 });
     }
 
-    const size_t nd = analysis.devices.size();
     for (const auto & placement : placements) {
-        // anchor 1: upper context
-        const common_fit_plan plan_upper = fit_plan_from_spec(analysis, placement, hp_ngl, upper_ctx);
-        fit_measure_result m_upper;
-        if (!fit_measure_plan(probe, plan_upper, mparams, cparams, path_model, m_upper) ||
-            !fit_same_devices(m_upper.devs, analysis)) {
-            LOG_INF("%s: placement %s cannot create a context at the upper context, skipping\n",
+        // grow the context from the minimum upward; this also tests the full
+        // context first and uses it directly when it fits.
+        common_fit_plan plan;
+        fit_measure_result m;
+        const int32_t ctx = fit_grow_context(analysis, margins, params, mparams, cparams,
+                probe, placement, -1.0f, hp_ngl, path_model, plan, m);
+        if (ctx < 0) {
+            LOG_DBG("%s: placement %s cannot fit even the minimum context, skipping\n",
                     __func__, placement.label.c_str());
             continue;
         }
-        if (fit_fits_margins(m_upper.memory, margins, nd)) {
-            LOG_INF("%s: placement %s fits at the upper context\n", __func__, placement.label.c_str());
-            out_measure = m_upper;
-            return plan_upper;
-        }
-
-        // anchor 2: target (floor) context
-        const common_fit_plan plan_target = fit_plan_from_spec(analysis, placement, hp_ngl, target_ctx);
-        fit_measure_result m_target;
-        if (!fit_measure_plan(probe, plan_target, mparams, cparams, path_model, m_target) ||
-            !fit_same_devices(m_target.devs, analysis)) {
-            LOG_INF("%s: placement %s cannot create a context at the floor context, skipping\n",
-                    __func__, placement.label.c_str());
-            continue;
-        }
-        if (!fit_fits_margins(m_target.memory, margins, nd)) {
-            LOG_INF("%s: placement %s cannot meet margins even at the floor context, skipping\n",
-                    __func__, placement.label.c_str());
-            continue;
-        }
-
-        // interpolate between the two anchors
-        int64_t sum_upper = 0;
-        int64_t sum_target = 0;
-        int64_t budget = 0;
-        for (size_t id = 0; id < nd; id++) {
-            sum_upper += fit_device_used(m_upper.memory[id]);
-            sum_target += fit_device_used(m_target.memory[id]);
-            budget += m_upper.memory[id].free - margins[id];
-        }
-        const int32_t hp_nct = (int32_t) m_upper.hp_nct;
-        int32_t n_ctx = target_ctx;
-        const int64_t ctx_span = sum_upper - sum_target;
-        if (ctx_span > 0 && budget <= sum_upper) {
-            const int32_t upper = upper_ctx > 0 ? upper_ctx : hp_nct;
-            n_ctx = target_ctx + (int32_t) ((int64_t) (upper - target_ctx) *
-                    (budget - sum_target) / ctx_span);
-            n_ctx = std::max(n_ctx - n_ctx % 256, target_ctx); // round down for CUDA
-        }
-
-        // final confirmation measure
-        const common_fit_plan plan_int = fit_plan_from_spec(analysis, placement, hp_ngl, n_ctx);
-        fit_measure_result m_int;
-        if (!fit_measure_plan(probe, plan_int, mparams, cparams, path_model, m_int) ||
-            !fit_same_devices(m_int.devs, analysis) ||
-            !fit_fits_margins(m_int.memory, margins, nd)) {
-            // interpolation overshot; the floor is known to fit
-            LOG_INF("%s: placement %s did not confirm at %" PRIi32 ", using the floor context\n",
-                    __func__, placement.label.c_str(), n_ctx);
-            out_measure = m_target;
-            return plan_target;
-        }
-
-        LOG_INF("%s: placement %s selected context %" PRIi32 "\n", __func__, placement.label.c_str(), n_ctx);
-        out_measure = m_int;
-        return plan_int;
+        LOG_DBG("%s: placement %s selected context %" PRIi32 "\n", __func__, placement.label.c_str(), ctx);
+        out_measure = m;
+        return plan;
     }
 
     throw std::runtime_error("maxctx strategy could not fit the model at the minimum context of " +
@@ -623,12 +902,16 @@ static void fit_serialize_moe_cache(
         return;
     }
 
-    const int pool_id = plan.role_devices[COMMON_FIT_ROLE_EXPERT_UP];
+    // The MoE cache session spans every split backend (local + RPC), so the
+    // budget headroom is the total free VRAM across all split devices, not one
+    // pool device. The scheduler divides the resulting grant across backends.
     int64_t remaining = 0;
-    if (pool_id >= 0 && pool_id < (int) measure.memory.size() && pool_id < (int) margins.size()) {
-        remaining = fit_device_remaining(measure.memory[pool_id], margins[pool_id]);
-        if (remaining < 0) {
-            remaining = 0;
+    for (size_t id = 0; id < measure.memory.size() && id < margins.size(); id++) {
+        if (id < plan.tensor_split.size() && plan.tensor_split[id] > 0.0f) {
+            int64_t dev_rem = fit_device_remaining(measure.memory[id], margins[id]);
+            if (dev_rem > 0) {
+                remaining += dev_rem;
+            }
         }
     }
 
@@ -642,17 +925,16 @@ static void fit_serialize_moe_cache(
         mc.mode = COMMON_MOE_CACHE_MODE_OFF;
         mc.budget_mib = 0;
         mc.fit_selected = false;
-        LOG_WRN("%s: no VRAM remaining for an MoE pool on device %d; pool disabled\n", __func__, pool_id);
+        LOG_WRN("%s: no VRAM remaining for an MoE pool across split devices; pool disabled\n", __func__);
     } else {
         if (mc.mode_explicit && mc.mode == COMMON_MOE_CACHE_MODE_SOFT) {
             mc.mode = COMMON_MOE_CACHE_MODE_SOFT;
         } else {
             mc.mode = COMMON_MOE_CACHE_MODE_ON;
         }
-        mc.budget_mib = grant;
+        mc.budget_mib = grant / (1024 * 1024);
         mc.fit_selected = true;
-        LOG_INF("%s: MoE pool budget %zu MiB on device %s\n", __func__, grant,
-                pool_id >= 0 ? ggml_backend_dev_name(analysis.devices[pool_id].dev) : "cpu");
+        LOG_DBG("%s: MoE pool budget %zu MiB across split devices\n", __func__, grant / (1024 * 1024));
     }
 
     // remap the context params to the resolved mode, mirroring common_context_params_to_llama
@@ -719,9 +1001,21 @@ static void fit_validate(
         throw std::runtime_error("final placement changed the device set");
     }
     for (size_t id = 0; id < analysis.devices.size(); id++) {
-        if (final_measure.memory[id].free - fit_device_used(final_measure.memory[id]) <
-                (int64_t) params.fit_params_target[id]) {
-            throw std::runtime_error("final placement exceeds the per-device margin on device " +
+        const int64_t used = (int64_t) fit_device_used(final_measure.memory[id]);
+        // `free` is post-allocation free, so the headroom left after load is
+        // `free` (committed backends) or `total - used` (lazy backends). Using
+        // `free - used` double-counts the footprint and rejects valid placements.
+        // No stats overhead is added: the device baseline is already in `free`.
+        const int64_t rem = std::min((int64_t) final_measure.memory[id].free,
+                                     (int64_t) final_measure.memory[id].total - used);
+        const int64_t free_mib = (int64_t) final_measure.memory[id].free / (1024 * 1024);
+        const int64_t used_mib = used / (1024 * 1024);
+        const int64_t proj_free_mib = rem / (1024 * 1024);
+        const int64_t target_mib = (int64_t) params.fit_params_target[id] / (1024 * 1024);
+        LOG_DBG("%s: device %s: probe free %" PRId64 " MiB, projected free after load %" PRId64 " MiB (used %" PRId64 "), fit-target %" PRId64 " MiB\n",
+                __func__, ggml_backend_dev_name(analysis.devices[id].dev), free_mib, proj_free_mib, used_mib, target_mib);
+        if (rem < (int64_t) params.fit_params_target[id]) {
+            throw std::runtime_error("final placement leaves less than the per-device margin on device " +
                     std::string(ggml_backend_dev_name(analysis.devices[id].dev)));
         }
     }
@@ -755,6 +1049,22 @@ static void fit_validate(
         pool_dev = analysis.devices[pool].dev;
     }
 
+    // Expert tensors may land on any device that has a non-zero tensor_split
+    // share (full-model split), not just the pool device. The pool device is
+    // still allowed for backwards compatibility with single-pool placements.
+    std::vector<ggml_backend_dev_t> allowed_expert;
+    if (pool_dev != nullptr) {
+        allowed_expert.push_back(pool_dev);
+    }
+    for (size_t i = 0; i < plan.tensor_split.size() && i < analysis.devices.size(); i++) {
+        if (plan.tensor_split[i] > 0.0f) {
+            allowed_expert.push_back(analysis.devices[i].dev);
+        }
+    }
+    if (pool < 0) {
+        allowed_expert.push_back(nullptr); // CPU pool
+    }
+
     const size_t n_tensors = llama_model_get_tensor_devices(model.get(), nullptr, 0);
     std::vector<llama_tensor_device_info> tensor_infos(n_tensors);
     if (n_tensors > 0) {
@@ -768,7 +1078,7 @@ static void fit_validate(
         // a CPU pool may land on the CPU buffer or on a device host buffer
         // (the CPU override path selects from buft_list_cpu, which can be host)
         const bool ok = is_expert
-            ? (pool < 0 ? info.host : info.dev == pool_dev)
+            ? std::find(allowed_expert.begin(), allowed_expert.end(), info.dev) != allowed_expert.end()
             : std::find(allowed_non_expert.begin(), allowed_non_expert.end(), info.dev) != allowed_non_expert.end();
         if (!ok) {
             throw std::runtime_error(std::string("tensor ") + info.name + " (role " + fit_role_name(role) +
@@ -798,12 +1108,17 @@ common_params_fit_status common_fit_strategy_apply_impl(
         }
 
         uint32_t hp_ngl = 0;
-        const common_fit_analysis analysis = fit_analyze(params, mparams, params.model.path, hp_ngl);
+        common_fit_analysis analysis = fit_analyze(params, mparams, params.model.path, hp_ngl);
 
-        // margins are indexed by model device order; re-attribute an RPC main_gpu
-        if (params.fit_strategy == COMMON_FIT_STRATEGY_RPC_AWARE) {
-            fit_reattribute_margins(params.fit_params_target, analysis, params.main_gpu);
-        }
+        // Device headroom is taken directly from the backend-reported `free`
+        // (which already excludes the device baseline: framebuffer + HIP context
+        // + display) and the exact model/context/compute sizes from metadata.
+        // No fit-stats overhead is applied: adding it would double-count the
+        // baseline and flip the placement between loads. The recorded stats
+        // file is kept only for diagnostics.
+
+        // margins are indexed by model device order; the user's explicit
+        // fit-target values are honored per device (no RPC main_gpu swap).
         std::vector<int64_t> margins;
         margins.reserve(analysis.devices.size());
         for (size_t id = 0; id < analysis.devices.size(); id++) {
@@ -849,7 +1164,7 @@ common_params_fit_status common_fit_strategy_apply_impl(
             if (!fit_same_devices(win_measure.devs, analysis)) {
                 throw std::runtime_error("manual plan changed the device set");
             }
-            if (!fit_fits_margins(win_measure.memory, margins, analysis.devices.size())) {
+            if (!fit_fits_margins(win_measure.memory, margins, analysis)) {
                 throw std::runtime_error("manual plan does not fit within the per-device margins");
             }
             have_plan = true;
@@ -944,4 +1259,66 @@ bool common_activation_profile_sink(const common_activation_profile & profile, c
     }
     out << row.dump() << '\n';
     return (bool) out;
+}
+
+int llama_model_get_backend_device_id(const struct llama_model * model, int device_index) {
+    if (model == nullptr || device_index < 0) {
+        return -1;
+    }
+
+    const int32_t n_devices = llama_model_n_devices(model);
+    if (device_index >= n_devices) {
+        return -1;
+    }
+
+    ggml_backend_dev_t dev = llama_model_get_device(model, device_index);
+    if (dev == nullptr) {
+        return -1;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return -1;
+    }
+
+    const size_t backend_dev_count = ggml_backend_reg_dev_count(reg);
+    for (size_t i = 0; i < backend_dev_count; i++) {
+        if (ggml_backend_reg_dev_get(reg, i) == dev) {
+            return (int)i;
+        }
+    }
+
+    return -1;
+}
+
+ggml_backend_dev_t llama_model_get_device_by_backend_id(const struct llama_model * model, int backend_device_id) {
+    if (model == nullptr || backend_device_id < 0) {
+        return nullptr;
+    }
+
+    const int32_t n_devices = llama_model_n_devices(model);
+    if (n_devices == 0) {
+        return nullptr;
+    }
+
+    for (int32_t i = 0; i < n_devices; i++) {
+        ggml_backend_dev_t dev = llama_model_get_device(model, i);
+        if (dev == nullptr) {
+            continue;
+        }
+
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (reg == nullptr) {
+            continue;
+        }
+
+        const size_t backend_dev_count = ggml_backend_reg_dev_count(reg);
+        if ((size_t)backend_device_id < backend_dev_count) {
+            if (ggml_backend_reg_dev_get(reg, backend_device_id) == dev) {
+                return dev;
+            }
+        }
+    }
+
+    return nullptr;
 }

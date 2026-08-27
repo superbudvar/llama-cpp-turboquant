@@ -80,9 +80,29 @@ probe uses conservative defaults and warns, never aborts.
 `common_fit_strategy_pool_budget` computes the bounded MoE cache budget:
 
 - explicit `--moe-cache N` wins;
-- otherwise `min(clamp(remaining/2, max(2*working_set, 256 MiB), 4 GiB), remaining)`;
+- otherwise `min(clamp(remaining*3/4, max(2*working_set, 256 MiB), 64 GiB), remaining)`;
 - when `remaining < floor` the grant is 0 and the pool is disabled with a warning
   (a 0 budget with cache `mode=on` means unlimited, so disabling is explicit).
+
+The budget is returned in bytes and converted to MiB before it reaches the
+cache layer (`config.budget_mb` is a MiB cap). When the experts land on the
+CPU pool, the grant is sized from the dense device's spare VRAM instead of
+being disabled.
+
+Sizing uses device total minus measured placement usage, not the probe's free
+value: the probe snapshot can predate our own allocations. A fixed reserve
+(1536 MiB plus the margin) keeps the driver away from queue-eviction territory
+on near-full devices.
+
+## Expert splits
+
+Partial expert placements exist but are opt-in via `TQ_FIT_EXPERT_SPLIT=1`:
+static residency packs expert layers onto the dense device up to its spare
+VRAM, then falls back to a partial RPC offload. Measured on the dev box
+(Qwen3.6-35B-A3B over 1 Gbps RPC, 16 GiB local GPU), both lose to the CPU pool
+plus a large MoE cache - static residency hit 9.3 t/s vs 19.1 t/s for the
+cache, and near-full VRAM wedged amdgpu queues during load. The adaptive cache
+keeps the hottest experts; a fixed layer split cannot.
 
 ## Activation profile
 

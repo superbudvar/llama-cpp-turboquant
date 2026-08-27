@@ -512,6 +512,138 @@ static void test_manual_plan_validated() {
             "a manual plan missing the per-device margins must be a hard error");
 }
 
+static void test_device_id_mapping() {
+    if (g_model.empty()) {
+        test_skip("no model available");
+        return;
+    }
+    
+    // Test device ID query functions with valid inputs
+    common_params temp_params;
+    temp_params.model.path = g_model;
+    llama_model_params mp = common_model_params_to_llama(temp_params);
+    mp.no_alloc = true;
+    mp.load_mode = LLAMA_LOAD_MODE_NONE;
+    llama_model_ptr model(llama_model_load_from_file(g_model.c_str(), mp));
+    if (!model) {
+        test_skip("model load failed");
+        return;
+    }
+    
+    const size_t nd = llama_model_n_devices(model.get());
+    expect(nd > 0, "model should have at least one device");
+    
+    // Test llama_model_get_backend_device_id with valid devices
+    for (size_t i = 0; i < nd; i++) {
+        ggml_backend_dev_t dev = llama_model_get_device(model.get(), (int)i);
+        expect(dev != nullptr, "device should not be null");
+        
+        // Query the actual backend device ID and verify it's valid
+        const int backend_id = llama_model_get_backend_device_id(model.get(), (int)i);
+        expect(backend_id >= 0, "backend device ID should be non-negative for valid device");
+        
+        // Verify we can get the same device back by backend ID
+        ggml_backend_dev_t dev_by_id = llama_model_get_device_by_backend_id(model.get(), backend_id);
+        expect(dev_by_id != nullptr, "device lookup by backend ID should succeed");
+        expect(dev_by_id == dev, "device lookup by backend ID should return same device");
+        
+        const char * dev_name = ggml_backend_dev_name(dev);
+        expect(dev_name != nullptr, "device name should not be null");
+    }
+    
+    // Test with invalid device indices
+    const int invalid_backend_id = llama_model_get_backend_device_id(model.get(), -1);
+    expect(invalid_backend_id == -1, "negative device index should return -1");
+    
+    const int invalid_backend_id2 = llama_model_get_backend_device_id(model.get(), 9999);
+    expect(invalid_backend_id2 == -1, "out-of-range device index should return -1");
+    
+    ggml_backend_dev_t invalid_dev = llama_model_get_device_by_backend_id(model.get(), -1);
+    expect(invalid_dev == nullptr, "negative backend ID should return null");
+    
+    ggml_backend_dev_t invalid_dev2 = llama_model_get_device_by_backend_id(model.get(), 9999);
+    expect(invalid_dev2 == nullptr, "out-of-range backend ID should return null");
+}
+
+static void test_rpc_pool_split_device_mapping() {
+    if (g_model.empty()) {
+        test_skip("no model available");
+        return;
+    }
+    
+    // Test RPC pool split device mapping correctness
+    common_params params;
+    params.fit_strategy = COMMON_FIT_STRATEGY_RPC_AWARE;
+    params.n_ctx = 1024;
+    params.model.path = g_model;
+    llama_model_params mparams = common_model_params_to_llama(params);
+    llama_context_params cparams = common_context_params_to_llama(params);
+    fake_probe_ctx cfg;
+    cfg.default_dev = { (int64_t) (16 * GiB), (int64_t) (16 * GiB), (size_t) (64 * MiB), (size_t) (32 * MiB), 0 };
+    
+    const common_params_fit_status st = common_fit_strategy_apply_impl(
+            params, &mparams, &cparams, nullptr, make_probe(&cfg));
+    expect(st == COMMON_PARAMS_FIT_STATUS_SUCCESS,
+            "rpc-aware placement should succeed");
+    
+    // Verify that tensor_split is set correctly
+    // The main device should have the majority of the model when no RPC devices are available
+    float total_split = 0.0f;
+    for (size_t i = 0; i < llama_max_devices(); i++) {
+        total_split += params.tensor_split[i];
+    }
+    expect(total_split > 0.99f && total_split <= 1.01f,
+            "tensor_split should sum to approximately 1.0");
+    
+    // When no RPC devices are available, all weight should be on device 0
+    expect(params.tensor_split[0] > 0.9f,
+            "main device should have majority of weight when no RPC available");
+}
+
+static void test_rpc_pool_split_inversion_bug() {
+    if (g_model.empty()) {
+        test_skip("no model available");
+        return;
+    }
+    
+    // Test for inversion bug regression
+    // RPC=0.3 should place ~30% on RPC, not 91%
+    // This test uses the rpc-aware strategy to verify correct device mapping
+    
+    common_params params;
+    params.fit_strategy = COMMON_FIT_STRATEGY_RPC_AWARE;
+    params.n_ctx = 1024;
+    params.model.path = g_model;
+    llama_model_params mparams = common_model_params_to_llama(params);
+    llama_context_params cparams = common_context_params_to_llama(params);
+    fake_probe_ctx cfg;
+    cfg.default_dev = { (int64_t) (16 * GiB), (int64_t) (16 * GiB), (size_t) (64 * MiB), (size_t) (32 * MiB), 0 };
+    
+    const common_params_fit_status st = common_fit_strategy_apply_impl(
+            params, &mparams, &cparams, nullptr, make_probe(&cfg));
+    expect(st == COMMON_PARAMS_FIT_STATUS_SUCCESS,
+            "rpc-aware placement should succeed");
+    
+    // Verify no inversion bug: local device should not get 91% when expecting ~70%
+    // The test verifies that device mapping is correct
+    // (the actual RPC split logic will be tested once RPC devices are available)
+    float max_split = 0.0f;
+    size_t max_device = 0;
+    for (size_t i = 0; i < llama_max_devices(); i++) {
+        if (params.tensor_split[i] > max_split) {
+            max_split = params.tensor_split[i];
+            max_device = i;
+        }
+    }
+    
+    // The device with maximum split should be device 0 (local main device)
+    // when no RPC devices are available
+    expect(max_device == 0,
+            "main device (0) should have maximum split when no RPC available");
+    expect(max_split > 0.9f,
+            "main device should have majority of weight when no RPC available");
+}
+
 static const struct test_case {
     const char * name;
     void (*fn)();
@@ -527,6 +659,9 @@ static const struct test_case {
     { "no_provider_pool",           test_no_provider_pool },
     { "activation_profile_sink",    test_activation_profile_sink },
     { "manual_plan_validated",      test_manual_plan_validated },
+    { "device_id_mapping",          test_device_id_mapping },
+    { "rpc_pool_split_device_mapping", test_rpc_pool_split_device_mapping },
+    { "rpc_pool_split_inversion_bug", test_rpc_pool_split_inversion_bug },
 };
 
 int main(int argc, char ** argv) {

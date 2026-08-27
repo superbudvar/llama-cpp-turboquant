@@ -1,6 +1,7 @@
 #include "fit.h"
 
 #include "common.h"
+#include "fit-stats.h"
 #include "log.h"
 
 #include "../ggml/src/ggml-backend-moe-cache.h"
@@ -1570,6 +1571,55 @@ void common_memory_breakdown_print(const struct llama_context * ctx) {
         LOG_TRC(td[0].c_str(),
             __func__, td[1].c_str(), td[2].c_str(), td[3].c_str(), td[4].c_str(), td[5].c_str(),
             td[6].c_str(), td[7].c_str(), td[8].c_str());
+    }
+}
+
+void common_fit_record_stats(const std::string & model_path, const struct llama_context * ctx) {
+    if (model_path.empty() || ctx == nullptr) {
+        return;
+    }
+    const auto * model = llama_get_model(ctx);
+    if (model == nullptr) {
+        return;
+    }
+    const int ndev = llama_model_n_devices(model);
+    if (ndev <= 0) {
+        return;
+    }
+
+    // reserved (self) per device, from the already-allocated context breakdown
+    const llama_memory_breakdown mb = llama_get_memory_breakdown(ctx);
+
+    for (int i = 0; i < ndev; i++) {
+        ggml_backend_dev_t dev = llama_model_get_device(model, i);
+        if (dev == nullptr) {
+            continue;
+        }
+        const char * dev_name = ggml_backend_dev_name(dev);
+
+        int64_t self = 0;
+        for (const auto & buft_mb : mb) {
+            ggml_backend_buffer_type_t buft = buft_mb.first;
+            const llama_memory_breakdown_data & d = buft_mb.second;
+            if (ggml_backend_buft_is_host(buft)) {
+                continue;
+            }
+            if (ggml_backend_buft_get_device(buft) != dev) {
+                continue;
+            }
+            self += (int64_t) d.model + (int64_t) d.context + (int64_t) d.compute;
+        }
+
+        uint64_t free = 0, total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+        const int64_t true_used = (int64_t) total - (int64_t) free;
+        int64_t overhead = true_used - self;
+        if (overhead < 0) {
+            overhead = 0;  // probe-time optimistic free; nothing to record yet
+        }
+        fit_stats::record_overhead(model_path, dev_name, overhead);
+        LOG_DBG("%s: fit stats recorded overhead=%lld bytes on %s\n",
+                __func__, (long long) overhead, dev_name);
     }
 }
 

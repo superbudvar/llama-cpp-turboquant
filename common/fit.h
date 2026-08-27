@@ -103,6 +103,12 @@ common_device_memory_data_vec common_get_device_memory_data(
                            uint32_t & hp_n_expert,
                      ggml_log_level   log_level);
 
+// Record the post-warmup per-device VRAM overhead for model_path into the fit
+// stats cache (see fit-stats.h). Call once after the context is fully warmed
+// up, when true RSS (weights faulted, draft model + graph scratch allocated)
+// is known. Safe to call on every load; cheap (no allocation).
+void common_fit_record_stats(const std::string & model_path, const struct llama_context * ctx);
+
 // Load a parent model + context with no_alloc, then return the per-device memory breakdown of a child model + context.
 common_device_memory_data_vec common_get_device_memory_data_with_parent(
                          const char * path_model,

@@ -4833,8 +4833,96 @@ static int ggml_cuda_physical_device_share_count(int device) {
     return info.devices[device].physical_share_count;
 }
 
+#ifdef GGML_USE_HIP
+#include <fstream>
+#include <sstream>
+#include <algorithm>
+#include <cctype>
+#include <cstring>
+
+// Read the true VRAM free/total for a ROCm GPU from the amdgpu sysfs
+// interface. cudaMemGetInfo (hipMemGetInfo) only sees ROCm/KFD allocations
+// and ignores memory held by the kernel DRM/Vulkan/desktop driver, so it
+// over-reports free space. The kernel memory manager (what rocm-smi reads)
+// counts all of it. We match this HIP device to its sysfs card via the PCI
+// bus id, then read mem_info_vram_used / mem_info_vram_total directly.
+static bool ggml_rocm_sysfs_memory(int device, size_t * free_mem, size_t * total_mem) {
+    char pciBusId[64];
+    if (hipDeviceGetPCIBusId(pciBusId, sizeof(pciBusId), device) != hipSuccess) {
+        GGML_LOG_WARN("%s: hipDeviceGetPCIBusId failed for device %d; falling back to cudaMemGetInfo",
+                __func__, device);
+        return false;
+    }
+
+    std::string want = pciBusId;
+    std::transform(want.begin(), want.end(), want.begin(), ::tolower);
+
+    char path[128];
+    for (int card = 0; card < 32; ++card) {
+        snprintf(path, sizeof(path), "/sys/class/drm/card%d/device", card);
+
+        // amdgpu cards expose mem_info_vram_used
+        const std::string used_path = std::string(path) + "/mem_info_vram_used";
+        std::ifstream used_f(used_path);
+        if (!used_f.good()) {
+            continue;
+        }
+
+        // match by PCI_SLOT_NAME in the card's uevent
+        bool matched = false;
+        std::ifstream uevent_f(std::string(path) + "/uevent");
+        std::string line;
+        std::string slot;
+        while (std::getline(uevent_f, line)) {
+            if (line.rfind("PCI_SLOT_NAME=", 0) == 0) {
+                slot = line.substr(strlen("PCI_SLOT_NAME="));
+                std::transform(slot.begin(), slot.end(), slot.begin(), ::tolower);
+                if (slot == want) {
+                    matched = true;
+                }
+                break;
+            }
+        }
+        if (!matched) {
+            continue;
+        }
+
+        size_t used = 0;
+        size_t total = 0;
+        used_f >> used;
+        std::ifstream total_f(std::string(path) + "/mem_info_vram_total");
+        if (!(total_f >> total) || total == 0) {
+            GGML_LOG_WARN("%s: failed to read mem_info_vram_total for card %s; falling back to cudaMemGetInfo",
+                    __func__, path);
+            return false;
+        }
+
+        *total_mem = total;
+        *free_mem  = total > used ? total - used : 0;
+        GGML_LOG_INFO("%s: device %d matched %s: vram_used=%zu MiB vram_total=%zu MiB vram_free=%zu MiB",
+                __func__, device, path, used / (1024 * 1024), total / (1024 * 1024), *free_mem / (1024 * 1024));
+        return true;
+    }
+
+    GGML_LOG_WARN("%s: no amdgpu sysfs card matched PCI id '%s'; falling back to cudaMemGetInfo (inaccurate on ROCm)",
+            __func__, want.c_str());
+    return false;
+}
+#endif
+
 void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * total) {
     ggml_cuda_set_device(device);
+
+#ifdef GGML_USE_HIP
+    // On ROCm, report the kernel-manager view so DRM/Vulkan/desktop driver
+    // memory is accounted for. Fall back to cudaMemGetInfo if sysfs is absent.
+    if (ggml_rocm_sysfs_memory(device, free, total)) {
+        const int share_count = ggml_cuda_physical_device_share_count(device);
+        *free  /= share_count;
+        *total /= share_count;
+        return;
+    }
+#endif
 
     CUDA_CHECK(cudaMemGetInfo(free, total));
 
@@ -4976,9 +5064,21 @@ static bool ggml_backend_cuda_get_available_uma_memory(long * available_memory_k
 }
 #endif // defined(__linux__)
 
-static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
+ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
     ggml_cuda_set_device(ctx->device);
+
+#ifdef GGML_USE_HIP
+    // On ROCm, report the kernel-manager view (amdgpu sysfs) so DRM/Vulkan/
+    // desktop driver memory is accounted for. Falls back to cudaMemGetInfo.
+    if (ggml_rocm_sysfs_memory(ctx->device, free, total)) {
+        const int share_count = ggml_cuda_physical_device_share_count(ctx->device);
+        *free  /= share_count;
+        *total /= share_count;
+        return;
+    }
+#endif
+
     cudaError_t err = cudaMemGetInfo(free, total);
     if (err != cudaSuccess) {
         (void)cudaGetLastError();
