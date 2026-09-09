@@ -10,6 +10,15 @@
 #include "speculative.h"
 #include "server-common.h"
 
+#include <algorithm>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <regex>
+#include <set>
+#include <string>
+#include <vector>
+
 using json = nlohmann::ordered_json;
 
 //
@@ -1851,4 +1860,367 @@ void server_prompt_cache::update() {
         SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
                 (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
     }
+}
+
+//
+// disk prompt cache
+//
+// each cache entry is stored as <sha256-of-text-tokens>.dpc in the cache directory.
+// only text-only prompts (no media chunks) are persisted - media placeholder tokens
+// cannot be reconstructed from token ids alone. entry numbers are streamed with
+// FILE* writes so large KV blobs are not copied into an extra buffer.
+//
+
+namespace {
+
+constexpr uint32_t DPC_MAGIC   = 0x31435044; // "DPC1"
+constexpr uint32_t DPC_VERSION = 1;
+constexpr uint32_t DPC_MAX_TOKENS = 1u << 24;
+constexpr uint32_t DPC_MAX_CHECKPOINTS = 1024;
+
+// compact SHA-256 (FIPS 180-4), single-shot. mirrors the core in common/fit-cache.cpp
+uint32_t dpc_sha256_k[64] = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+};
+
+uint32_t dpc_rotr(uint32_t x, uint32_t n) {
+    return (x >> n) | (x << (32 - n));
+}
+
+void dpc_block(uint32_t h[8], const uint8_t * p) {
+    uint32_t w[64];
+    for (size_t i = 0; i < 16; i++) {
+        w[i] = ((uint32_t) p[i * 4 + 0] << 24) |
+               ((uint32_t) p[i * 4 + 1] << 16) |
+               ((uint32_t) p[i * 4 + 2] <<  8) |
+               ((uint32_t) p[i * 4 + 3] <<  0);
+    }
+    for (size_t i = 16; i < 64; i++) {
+        const uint32_t s0 = dpc_rotr(w[i - 15], 7) ^ dpc_rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+        const uint32_t s1 = dpc_rotr(w[i - 2], 17)  ^ dpc_rotr(w[i - 2], 19)   ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+
+    uint32_t a = h[0], b = h[1], c = h[2], d = h[3];
+    uint32_t e = h[4], f = h[5], g = h[6], hh = h[7];
+
+    for (size_t i = 0; i < 64; i++) {
+        const uint32_t S1 = dpc_rotr(e, 6) ^ dpc_rotr(e, 11) ^ dpc_rotr(e, 25);
+        const uint32_t ch = (e & f) ^ (~e & g);
+        const uint32_t t1 = hh + S1 + ch + dpc_sha256_k[i] + w[i];
+        const uint32_t S0 = dpc_rotr(a, 2) ^ dpc_rotr(a, 13) ^ dpc_rotr(a, 22);
+        const uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+        const uint32_t t2 = S0 + maj;
+        hh = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
+    }
+
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d;
+    h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+}
+
+std::string dpc_sha256_hex(const uint8_t * data, size_t len) {
+    uint32_t h[8] = {
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    };
+
+    const uint64_t bitlen = (uint64_t) len * 8;
+    std::vector<uint8_t> buf(data, data + len);
+    buf.push_back(0x80);
+    while (buf.size() % 64 != 56) {
+        buf.push_back(0x00);
+    }
+    for (int i = 7; i >= 0; i--) {
+        buf.push_back((uint8_t) (bitlen >> (i * 8)));
+    }
+
+    for (size_t off = 0; off < buf.size(); off += 64) {
+        dpc_block(h, buf.data() + off);
+    }
+
+    static const char hex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(64);
+    for (size_t i = 0; i < 8; i++) {
+        const uint32_t v = h[i];
+        const uint8_t b[4] = {
+            (uint8_t) (v >> 24), (uint8_t) (v >> 16), (uint8_t) (v >> 8), (uint8_t) (v >> 0),
+        };
+        for (int j = 0; j < 4; j++) {
+            out.push_back(hex[b[j] >> 4]);
+            out.push_back(hex[b[j] & 0x0f]);
+        }
+    }
+    return out;
+}
+
+// entry layout (all little-endian):
+//   u32 magic, u32 version, u32 n_tokens,
+//   u64 len_main, u64 len_drft, u32 n_checkpoints,
+//   tokens[n_tokens], main[len_main], drft[len_drft],
+//   per checkpoint: i64 n_tokens, i32 id_task, i32 pos_min, i32 pos_max,
+//                   u64 n_tgt, u64 n_dft, u64 n_spec, tgt[n_tgt], dft[n_dft], spec[n_spec]
+bool dpc_write_state(FILE * f, const server_prompt_cache_state & state) {
+    const llama_tokens tokens = state.prompt.tokens.get_text_tokens();
+
+    bool ok = true;
+
+    const uint32_t n_tokens = (uint32_t) tokens.size();
+    const uint64_t len_main = state.data.main.size();
+    const uint64_t len_drft = state.data.drft.size();
+    const uint32_t n_ckpt   = (uint32_t) state.prompt.checkpoints.size();
+
+    ok = ok && fwrite(&n_tokens,     4, 1, f) == 1;
+    ok = ok && fwrite(&len_main,     8, 1, f) == 1;
+    ok = ok && fwrite(&len_drft,     8, 1, f) == 1;
+    ok = ok && fwrite(&n_ckpt,       4, 1, f) == 1;
+    ok = ok && (n_tokens == 0 || fwrite(tokens.data(), sizeof(llama_token), n_tokens, f) == n_tokens);
+    ok = ok && (len_main == 0 || fwrite(state.data.main.data(), 1, len_main, f) == len_main);
+    ok = ok && (len_drft == 0 || fwrite(state.data.drft.data(), 1, len_drft, f) == len_drft);
+
+    for (const auto & ckpt : state.prompt.checkpoints) {
+        const int64_t  n_tokens = ckpt.n_tokens;
+        const int32_t  id_task  = ckpt.id_task;
+        const int32_t  pos_min  = ckpt.pos_min;
+        const int32_t  pos_max  = ckpt.pos_max;
+        const uint64_t n_tgt    = ckpt.data_tgt.size();
+        const uint64_t n_dft    = ckpt.data_dft.size();
+        const uint64_t n_spec   = ckpt.data_spec.size();
+
+        ok = ok && fwrite(&n_tokens, 8, 1, f) == 1;
+        ok = ok && fwrite(&id_task,  4, 1, f) == 1;
+        ok = ok && fwrite(&pos_min,  4, 1, f) == 1;
+        ok = ok && fwrite(&pos_max,  4, 1, f) == 1;
+        ok = ok && fwrite(&n_tgt,    8, 1, f) == 1;
+        ok = ok && fwrite(&n_dft,    8, 1, f) == 1;
+        ok = ok && fwrite(&n_spec,   8, 1, f) == 1;
+        ok = ok && (n_tgt == 0  || fwrite(ckpt.data_tgt.data(),  1, n_tgt,  f) == n_tgt);
+        ok = ok && (n_dft == 0  || fwrite(ckpt.data_dft.data(),  1, n_dft,  f) == n_dft);
+        ok = ok && (n_spec == 0 || fwrite(ckpt.data_spec.data(), 1, n_spec, f) == n_spec);
+    }
+
+    return ok;
+}
+
+bool dpc_read_state(FILE * f, server_prompt_cache_state & state) {
+    auto rd = [&](void * dst, size_t n) { return fread(dst, 1, n, f) == n; };
+
+    uint32_t n_tokens = 0;
+    uint64_t len_main = 0;
+    uint64_t len_drft = 0;
+    uint32_t n_ckpt   = 0;
+
+    bool ok = rd(&n_tokens, 4) && rd(&len_main, 8) && rd(&len_drft, 8) && rd(&n_ckpt, 4) &&
+              n_tokens <= DPC_MAX_TOKENS && n_ckpt <= DPC_MAX_CHECKPOINTS &&
+              len_main <= (1ull << 34) && len_drft <= (1ull << 34);
+
+    llama_tokens tokens(n_tokens);
+    ok = ok && (n_tokens == 0 || fread(tokens.data(), sizeof(llama_token), n_tokens, f) == n_tokens);
+
+    state.data.main.resize(len_main);
+    state.data.drft.resize(len_drft);
+    ok = ok && (len_main == 0 || fread(state.data.main.data(), 1, len_main, f) == len_main);
+    ok = ok && (len_drft == 0 || fread(state.data.drft.data(), 1, len_drft, f) == len_drft);
+
+    for (uint32_t i = 0; ok && i < n_ckpt; ++i) {
+        auto & ckpt = state.prompt.checkpoints.emplace_back();
+
+        uint64_t n_tgt  = 0;
+        uint64_t n_dft  = 0;
+        uint64_t n_spec = 0;
+
+        ok = ok && rd(&ckpt.n_tokens, 8) && rd(&ckpt.id_task, 4) &&
+              rd(&ckpt.pos_min, 4) && rd(&ckpt.pos_max, 4) &&
+              rd(&n_tgt, 8) && rd(&n_dft, 8) && rd(&n_spec, 8);
+
+        ok = ok && n_tgt <= (1ull << 34) && n_dft <= (1ull << 34) && n_spec <= (1ull << 34);
+
+        if (ok) {
+            ckpt.data_tgt.resize(n_tgt);
+            ckpt.data_dft.resize(n_dft);
+            ckpt.data_spec.resize(n_spec);
+            ok = ok && (n_tgt == 0  || fread(ckpt.data_tgt.data(),  1, n_tgt,  f) == n_tgt);
+            ok = ok && (n_dft == 0  || fread(ckpt.data_dft.data(),  1, n_dft,  f) == n_dft);
+            ok = ok && (n_spec == 0 || fread(ckpt.data_spec.data(), 1, n_spec, f) == n_spec);
+        }
+    }
+
+    state.prompt.tokens = server_tokens(tokens, false);
+
+    return ok;
+}
+
+} // namespace
+
+bool server_prompt_cache::save_to_disk(const std::string & dir, const std::string & fingerprint) const {
+    namespace fs = std::filesystem;
+
+    std::error_code ec;
+    if (!fs::is_directory(dir, ec)) {
+        fs::create_directories(dir, ec);
+        if (ec) {
+            SRV_WRN(" - disk prompt cache: failed to create directory '%s': %s\n", dir.c_str(), ec.message().c_str());
+            return false;
+        }
+    }
+
+    const std::string meta_path = (fs::path(dir) / "meta").string();
+    const std::string meta_tmp  = (fs::path(dir) / "meta.tmp").string();
+
+    std::string stored;
+    {
+        std::ifstream in(meta_path, std::ios::binary);
+        stored.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        // strip trailing newlines (older saves wrote a trailing '\n')
+        while (!stored.empty() && (stored.back() == '\n' || stored.back() == '\r')) {
+            stored.pop_back();
+        }
+    }
+
+    // a config change invalidates the whole directory
+    if (stored != fingerprint) {
+        SRV_INF(" - disk prompt cache: fingerprint changed, clearing '%s'\n", dir.c_str());
+        for (auto & entry : fs::directory_iterator(dir, ec)) {
+            if (entry.path().extension() == ".dpc") {
+                fs::remove(entry.path(), ec);
+            }
+        }
+    }
+
+    bool ok = true;
+    std::set<std::string> written;
+
+    for (const auto & state : states) {
+        // media placeholders cannot be rebuilt from token ids, skip such entries
+        if (state.prompt.tokens.has_mtmd) {
+            SRV_TRC("%s", " - disk prompt cache: skipping media prompt\n");
+            continue;
+        }
+
+        const llama_tokens tokens = state.prompt.tokens.get_text_tokens();
+        const std::string fname = dpc_sha256_hex((const uint8_t *) tokens.data(), tokens.size() * sizeof(llama_token)) + ".dpc";
+        const std::string path  = (fs::path(dir) / fname).string();
+        const std::string tmp   = path + ".tmp";
+
+        FILE * f = fopen(tmp.c_str(), "wb");
+        if (f == nullptr) {
+            SRV_WRN(" - disk prompt cache: cannot open '%s'\n", tmp.c_str());
+            ok = false;
+            continue;
+        }
+
+        const uint32_t magic   = DPC_MAGIC;
+        const uint32_t version = DPC_VERSION;
+
+        bool entry_ok = fwrite(&magic, 4, 1, f) == 1 && fwrite(&version, 4, 1, f) == 1 && dpc_write_state(f, state);
+        fclose(f);
+
+        if (entry_ok) {
+            fs::rename(tmp, path, ec);
+            if (!ec) {
+                written.insert(fname);
+            } else {
+                SRV_WRN(" - disk prompt cache: rename to '%s' failed: %s\n", path.c_str(), ec.message().c_str());
+                ok = false;
+            }
+        } else {
+            SRV_WRN(" - disk prompt cache: write to '%s' failed\n", tmp.c_str());
+            ok = false;
+        }
+    }
+
+    // drop stale entries so the directory mirrors the in-memory cache
+    for (auto & entry : fs::directory_iterator(dir, ec)) {
+        if (entry.path().extension() == ".dpc" && !written.count(entry.path().filename().string())) {
+            fs::remove(entry.path(), ec);
+        }
+    }
+
+    // the fingerprint is written last: an interrupted save leaves the old meta
+    // in place and the directory is never treated as valid against the new config
+    {
+        std::ofstream out(meta_tmp, std::ios::binary);
+        out.write(fingerprint.data(), (std::streamsize) fingerprint.size());
+        out.close();
+    }
+    fs::rename(meta_tmp, meta_path, ec);
+    if (ec) {
+        SRV_WRN(" - disk prompt cache: failed to write meta: %s\n", ec.message().c_str());
+        ok = false;
+    }
+
+    return ok;
+}
+
+size_t server_prompt_cache::load_from_disk(const std::string & dir, const std::string & fingerprint) {
+    namespace fs = std::filesystem;
+
+    std::error_code ec;
+    if (!fs::is_directory(dir, ec)) {
+        return 0;
+    }
+
+    std::string stored;
+    {
+        std::ifstream in((fs::path(dir) / "meta").string(), std::ios::binary);
+        if (!in) {
+            SRV_INF(" - disk prompt cache: no meta in '%s', skipping load\n", dir.c_str());
+            return 0;
+        }
+        stored.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        // strip trailing newlines (older saves wrote a trailing '\n')
+        while (!stored.empty() && (stored.back() == '\n' || stored.back() == '\r')) {
+            stored.pop_back();
+        }
+    }
+
+    if (stored != fingerprint) {
+        SRV_INF(" - disk prompt cache: fingerprint mismatch for '%s', ignoring cached prompts\n", dir.c_str());
+        return 0;
+    }
+
+    std::vector<fs::path> files;
+    for (auto & entry : fs::directory_iterator(dir, ec)) {
+        if (entry.path().extension() == ".dpc") {
+            files.push_back(entry.path());
+        }
+    }
+
+    // deterministic order
+    std::sort(files.begin(), files.end());
+
+    size_t n_loaded = 0;
+    for (const auto & path : files) {
+        FILE * f = fopen(path.string().c_str(), "rb");
+        if (f == nullptr) {
+            continue;
+        }
+
+        uint32_t magic = 0;
+        uint32_t version = 0;
+        bool header_ok = fread(&magic, 4, 1, f) == 1 && fread(&version, 4, 1, f) == 1;
+
+        server_prompt_cache_state state;
+        bool ok = header_ok && magic == DPC_MAGIC && version == DPC_VERSION && dpc_read_state(f, state);
+        fclose(f);
+
+        if (ok) {
+            states.push_back(std::move(state));
+            n_loaded++;
+        } else {
+            SRV_WRN(" - disk prompt cache: ignoring corrupt entry '%s'\n", path.filename().string().c_str());
+        }
+    }
+
+    update();
+
+    return n_loaded;
 }

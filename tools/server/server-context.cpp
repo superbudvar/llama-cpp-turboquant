@@ -19,6 +19,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
@@ -1226,6 +1227,55 @@ private:
         mctx = nullptr;
     }
 
+    std::string prompt_cache_disk_dir() const {
+        // derive the per-model subdirectory from the model name (alias in router mode)
+        std::string name = model_name;
+        std::replace_if(name.begin(), name.end(),
+            [](char c) { return !(std::isalnum((unsigned char) c) || c == '.' || c == '-' || c == '_'); }, '_');
+        return (std::filesystem::path(params_base.cache_disk_path) / name).string();
+    }
+
+    std::string prompt_cache_disk_fingerprint() const {
+        std::error_code ec;
+        const auto pmodel = std::filesystem::path(params_base.model.path);
+        const auto fsize  = std::filesystem::file_size(pmodel, ec);
+        const auto ftime  = std::filesystem::last_write_time(pmodel, ec).time_since_epoch().count();
+        return params_base.model.path + "\n" +
+               std::to_string(fsize) + "\n" +
+               std::to_string(ftime) + "\n" +
+               std::to_string((int) params_base.cache_type_k) + "\n" +
+               std::to_string((int) params_base.cache_type_v) + "\n" +
+               std::to_string(params_base.n_ctx) + "\n" +
+               std::to_string((int) params_base.flash_attn_type) + "\n" +
+               std::to_string(params_base.n_parallel) + "\n" +
+               std::to_string(params_base.kv_unified);
+    }
+
+    size_t prompt_cache_disk_load() {
+        if (!prompt_cache || params_base.cache_disk_path.empty() || !prompt_cache->states.empty()) {
+            return 0;
+        }
+        const size_t n = prompt_cache->load_from_disk(prompt_cache_disk_dir(), prompt_cache_disk_fingerprint());
+        SRV_INF("loaded %zu prompt cache states from disk\n", n);
+        return n;
+    }
+
+    void prompt_cache_disk_save() {
+        if (!prompt_cache || params_base.cache_disk_path.empty()) {
+            return;
+        }
+        // idle slots are normally flushed into the shared cache on the next task launch;
+        // capture them now so the freshest worked prefix survives the process
+        for (auto & slot : slots) {
+            if (!slot.is_processing()) {
+                slot.prompt_save(*prompt_cache);
+            }
+        }
+        prompt_cache->update();
+        const bool ok = prompt_cache->save_to_disk(prompt_cache_disk_dir(), prompt_cache_disk_fingerprint());
+        SRV_INF("saved %zu prompt cache states to disk%s\n", prompt_cache->states.size(), ok ? "" : " (with errors)");
+    }
+
     void handle_sleeping_state(bool new_state) {
         GGML_ASSERT(sleeping != new_state);
         if (new_state) {
@@ -1771,6 +1821,9 @@ private:
 
         model_aliases = params_base.model_alias;
         model_tags    = params_base.model_tags;
+
+        // restore the disk prompt cache (no-op when disabled or already populated)
+        prompt_cache_disk_load();
 
         // propagate new defaults back to the initial caller
         if (!is_resume) {
@@ -4494,6 +4547,10 @@ void server_context::start_loop() {
 
 void server_context::terminate() {
     impl->queue_tasks.terminate();
+}
+
+void server_context::save_disk_cache() {
+    impl->prompt_cache_disk_save();
 }
 
 llama_context * server_context::get_llama_context() const {

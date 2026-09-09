@@ -428,6 +428,8 @@ int llama_server(common_params & params, int argc, char ** argv) {
             server_stream_session_manager_stop();
             ctx_http.stop();
             ctx_server.terminate();
+            // persist the prompt cache so the next process can restore it
+            ctx_server.save_disk_cache();
             mcp_mgr.shutdown();
             llama_backend_free();
         };

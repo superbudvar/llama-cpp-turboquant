@@ -1685,6 +1685,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--cache-disk"}, "PATH",
+        "persist the in-memory prompt cache to disk on exit, and reload it on start (requires --cache-ram)"
+            "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)",
+        [](common_params & params, const std::string & value) {
+            params.cache_disk_path = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",
@@ -2807,6 +2815,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         LLAMA_EXAMPLE_MTMD,
         LLAMA_EXAMPLE_FIT_PARAMS,
     }).set_env("LLAMA_ARG_FIT_STRATEGY_MIN_CTX"));
+    add_opt(common_arg(
+        {"--fit-cache-clear"},
+        "discard the disk fit result cache for this model before fitting, forcing a fresh probe suite",
+        [](common_params & params) {
+            params.fit_cache_clear = true;
+        }
+    ).set_examples({
+        LLAMA_EXAMPLE_CLI,
+        LLAMA_EXAMPLE_SERVER,
+        LLAMA_EXAMPLE_PERPLEXITY,
+        LLAMA_EXAMPLE_IMATRIX,
+        LLAMA_EXAMPLE_TTS,
+        LLAMA_EXAMPLE_COMPLETION,
+        LLAMA_EXAMPLE_RESULTS,
+        LLAMA_EXAMPLE_CVECTOR_GENERATOR,
+        LLAMA_EXAMPLE_MTMD,
+        LLAMA_EXAMPLE_FIT_PARAMS,
+    }).set_env("LLAMA_ARG_FIT_CACHE_CLEAR"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

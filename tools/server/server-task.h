@@ -658,6 +658,14 @@ struct server_prompt_cache {
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
+
+    // persist/restore the cache to a directory of <sha256-of-tokens>.dpc files.
+    // save_to_disk writes a meta file carrying the caller-provided fingerprint and
+    // removes stale entry files so the directory mirrors the in-memory cache.
+    // load_from_disk only imports entries when the stored fingerprint matches the
+    // caller-provided one. returns the number of states loaded.
+    bool save_to_disk(const std::string & dir, const std::string & fingerprint) const;
+    size_t load_from_disk(const std::string & dir, const std::string & fingerprint);
 };
 
 // used exclusively by router mode

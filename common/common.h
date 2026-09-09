@@ -504,6 +504,7 @@ struct common_params {
 
     common_fit_strategy fit_strategy       = COMMON_FIT_STRATEGY_UPSTREAM; // selectable fit engine
     int32_t             fit_strategy_min_ctx = 0; // strategy floor, 0 = unset -> required for non-upstream
+    bool                fit_cache_clear    = false; // discard the disk fit result cache for this model before fitting
 
     std::vector<std::string> rpc_hosts; // RPC server hosts captured at parse time (cold-start signal)
 
@@ -654,6 +655,7 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    std::string cache_disk_path = "";    // persist the prompt cache to disk (requires cache_ram_mib != 0)
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
