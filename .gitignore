@@ -159,3 +159,8 @@ AGENTS.local.md
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# Agent runtime state and fit probe artifacts
+.agents/
+fit-session.jsonp
+fit-session.raw.jsonp
