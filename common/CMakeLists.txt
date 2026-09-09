@@ -74,6 +74,8 @@ add_library(${TARGET}
     download.cpp
     download.h
     fit.cpp
+    fit-cache.cpp
+    fit-cache.h
     fit.h
     fit-stats.cpp
     fit-stats.h

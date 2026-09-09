@@ -29,6 +29,7 @@ Turbo cache types are runtime-only, never stored in GGUF. TQ3_1S/TQ4_1S are firs
 - `ggml/src/ggml-cuda/mmvq-tq.cu` - native TQ dp4a kernels (`GGML_TQ_NATIVE=1`)
 - `ggml/src/ggml-vulkan/` - turbo FA, SET_ROWS, dequant shaders
 - `ggml/src/ggml-metal/ggml-metal.metal` - TurboFlash kernels
+- `common/fit-strategy.cpp` / `common/fit.cpp` - rpc-aware fit placement solver (see `common/AGENTS.md` for scan-direction and probe-artifact traps)
 - `docs/KV-cache-quantization.md` - authoritative usage doc (read before touching cache types)
 
 ### Usage

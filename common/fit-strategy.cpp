@@ -1,4 +1,5 @@
 #include "fit-strategy.h"
+#include "fit-cache.h"
 
 #include "../src/llama-ext.h" // llama_model_get_moe_tensor_info, llama_model_get_tensor_devices (internal)
 #include "common.h"
@@ -757,11 +758,14 @@ static bool fit_solve_rpc_aware(
         // layer share is the context bottleneck. a balanced split maximizes the
         // global context; a min-offload split leaves the local device holding most
         // layers and caps context far below the available headroom.
+        // scan bottom-up so that among splits reaching the same maximum context
+        // the smallest rpc_frac (least RPC offload) wins: RPC is used last to
+        // avoid per-token network lag on the dense path.
         float best_ftry = -1.0f;
         int32_t best_ctx = -1;
         common_fit_plan best_plan;
         fit_measure_result best_m;
-        for (float ftry = f_hi_off; ftry >= f_lo_off - 1e-6f; ftry -= 0.05f) {
+        for (float ftry = f_lo_off; ftry <= f_hi_off + 1e-6f; ftry += 0.05f) {
             common_fit_plan plan;
             fit_measure_result m;
             const int32_t ctx = fit_grow_context(analysis, margins, params, mparams, cparams,
@@ -1131,24 +1135,54 @@ common_params_fit_status common_fit_strategy_apply_impl(
         bool have_plan = false;
 
         if (plan == nullptr) {
-            if (params.fit_strategy == COMMON_FIT_STRATEGY_RPC_AWARE) {
-                have_plan = fit_solve_rpc_aware(
-                        analysis, margins, params, mparams, cparams, probe, params.model.path,
-                        hp_ngl, final_plan, win_measure);
-                if (!have_plan) {
-                    // exhaust: fall back to the stock solver with the re-attributed margins
-                    LOG_WRN("%s: no rpc-aware candidate fit; falling back to the upstream fit\n", __func__);
-                    return common_fit_params(params.model.path.c_str(), mparams, cparams,
-                            params.tensor_split, params.tensor_buft_overrides.data(), &params.moe_cache,
-                            params.fit_params_target.data(),
-                            params.fit_strategy_min_ctx > 0 ? params.fit_strategy_min_ctx : params.fit_params_min_ctx,
-                            GGML_LOG_LEVEL_INFO);
+            // fit cache: a hit substitutes the cached placement for the probe
+            // suite. it is validated with a single probe; on any failure the
+            // solver runs as usual (soft miss).
+            common_fit_plan cache_plan;
+            bool cache_ok = false;
+            if (common_fit_cache_load(params, params.model.path, analysis, cache_plan)) {
+                LOG_INF("%s: fit cache hit for %s, validating cached placement\n",
+                        __func__, params.model.path.c_str());
+                bool in_bounds = true;
+                for (int id : cache_plan.role_devices) {
+                    if (id >= (int) analysis.devices.size()) {
+                        LOG_WRN("%s: cached plan references unknown device id %d, refitting\n",
+                                __func__, id);
+                        in_bounds = false;
+                        break;
+                    }
                 }
-            } else {
-                final_plan = fit_solve_maxctx(
-                        analysis, margins, params, mparams, cparams, probe, params.model.path,
-                        hp_ngl, win_measure);
-                have_plan = true;
+                if (in_bounds &&
+                        fit_measure_plan(probe, cache_plan, mparams, cparams, params.model.path, win_measure) &&
+                        fit_same_devices(win_measure.devs, analysis) &&
+                        fit_fits_margins(win_measure.memory, margins, analysis)) {
+                    final_plan = cache_plan;
+                    have_plan  = true;
+                    cache_ok   = true;
+                } else {
+                    LOG_WRN("%s: cached placement failed validation, refitting\n", __func__);
+                }
+            }
+            if (!cache_ok) {
+                if (params.fit_strategy == COMMON_FIT_STRATEGY_RPC_AWARE) {
+                    have_plan = fit_solve_rpc_aware(
+                            analysis, margins, params, mparams, cparams, probe, params.model.path,
+                            hp_ngl, final_plan, win_measure);
+                    if (!have_plan) {
+                        // exhaust: fall back to the stock solver with the re-attributed margins
+                        LOG_WRN("%s: no rpc-aware candidate fit; falling back to the upstream fit\n", __func__);
+                        return common_fit_params(params.model.path.c_str(), mparams, cparams,
+                                params.tensor_split, params.tensor_buft_overrides.data(), &params.moe_cache,
+                                params.fit_params_target.data(),
+                                params.fit_strategy_min_ctx > 0 ? params.fit_strategy_min_ctx : params.fit_params_min_ctx,
+                                GGML_LOG_LEVEL_INFO);
+                    }
+                } else {
+                    final_plan = fit_solve_maxctx(
+                            analysis, margins, params, mparams, cparams, probe, params.model.path,
+                            hp_ngl, win_measure);
+                    have_plan = true;
+                }
             }
         } else {
             // manual plan: measure it once, a conflict is a hard error
@@ -1176,6 +1210,10 @@ common_params_fit_status common_fit_strategy_apply_impl(
 
         fit_serialize(final_plan, params, mparams, cparams, analysis, win_measure, margins);
         fit_validate(final_plan, analysis, params, mparams, cparams, probe, params.model.path);
+
+        // save the successful placement to the disk cache (best-effort); on a
+        // cache hit this refreshes the freshness timestamp
+        common_fit_cache_save(params, params.model.path, analysis, final_plan);
 
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {
