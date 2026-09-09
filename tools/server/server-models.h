@@ -86,6 +86,10 @@ struct server_model_meta {
     mtmd_caps multimodal; // multimodal capabilities
     // bool need_download = false; // whether the model needs to be downloaded before loading // TODO @ngxson: implement this
 
+    // request queueing support
+    int n_active = 0; // number of in-flight requests for this model
+    int64_t last_request_time = 0; // timestamp of last begin_request call (for crash recovery)
+
     bool is_ready() const {
         return status == SERVER_MODEL_STATUS_LOADED;
     }
@@ -105,6 +109,11 @@ struct server_model_meta {
 struct server_models_routes;
 struct server_subproc; // defined in server-models.cpp
 
+// thrown when a request queued behind busy models exceeds the queue timeout
+struct server_queue_timeout_error : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 struct server_models {
     friend struct server_models_routes;
 
@@ -113,6 +122,7 @@ private:
         std::shared_ptr<server_subproc> subproc; // shared between main thread and monitoring thread
         std::thread th;
         server_model_meta meta;
+        bool evicting = false; // set while this instance is being evicted by the capacity gate
     };
 
     std::mutex mutex;
@@ -143,7 +153,7 @@ private:
             }
             std::lock_guard<std::mutex> lock(mu);
             uint64_t ticket = next_ticket++;
-            map[conv_id] = { model, ticket };
+            map[conv_id] = { model, ticket, ggml_time_ms() };
             return ticket;
         }
 
@@ -174,10 +184,48 @@ private:
             map.erase(conv_id);
         }
 
+        // number of live conversations owned by a model; 0 means the model is safe to evict
+        // without losing resumable session state. also opportunistically drops entries older
+        // than the TTL so a deleted-but-never-forgotten conversation cannot pin a model forever
+        size_t count_for_model(const std::string & model) {
+            std::lock_guard<std::mutex> lock(mu);
+            if (model.empty()) {
+                return 0;
+            }
+            const uint64_t ttl_ms = 300000; // 5 min: matches the stale n_active watchdog
+            size_t count = 0;
+            std::vector<std::string> stale;
+            for (const auto & kv : map) {
+                if (kv.second.model == model) {
+                    count++;
+                }
+                if (ggml_time_ms() - kv.second.timestamp > (int64_t) ttl_ms) {
+                    stale.push_back(kv.first);
+                }
+            }
+            for (const auto & conv_id : stale) {
+                map.erase(conv_id);
+            }
+            return count;
+        }
+
+      // drop every conversation owned by a model (called when the instance reaches UNLOADED)
+        void forget_all_for_model(const std::string & model) {
+            std::lock_guard<std::mutex> lock(mu);
+            for (auto it = map.begin(); it != map.end();) {
+                if (it->second.model == model) {
+                    it = map.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
       private:
         struct entry_t {
             std::string model;
             uint64_t    ticket;
+            int64_t     timestamp; // for TTL cleanup
         };
         std::mutex                               mu;
         uint64_t                                 next_ticket = 1;
@@ -194,7 +242,14 @@ private:
     void update_meta(const std::string & name, const server_model_meta & meta);
 
     // unload least recently used models if the limit is reached
-    void unload_lru();
+    void unload_lru(const std::string & name);
+
+    // request queueing support
+    void begin_request(const std::string & name);
+    void end_request(const std::string & name);
+    void ensure_capacity_locked(std::unique_lock<std::mutex> & lk, const std::string & name);
+    std::string conv_models_for(const std::string & name);
+    void reconcile_stale_n_active();
 
     // not thread-safe, caller must hold mutex
     void add_model(server_model_meta && meta);
@@ -219,6 +274,17 @@ public:
 
     // check if a model instance exists (thread-safe)
     bool has_model(const std::string & name);
+
+    // true if any request is in-flight (thread-safe); used to reject reloads mid-generation
+    bool has_inflight_requests() {
+        std::lock_guard<std::mutex> lk(mutex);
+        for (const auto & m : mapping) {
+            if (m.second.meta.n_active > 0) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     // return a copy of model metadata (thread-safe)
     std::optional<server_model_meta> get_meta(const std::string & name);
@@ -266,7 +332,7 @@ public:
     bool ensure_model_ready(const std::string & name);
 
     // proxy an HTTP request to the model instance
-    server_http_res_ptr proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used, bool detached = false);
+    server_http_res_ptr proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used, bool detached = false, const std::function<void()> & on_done = {});
 
     // handle message sent from server_child::notify_to_router()
     // raw input must starts with CMD_CHILD_TO_ROUTER_STATE, followed by a JSON string
@@ -343,6 +409,7 @@ struct server_models_routes {
  */
 struct server_http_proxy : server_http_res {
     std::function<void()> cleanup = nullptr;
+    std::function<void()> on_done = nullptr; // called on response completion to release the n_active counter
 public:
     server_http_proxy(const std::string & method,
                       const std::string & scheme,
@@ -359,6 +426,12 @@ public:
     ~server_http_proxy() {
         if (cleanup) {
             cleanup();
+        }
+    }
+
+    void on_complete() override {
+        if (on_done) {
+            on_done();
         }
     }
 private:

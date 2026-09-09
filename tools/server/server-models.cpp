@@ -316,6 +316,18 @@ void server_models::notify_sse(const std::string & event, const std::string & mo
 }
 
 void server_models::load_models() {
+    // Phase 0: do not mutate while any request is in-flight - a reload here would interrupt
+    // an active generation. seen from the API reload endpoint and the periodic refresh loop
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        for (const auto & m : mapping) {
+            if (m.second.meta.n_active > 0) {
+                SRV_INF("skipping model list reload: %d request(s) in-flight (name=%s)\n",
+                        m.second.meta.n_active, m.first.c_str());
+                return;
+            }
+        }
+    }
     // Phase 1: load presets from all sources - pure I/O, no lock needed
     // 1. cached models
     common_presets cached_models = ctx_preset.load_from_cache();
@@ -708,35 +720,129 @@ std::vector<server_model_meta> server_models::get_all_meta() {
     return result;
 }
 
-void server_models::unload_lru() {
+void server_models::unload_lru(const std::string & name) {
+    std::unique_lock<std::mutex> lk(mutex);
+    ensure_capacity_locked(lk, name);
+}
+
+void server_models::ensure_capacity_locked(std::unique_lock<std::mutex> & lk, const std::string & name) {
     if (base_params.models_max <= 0) {
         return; // no limit
     }
-    // remove one of the servers if we passed the models_max (least recently used - LRU)
-    std::string lru_model_name = "";
-    int64_t lru_last_used = ggml_time_ms();
-    size_t count_active = 0;
-    {
-        std::unique_lock<std::mutex> lk(mutex);
+    while (true) {
+        // caller may have re-checked and found another thread owns the spawn
+        auto it = mapping.find(name);
+        if (it != mapping.end() && it->second.meta.status != SERVER_MODEL_STATUS_UNLOADED) {
+            return; // already loading/loaded - someone else handles this
+        }
+        size_t count_active = 0;
         for (const auto & m : mapping) {
             if (m.second.meta.is_running()) {
                 count_active++;
-                if (m.second.meta.last_used < lru_last_used) {
+            }
+        }
+        if (count_active < (size_t)base_params.models_max) {
+            return; // room to spawn
+        }
+        // pick LRU idle victim: running, zero in-flight, not being evicted, not loading,
+        // and no active resumable-stream conversations
+        std::string lru_model_name = "";
+        int64_t lru_last_used = ggml_time_ms();
+        for (const auto & m : mapping) {
+            const auto & meta = m.second.meta;
+            if (meta.is_running() &&
+                meta.n_active == 0 &&
+                !m.second.evicting &&
+                meta.status != SERVER_MODEL_STATUS_LOADING &&
+                conv_models_for(m.first).empty()) {
+                if (meta.last_used < lru_last_used) {
                     lru_model_name = m.first;
-                    lru_last_used = m.second.meta.last_used;
+                    lru_last_used  = meta.last_used;
                 }
             }
         }
+        if (!lru_model_name.empty()) {
+            SRV_INF("models_max limit reached, removing LRU name=%s\n", lru_model_name.c_str());
+            auto & victim = mapping[lru_model_name];
+            victim.evicting = true;
+            lk.unlock();
+            unload(lru_model_name);
+            // wait for unload to complete
+            {
+                std::unique_lock<std::mutex> lk2(mutex);
+                cv.wait(lk2, [this, &lru_model_name]() {
+                    auto vit = mapping.find(lru_model_name);
+                    return vit == mapping.end() || vit->second.meta.status == SERVER_MODEL_STATUS_UNLOADED;
+                });
+            }
+            lk.lock();
+            if (it != mapping.end() && it->second.meta.status != SERVER_MODEL_STATUS_UNLOADED) {
+                return; // someone loaded the victim's slot or target while we waited
+            }
+            continue; // re-check capacity, may need to evict more (or another victim)
+        }
+        // all running models are busy - wait for one to drain. timeout_reuse:
+        // long default (several hours) so legit long generations do not abort
+        const int64_t queue_timeout_ms = std::max(30000LL, base_params.timeout_read * 1000LL);
+        SRV_INF("all models busy at models_max=%d, waiting for a slot to free up (request for %s)\n",
+                base_params.models_max, name.c_str());
+        if (cv.wait_for(lk, std::chrono::milliseconds(queue_timeout_ms)) == std::cv_status::timeout) {
+            // if the target is now unloaded, another thread may have grabbed capacity; treat
+            // timeout as capacity-unavailable for this request
+            throw server_queue_timeout_error("model limit reached, try again later");
+        }
     }
-    if (!lru_model_name.empty() && count_active >= (size_t)base_params.models_max) {
-        SRV_INF("models_max limit reached, removing LRU name=%s\n", lru_model_name.c_str());
-        unload(lru_model_name);
-        // wait for unload to complete
-        {
-            std::unique_lock<std::mutex> lk(mutex);
-            cv.wait(lk, [this, &lru_model_name]() {
-                return mapping[lru_model_name].meta.status == SERVER_MODEL_STATUS_UNLOADED;
-            });
+}
+
+// count live conv_models entries owned by the given model name; 0 means safe to evict
+std::string server_models::conv_models_for(const std::string & name) {
+    return conv_models.count_for_model(name) > 0 ? name : std::string();
+}
+
+void server_models::begin_request(const std::string & name) {
+    std::unique_lock<std::mutex> lk(mutex);
+    reconcile_stale_n_active();
+    auto it = mapping.find(name);
+    if (it == mapping.end()) {
+        throw std::runtime_error("model name=" + name + " is not found");
+    }
+    // wait out an in-flight eviction of this model: update_status clears evicting when the
+    // victim reaches UNLOADED and notifies cv, so we then load a fresh instance
+    cv.wait(lk, [&]() {
+        auto vit = mapping.find(name);
+        return vit == mapping.end() || !vit->second.evicting;
+    });
+    it = mapping.find(name);
+    if (it == mapping.end()) {
+        throw std::runtime_error("model name=" + name + " is not found");
+    }
+    it->second.meta.n_active++;
+    it->second.meta.last_request_time = ggml_time_ms();
+}
+
+void server_models::end_request(const std::string & name) {
+    std::unique_lock<std::mutex> lk(mutex);
+    auto it = mapping.find(name);
+    if (it != mapping.end() && it->second.meta.n_active > 0) {
+        it->second.meta.n_active--;
+        cv.notify_all();
+    }
+}
+
+// watchdog: if a child was force-killed mid-request the n_active counter would never
+// reach 0, permanently blocking eviction. any counter that has not seen a new request
+// for N seconds is considered stale and reset. caller must hold mutex
+void server_models::reconcile_stale_n_active() {
+    const int64_t stale_ms = 300000; // 5 min: far longer than any single generation we expect
+    const int64_t now = ggml_time_ms();
+    for (auto & [name, inst] : mapping) {
+        if (inst.meta.n_active > 0) {
+            int64_t idle_ms = now - inst.meta.last_request_time;
+            if (idle_ms > stale_ms) {
+                SRV_WRN("n_active=%d for name=%s stale (%lld ms since last request), resetting to 0\n",
+                        inst.meta.n_active, name.c_str(), (long long) idle_ms);
+                inst.meta.n_active = 0;
+            }
         }
     }
 }
@@ -750,7 +856,7 @@ void server_models::load(const std::string & name, const load_options & opts) {
         if (!has_model(name)) {
             throw std::runtime_error("model name=" + name + " is not found");
         }
-        unload_lru();
+        unload_lru(name);
     }
 
     std::unique_lock<std::mutex> lk(mutex);
@@ -758,27 +864,26 @@ void server_models::load(const std::string & name, const load_options & opts) {
     // against the freshest preset and a consistent mapping state
     cv.wait(lk, [this]() { return !is_reloading; });
 
-    auto meta = opts.custom_meta.has_value() ? *opts.custom_meta : mapping[name].meta;
-    if (meta.status != SERVER_MODEL_STATUS_UNLOADED) {
+    auto it = mapping.find(name);
+    if (it == mapping.end()) {
+        throw std::runtime_error("model name=" + name + " is not found");
+    }
+    if (it->second.meta.status != SERVER_MODEL_STATUS_UNLOADED) {
         SRV_INF("model %s is not ready\n", name.c_str());
-        return;
+        return; // already loading/loaded - another thread owns this spawn
     }
 
-    // Re-check capacity under the lock to prevent concurrent loads from
-    // exceeding models_max. Without this, the window between unload_lru()
-    // releasing its lock and this lock_guard acquiring allows multiple
-    // threads to each observe capacity and all proceed to load.
+    // re-check capacity under the lock (blocks until a free slot, evicting an idle LRU
+    // model as needed). busy models (n_active > 0 or live conversations) are never evicted
     if (base_params.models_max > 0) {
-        size_t count_active = 0;
-        for (const auto & m : mapping) {
-            if (m.second.meta.is_running()) {
-                count_active++;
-            }
-        }
-        if (count_active >= (size_t)base_params.models_max) {
-            throw std::runtime_error("model limit reached, try again later");
-        }
+        ensure_capacity_locked(lk, name); // returns with lk held
     }
+    // re-read after the gate: entry may have been loaded or erased while we waited
+    it = mapping.find(name);
+    if (it == mapping.end() || it->second.meta.status != SERVER_MODEL_STATUS_UNLOADED) {
+        return;
+    }
+    auto meta = opts.custom_meta.has_value() ? *opts.custom_meta : it->second.meta;
 
     // prepare new instance info
     instance_t inst;
@@ -1006,6 +1111,11 @@ void server_models::update_status(const std::string & name, const update_status_
         if (!args.progress.is_null()) {
             meta.progress = args.progress;
         }
+        if (args.status == SERVER_MODEL_STATUS_UNLOADED) {
+            it->second.evicting = false;
+            // a dead instance can no longer serve resumable-stream conversations
+            conv_models.forget_all_for_model(name);
+        }
     }
     // broadcast status change to SSE
     {
@@ -1172,7 +1282,7 @@ bool server_models::ensure_model_ready(const std::string & name) {
     return true;
 }
 
-server_http_res_ptr server_models::proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used, bool detached) {
+server_http_res_ptr server_models::proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used, bool detached, const std::function<void()> & on_done) {
     auto meta = get_meta(name);
     if (!meta.has_value()) {
         throw std::runtime_error("model name=" + name + " is not found");
@@ -1205,6 +1315,9 @@ server_http_res_ptr server_models::proxy_request(const server_http_req & req, co
             base_params.timeout_read,
             base_params.timeout_write
             );
+    if (on_done) {
+        proxy->on_done = on_done;
+    }
     return proxy;
 }
 
@@ -1588,18 +1701,36 @@ void server_models_routes::init_routes() {
         // this request instead of leaving an orphan generation
         std::string conv_id = server_stream_conv_id_from_headers(req.headers);
         uint64_t ticket = models.conv_models.remember(conv_id, name);
-        bool waited = autoload && models.ensure_model_ready(name);
-        if (ticket != 0 && !models.conv_models.alive(conv_id, ticket)) {
-            SRV_INF("request for conv_id=%s cancelled while model name=%s was loading\n",
-                    conv_id.c_str(), name.c_str());
-            res_err(error_res, format_error_response(
-                    "request cancelled by a stop while the model was loading", ERROR_TYPE_INVALID_REQUEST));
-            return error_res;
+        // count this request against the model before the load wait: while n_active > 0 the
+        // capacity gate will not evict this model, even if it is the LRU
+        models.begin_request(name);
+        try {
+            bool waited = autoload && models.ensure_model_ready(name);
+            if (ticket != 0 && !models.conv_models.alive(conv_id, ticket)) {
+                SRV_INF("request for conv_id=%s cancelled while model name=%s was loading\n",
+                        conv_id.c_str(), name.c_str());
+                models.end_request(name);
+                res_err(error_res, format_error_response(
+                        "request cancelled by a stop while the model was loading", ERROR_TYPE_INVALID_REQUEST));
+                return error_res;
+            }
+            // a session request that waited for a load detaches from the client socket: the
+            // client may have dropped during the wait (page reload) and the session buffer must
+            // still receive the generation for a later resume
+            return models.proxy_request(req, method, name, true, waited && ticket != 0, [this, name]() { // update last usage for POST request only
+                models.end_request(name);
+            });
+        } catch (const server_queue_timeout_error & e) {
+            models.end_request(name);
+            SRV_WRN("request timed out in queue: %s\n", e.what());
+            auto res = std::make_unique<server_http_res>();
+            res->status = 504;
+            res->data   = format_error_response(e.what(), ERROR_TYPE_SERVER).dump();
+            return res;
+        } catch (...) {
+            models.end_request(name);
+            throw;
         }
-        // a session request that waited for a load detaches from the client socket: the
-        // client may have dropped during the wait (page reload) and the session buffer must
-        // still receive the generation for a later resume
-        return models.proxy_request(req, method, name, true, waited && ticket != 0); // update last usage for POST request only
     };
 
     this->post_router_models_load = [this](const server_http_req & req) {
@@ -1623,6 +1754,12 @@ void server_models_routes::init_routes() {
     this->get_router_models = [this](const server_http_req & req) {
         bool reload = !req.get_param("reload", "").empty();
         if (reload) {
+            if (models.has_inflight_requests()) {
+                auto res = std::make_unique<server_http_res>();
+                res_err(res, format_error_response(
+                        "cannot reload while requests are in-flight", ERROR_TYPE_UNAVAILABLE));
+                return res;
+            }
             models.load_models();
         }
         auto res = std::make_unique<server_http_res>();
@@ -1823,19 +1960,30 @@ void server_models_routes::init_routes() {
         }
         SRV_TRC("proxying stream resume to model %s on port %d, path=%s\n",
                 owner->name.c_str(), owner->port, child_path.c_str());
-        auto proxy = std::make_unique<server_http_proxy>(
-                "GET",
-                "http",
-                CHILD_ADDR,
-                owner->port,
-                child_path,
-                req.headers,
-                req.body,
-                req.files,
-                req.should_stop,
-                params.timeout_read,
-                params.timeout_write);
-        return std::unique_ptr<server_http_res>(std::move(proxy));
+        // resume GETs are long-lived and stream from the child with session state; count them
+        // toward n_active so the gate does not evict the model mid-stream
+        models.begin_request(owner->name);
+        try {
+            auto proxy = std::make_unique<server_http_proxy>(
+                    "GET",
+                    "http",
+                    CHILD_ADDR,
+                    owner->port,
+                    child_path,
+                    req.headers,
+                    req.body,
+                    req.files,
+                    req.should_stop,
+                    params.timeout_read,
+                    params.timeout_write);
+            proxy->on_done = [this, name = owner->name]() {
+                this->models.end_request(name);
+            };
+            return std::unique_ptr<server_http_res>(std::move(proxy));
+        } catch (...) {
+            models.end_request(owner->name);
+            throw;
+        }
     };
 
     this->router_streams_lookup = [this](const server_http_req & req) {
