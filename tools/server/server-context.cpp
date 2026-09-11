@@ -503,6 +503,9 @@ struct server_slot {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
 
+        // disk states are text-only; re-assert the multimodal invariant
+        prompt.tokens.has_mtmd = mctx != nullptr;
+
         return res;
     }
 
