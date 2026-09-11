@@ -18,7 +18,7 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr uint32_t CACHE_MAGIC   = 0x46495443; // "FITC"
-constexpr uint32_t CACHE_VERSION = 1;
+constexpr uint32_t CACHE_VERSION = 2;
 constexpr std::int64_t MAX_CACHE_AGE_S = 24 * 3600;
 
 // parse guards: no plan can legitimately exceed these
@@ -272,6 +272,26 @@ key += "model=";
         key += std::to_string(t);
         key += "\n";
     }
+    key += "shed=";
+    key += std::to_string(params.fit_params_shed_tags.size());
+    for (const auto & tag : params.fit_params_shed_tags) {
+        key += ",";
+        key += tag;
+    }
+    key += "\n";
+    key += "reserve=";
+    key += std::to_string(params.fit_params_reserves.size());
+    for (const auto & r : params.fit_params_reserves) {
+        key += ",";
+        key += std::to_string(r.device);
+        key += ":";
+        key += std::to_string(r.bytes);
+        key += ":";
+        key += std::to_string(r.priority);
+        key += ":";
+        key += r.tag;
+    }
+    key += "\n";
     key += "strategy=";
     key += std::to_string((int) params.fit_strategy);
     key += "\n";
@@ -288,6 +308,38 @@ key += "model=";
     }
     key += "rpc=";
     key += rpc;
+    key += "\n";
+
+    // speculative decoding and a vision companion load after the main model fit
+    // and consume leftover VRAM, so they must not reuse the same cached plan as
+    // a run without them.
+    key += "spec=";
+    for (enum common_speculative_type t : params.speculative.types) {
+        key += std::to_string((int) t);
+        key += ",";
+    }
+    key += "\n";
+    key += "spec_draft=";
+    if (!params.speculative.draft.mparams.empty()) {
+        key += params.speculative.draft.mparams.path;
+        key += "|";
+        key += std::to_string(file_size_bytes(params.speculative.draft.mparams.path));
+        key += "|";
+        key += std::to_string(file_mtime_sec(params.speculative.draft.mparams.path));
+    } else {
+        key += "none";
+    }
+    key += "\n";
+    key += "mmproj=";
+    if (!params.mmproj.empty() && !params.no_mmproj) {
+        key += params.mmproj.path;
+        key += "|";
+        key += std::to_string(file_size_bytes(params.mmproj.path));
+        key += "|";
+        key += std::to_string(file_mtime_sec(params.mmproj.path));
+    } else {
+        key += "none";
+    }
     key += "\n";
 
     const std::vector<uint8_t> d = sha256_digest((const uint8_t *) key.data(), key.size());
@@ -382,6 +434,23 @@ bool common_fit_cache_load(
     }
     plan.pool_grant_mib = (size_t) pool;
 
+    int32_t n_shed = 0;
+    if (!r.i32(n_shed) || n_shed < 0 || (size_t) n_shed > MAX_SPLIT) {
+        return false;
+    }
+    plan.shed_reserves.reserve((size_t) n_shed);
+    for (int32_t i = 0; i < n_shed; i++) {
+        int32_t tag_len = 0;
+        if (!r.i32(tag_len) || tag_len < 0 || tag_len > 63) {
+            return false;
+        }
+        if (r.pos + (size_t) tag_len > r.size) {
+            return false;
+        }
+        plan.shed_reserves.emplace_back((const char *) (r.data + r.pos), (size_t) tag_len);
+        r.pos += (size_t) tag_len;
+    }
+
     if (r.pos != buf.size()) {
         LOG_DBG("%s: cache body not fully consumed: %s\n", __func__, path.c_str());
         return false;
@@ -412,6 +481,15 @@ bool common_fit_cache_save(
     }
     app_i32(body, plan.n_ctx);
     app_u64(body, (uint64_t) plan.pool_grant_mib);
+    app_i32(body, (int32_t) plan.shed_reserves.size());
+    for (const auto & tag : plan.shed_reserves) {
+        if (tag.size() > 63) {
+            LOG_WRN("%s: shed tag too long, refusing to cache\n", __func__);
+            return false;
+        }
+        app_i32(body, (int32_t) tag.size());
+        body.insert(body.end(), tag.begin(), tag.end());
+    }
 
     std::vector<uint8_t> out;
     app_u32(out, CACHE_MAGIC);

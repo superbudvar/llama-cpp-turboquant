@@ -1425,8 +1425,9 @@ private:
                     for (size_t i = 0; i < target_fit_devices.size(); i++) {
                         if (target_fit_devices[i] == dev) {
                             GGML_ASSERT(i < params_base.fit_params_target.size());
-                            SRV_DBG("[mtmd] adding %.2f MiB to fit_params_target for device %s\n", size / (1024.0 * 1024.0), ggml_backend_dev_name(dev));
-                            params_base.fit_params_target[i] += size;
+                            SRV_DBG("[mtmd] adding %.2f MiB as a sheddable fit reserve for device %s\n", size / (1024.0 * 1024.0), ggml_backend_dev_name(dev));
+                            // soft reserve: the vision model sheds first (priority 0)
+                            params_base.fit_params_reserves.push_back({ (int) i, size, 0, "mmproj" });
                             break;
                         }
                     }
@@ -1538,6 +1539,11 @@ private:
 
                     const std::vector<ggml_backend_dev_t> tgt_devices = server_target_fit_devices_for(params_base, fit_main_gpu);
 
+                    // the speculative footprint is a soft reserve only when the draft is a
+                    // separate model (it can fall back to CPU); an MTP predictor has no CPU
+                    // fallback and stays a hard fit margin.
+                    const bool shedable = has_draft && !spec_mtp;
+
                     for (const auto & [device, bytes] : reservations) {
                         total += bytes;
                         if (bytes == 0) {
@@ -1545,12 +1551,18 @@ private:
                         }
                         for (size_t i = 0; i < tgt_devices.size(); i++) {
                             if (tgt_devices[i] == device) {
-                                SRV_INF("[spec] reserving %.2f MiB on %s for the speculative model and context\n",
-                                        bytes / (1024.0 * 1024.0), ggml_backend_dev_name(device));
                                 if (bytes > SIZE_MAX - params_base.fit_params_target[i]) {
                                     throw std::runtime_error("speculative memory margin overflowed");
                                 }
-                                params_base.fit_params_target[i] += bytes;
+                                if (shedable) {
+                                    SRV_INF("[spec] reserving %.2f MiB on %s for the speculative model and context (sheddable, priority 1)\n",
+                                            bytes / (1024.0 * 1024.0), ggml_backend_dev_name(device));
+                                    params_base.fit_params_reserves.push_back({ (int) i, bytes, 1, "spec" });
+                                } else {
+                                    SRV_INF("[spec] reserving %.2f MiB on %s for the MTP context\n",
+                                            bytes / (1024.0 * 1024.0), ggml_backend_dev_name(device));
+                                    params_base.fit_params_target[i] += bytes;
+                                }
                                 break;
                             }
                         }
@@ -1572,6 +1584,22 @@ private:
         }
 
         llama_init = common_init_from_params(params_base);
+
+        // the fit may have shed soft reservations to keep the main model fully
+        // offloaded; move the tagged companions off VRAM accordingly
+        const auto has_shed_tag = [&](const char * tag) {
+            return std::find(params_base.fit_params_shed_tags.begin(),
+                             params_base.fit_params_shed_tags.end(), tag) != params_base.fit_params_shed_tags.end();
+        };
+        const bool shed_mmproj = has_shed_tag("mmproj");
+        const bool shed_spec   = has_shed_tag("spec");
+        if (shed_mmproj) {
+            mparams.use_gpu = false;
+            SRV_WRN("%s", "[fit] shed the mmproj reservation, the vision model will load on CPU\n");
+        }
+        if (shed_spec) {
+            SRV_WRN("%s", "[fit] shed the draft reservation, the draft model will load on CPU\n");
+        }
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
@@ -1599,6 +1627,14 @@ private:
 
             {
                 common_params params_dft = make_params_dft();
+
+                if (shed_spec) {
+                    // fit released the draft reservation to keep the main model
+                    // offloaded; run the draft entirely on CPU
+                    params_dft.n_gpu_layers = 0;
+                    params_dft.devices.clear();
+                    params_dft.split_mode = LLAMA_SPLIT_MODE_NONE;
+                }
 
                 // progress callback
                 params_dft.load_progress_callback           = load_progress_callback;

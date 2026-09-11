@@ -470,6 +470,17 @@ enum common_fit_strategy {
 
 common_fit_strategy common_fit_strategy_from_string(const std::string & s);
 
+// soft per-device VRAM reservation the fit solver may shed (release) before
+// CPU-spilling model layers. lower priority releases first; on a shed the
+// caller moves the tagged companion off VRAM ("mmproj" -> CPU vision model,
+// "spec" -> CPU draft model).
+struct common_fit_reserve {
+    int device = -1;    // fit device index (analysis device order)
+    size_t bytes = 0;
+    int priority = 0;   // lower = released first
+    std::string tag;
+};
+
 struct common_params {
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
@@ -510,6 +521,14 @@ struct common_params {
 
     // margin per device in bytes for fitting parameters to free memory:
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);
+
+    // soft VRAM reservations (set by the server for its companion models). the
+    // fit solver holds them while full offload is feasible and sheds them in
+    // priority order before CPU-spilling the main model.
+    std::vector<common_fit_reserve> fit_params_reserves;
+    // reservations the fit released (tags). the caller must then move the
+    // tagged companion off VRAM before loading it.
+    std::vector<std::string> fit_params_shed_tags;
 
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
     enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_MMAP; // how to load the model

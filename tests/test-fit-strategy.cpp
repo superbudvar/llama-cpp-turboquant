@@ -343,6 +343,62 @@ static void test_rpc_cold_start() {
     expect(mparams.n_gpu_layers == 7, "the local fallback must still offload all layers");
 }
 
+static void test_shed_reserve_order() {
+    if (g_model.empty()) {
+        test_skip("no model available");
+        return;
+    }
+
+    // reservations are shed in priority order (mmproj first, spec second) before
+    // any CPU spill; the main model stays fully offloaded as long as a shed can
+    // free the headroom. over-subscribed by 512 GiB each, the solver must shed
+    // both and keep every layer offloaded, with the shed tags in priority order.
+    common_params params;
+    params.fit_strategy = COMMON_FIT_STRATEGY_RPC_AWARE;
+    params.n_ctx = 1024;
+    params.model.path = g_model;
+    params.fit_params_reserves = {
+        { 0, (size_t) (512 * GiB), 0, "mmproj" },
+        { 0, (size_t) (512 * GiB), 1, "spec" },
+    };
+    llama_model_params mparams = common_model_params_to_llama(params);
+    llama_context_params cparams = common_context_params_to_llama(params);
+    fake_probe_ctx cfg;
+    cfg.default_dev = { (int64_t) (16 * GiB), (int64_t) (16 * GiB), (size_t) (64 * MiB), (size_t) (32 * MiB), 0 };
+    const common_params_fit_status st = common_fit_strategy_apply_impl(
+            params, &mparams, &cparams, nullptr, make_probe(&cfg));
+    expect(st == COMMON_PARAMS_FIT_STATUS_SUCCESS, "the shed-order solver must still fit");
+    expect(mparams.n_gpu_layers == 7, "full offload must be kept once both companions shed");
+    expect(params.fit_params_shed_tags.size() == 2 &&
+           params.fit_params_shed_tags[0] == "mmproj" &&
+           params.fit_params_shed_tags[1] == "spec",
+           "the shed order must be mmproj first, spec second");
+    expect(params.fit_params_target[0] == 1024ull * 1024 * 1024,
+           "the per-device margin must not absorb the shed reservations");
+
+    // a spec reserve that still fits is held: shedding only mmproj frees the
+    // headroom and the solver must not force the draft off early
+    common_params params2;
+    params2.fit_strategy = COMMON_FIT_STRATEGY_RPC_AWARE;
+    params2.n_ctx = 1024;
+    params2.model.path = g_model;
+    params2.fit_params_reserves = {
+        { 0, (size_t) (512 * GiB), 0, "mmproj" },
+        { 0, (size_t) (1 * MiB), 1, "spec" },
+    };
+    llama_model_params mparams2 = common_model_params_to_llama(params2);
+    llama_context_params cparams2 = common_context_params_to_llama(params2);
+    fake_probe_ctx cfg2;
+    cfg2.default_dev = cfg.default_dev;
+    const common_params_fit_status st2 = common_fit_strategy_apply_impl(
+            params2, &mparams2, &cparams2, nullptr, make_probe(&cfg2));
+    expect(st2 == COMMON_PARAMS_FIT_STATUS_SUCCESS, "shedding mmproj alone must fit");
+    expect(mparams2.n_gpu_layers == 7, "the main model must stay fully offloaded");
+    expect(params2.fit_params_shed_tags.size() == 1 &&
+           params2.fit_params_shed_tags[0] == "mmproj",
+           "only mmproj must shed when the spec reserve still fits");
+}
+
 static void test_exception_classification() {
     if (g_model.empty()) {
         test_skip("no model available");
@@ -655,6 +711,7 @@ static const struct test_case {
     { "floor_unreachable_errors",   test_floor_unreachable_errors },
     { "rpc_aware_placement",        test_rpc_aware_placement },
     { "rpc_cold_start",             test_rpc_cold_start },
+    { "shed_reserve_order",         test_shed_reserve_order },
     { "exception_classification",   test_exception_classification },
     { "no_provider_pool",           test_no_provider_pool },
     { "activation_profile_sink",    test_activation_profile_sink },

@@ -66,6 +66,9 @@ struct common_fit_plan {
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
     int32_t n_ctx = 0;
     size_t pool_grant_mib = 0; // 0 = no pool
+    // tags of soft reservations this plan released ("mmproj", "spec"). the
+    // caller moves those companions off VRAM before loading them.
+    std::vector<std::string> shed_reserves;
 };
 
 // Measure seam: mirrors the common_get_device_memory_data signature (fit.h:96).

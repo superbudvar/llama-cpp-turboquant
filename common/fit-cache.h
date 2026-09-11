@@ -37,8 +37,10 @@
 // SHA-256 of the identity key for path_model + configuration + device set.
 // The key hashes model identity (path, mtime, size), device identity (name,
 // type, total bytes, rpc flag), fit configuration (target, strategy,
-// min-ctx) and RPC endpoints. Device memory CAPACITY is hashed; device memory
-// LOAD is validated separately on every cache hit.
+// min-ctx) and RPC endpoints. Speculative draft and mmproj companions are
+// hashed too: they load after the fit and consume leftover VRAM, so they must
+// not share a cached plan with a run that lacks them. Device memory CAPACITY
+// is hashed; device memory LOAD is validated separately on every cache hit.
 uint64_t common_fit_cache_key_hash(
         const common_params & params,
         const std::string & path_model,

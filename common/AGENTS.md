@@ -12,6 +12,15 @@ Fit placement on multi-GPU / RPC split models.
 - `fit_solve_rpc_aware` scans feasible rpc_frac values and keeps the split reaching the largest context (`fit_grow_context`). Selection is strict `ctx > best_ctx`, so the FIRST scanned split that reaches the max context wins the tie.
 - Scanning top-down (largest rpc_frac first) packs the RPC device to the brim while the local device stays half-idle (observed: RPC 0 MiB free, ROCm 4 GiB free). Scanning bottom-up keeps the smallest RPC share that still reaches the same max context and packs the local device first (observed: ROCm 611 MiB free, RPC 4 GiB free). See the loop at fit-strategy.cpp:~764.
 - Context is the primary objective: a split that reaches a higher context always beats a smaller rpc_frac at lower context. Tie-break (scan direction) only applies among splits at the same max context.
+- Selection tiers (dense): (1) local-only offload reaching min-ctx wins immediately on the main GPU; (2) the local+RPC split keeps growing to its max context and wins when it reaches min-ctx - CPU spill is never considered in case 2; (3) only when tier 2 fails does the CPU-spill phase run, and its base is the RPC-split candidate kept inside the loop (`have_rpc_spill`), so the spill stays rocm+rpc+cpu. A local-only spill base only remains when no RPC device is usable.
+
+### Companion reservations shed before CPU spill
+
+- The server registers soft VRAM reservations (`common_fit_reserve`) for its companions before fitting the main model: mmproj (priority 0) and the draft model (priority 1, only for a separate draft; MTP stays a hard fit margin). Each is a `{device, bytes, priority, tag}` entry in `fit_params_reserves`; priorities are lower-releases-first.
+- `fit_solve_rpc_aware` (and `maxctx`) re-run the whole candidate suite per shed level: no shed, then cumulative release by ascending priority. The first level with a full-offload candidate reaching min-ctx wins. CPU spill runs only at the last level (all reservations shed), because moving a companion off VRAM is cheaper than spilling model layers.
+- Positions: mmproj sheds before spec before model layers; if shedding mmproj alone suffices, the spec (draft) stays on VRAM.
+- The winning plan's `shed_reserves` (tags) is saved to the fit cache, published back into `params.fit_params_shed_tags`, and used by the server to load the tagged companions on CPU (draft forced to CPU via `devices.clear()/n_gpu_layers=0`, mmproj via `mparams.use_gpu=false`).
+- The cache key includes the reserve set; a cache hit is validated against the margins matching its own `shed_reserves`.
 
 ### Fit probe output is not the real allocation
 
