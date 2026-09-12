@@ -87,8 +87,14 @@ struct server_model_meta {
     // bool need_download = false; // whether the model needs to be downloaded before loading // TODO @ngxson: implement this
 
     // request queueing support
-    int n_active = 0; // number of in-flight requests for this model
+    int n_active = 0; // number of in-flight requests for this model (crash recovery signal)
     int64_t last_request_time = 0; // timestamp of last begin_request call (for crash recovery)
+    int n_pending = 0; // requests queued or in-flight for this model; never reset by the stale
+                       // watchdog, only reset when the child dies. a model with n_pending > 0
+                       // must never be evicted - it has requests waiting to be served
+    int64_t evict_grace_until = 0; // absolute ms; this model is not evictable before this time.
+                                   // set when the last pending request drains, so a brief
+                                   // same-model burst is not chopped into model-switch churn
 
     bool is_ready() const {
         return status == SERVER_MODEL_STATUS_LOADED;
@@ -238,6 +244,7 @@ private:
     std::string bin_path;
     std::vector<std::string> base_env;
     common_preset base_preset; // base preset from llama-server CLI args
+    int64_t evict_grace_ms = 5000; // hide a brief same-model burst from the LRU eviction gate
 
     void update_meta(const std::string & name, const server_model_meta & meta);
 
@@ -279,7 +286,7 @@ public:
     bool has_inflight_requests() {
         std::lock_guard<std::mutex> lk(mutex);
         for (const auto & m : mapping) {
-            if (m.second.meta.n_active > 0) {
+            if (m.second.meta.n_pending > 0) {
                 return true;
             }
         }
@@ -409,7 +416,7 @@ struct server_models_routes {
  */
 struct server_http_proxy : server_http_res {
     std::function<void()> cleanup = nullptr;
-    std::function<void()> on_done = nullptr; // called on response completion to release the n_active counter
+    std::function<void()> on_done = nullptr; // called on response completion to release the n_pending counter
 public:
     server_http_proxy(const std::string & method,
                       const std::string & scheme,

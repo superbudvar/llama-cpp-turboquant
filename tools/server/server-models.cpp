@@ -240,6 +240,10 @@ server_models::server_models(
         LOG_WRN("failed to get server executable path: %s\n", e.what());
         LOG_WRN("using original argv[0] as fallback: %s\n", argv[0]);
     }
+    const char * grace_env = std::getenv("LLAMA_SERVER_EVICT_GRACE_MS");
+    if (grace_env != nullptr && grace_env[0] != '\0') {
+        evict_grace_ms = std::atoll(grace_env);
+    }
     load_models();
 }
 
@@ -321,9 +325,9 @@ void server_models::load_models() {
     {
         std::lock_guard<std::mutex> lk(mutex);
         for (const auto & m : mapping) {
-            if (m.second.meta.n_active > 0) {
+            if (m.second.meta.n_pending > 0) {
                 SRV_INF("skipping model list reload: %d request(s) in-flight (name=%s)\n",
-                        m.second.meta.n_active, m.first.c_str());
+                        m.second.meta.n_pending, m.first.c_str());
                 return;
             }
         }
@@ -744,20 +748,27 @@ void server_models::ensure_capacity_locked(std::unique_lock<std::mutex> & lk, co
         if (count_active < (size_t)base_params.models_max) {
             return; // room to spawn
         }
-        // pick LRU idle victim: running, zero in-flight, not being evicted, not loading,
-        // and no active resumable-stream conversations
+        // pick LRU idle victim: running, zero queued requests (n_pending, not n_active - the
+        // stale watchdog may have wiped n_active for a long load), not being evicted, not loading,
+        // no active resumable-stream conversations, and past its eviction grace window (so a
+        // brief same-model burst does not pay switch churn)
+        const int64_t now_ms = ggml_time_ms();
         std::string lru_model_name = "";
         int64_t lru_last_used = ggml_time_ms();
+        int64_t next_grace_until = INT64_MAX;
         for (const auto & m : mapping) {
             const auto & meta = m.second.meta;
             if (meta.is_running() &&
-                meta.n_active == 0 &&
                 !m.second.evicting &&
                 meta.status != SERVER_MODEL_STATUS_LOADING &&
                 conv_models_for(m.first).empty()) {
-                if (meta.last_used < lru_last_used) {
-                    lru_model_name = m.first;
-                    lru_last_used  = meta.last_used;
+                if (meta.n_pending == 0 && meta.evict_grace_until <= now_ms) {
+                    if (meta.last_used < lru_last_used) {
+                        lru_model_name = m.first;
+                        lru_last_used  = meta.last_used;
+                    }
+                } else if (meta.n_pending == 0) {
+                    next_grace_until = std::min(next_grace_until, meta.evict_grace_until);
                 }
             }
         }
@@ -782,14 +793,26 @@ void server_models::ensure_capacity_locked(std::unique_lock<std::mutex> & lk, co
             continue; // re-check capacity, may need to evict more (or another victim)
         }
         // all running models are busy - wait for one to drain. timeout_reuse:
-        // long default (several hours) so legit long generations do not abort
+        // long default (several hours) so legit long generations do not abort.
+        // if a candidate is idle but in its grace window, sleep only until the
+        // earliest such grace expiry so we re-scan (and can then evict it)
         const int64_t queue_timeout_ms = std::max(30000LL, base_params.timeout_read * 1000LL);
-        SRV_INF("all models busy at models_max=%d, waiting for a slot to free up (request for %s)\n",
-                base_params.models_max, name.c_str());
-        if (cv.wait_for(lk, std::chrono::milliseconds(queue_timeout_ms)) == std::cv_status::timeout) {
+        int64_t sleep_ms = queue_timeout_ms;
+        if (next_grace_until != INT64_MAX) {
+            sleep_ms = std::clamp(next_grace_until - now_ms, (int64_t) 1, sleep_ms);
+        }
+        SRV_INF("all models busy at models_max=%d, waiting %lld ms for a slot to free up (request for %s)\n",
+                base_params.models_max, (long long) sleep_ms, name.c_str());
+        if (cv.wait_for(lk, std::chrono::milliseconds(sleep_ms)) == std::cv_status::timeout) {
             // if the target is now unloaded, another thread may have grabbed capacity; treat
-            // timeout as capacity-unavailable for this request
-            throw server_queue_timeout_error("model limit reached, try again later");
+            // timeout as capacity-unavailable for this request. if the timeout was a grace
+            // expiry, loop around: the in-grace model is now evictable
+            auto tid = mapping.find(name);
+            if (tid == mapping.end() ||
+                (tid->second.meta.status == SERVER_MODEL_STATUS_UNLOADED &&
+                 sleep_ms >= queue_timeout_ms)) {
+                throw server_queue_timeout_error("model limit reached, try again later");
+            }
         }
     }
 }
@@ -817,25 +840,44 @@ void server_models::begin_request(const std::string & name) {
         throw std::runtime_error("model name=" + name + " is not found");
     }
     it->second.meta.n_active++;
+    it->second.meta.n_pending++;
     it->second.meta.last_request_time = ggml_time_ms();
 }
 
 void server_models::end_request(const std::string & name) {
     std::unique_lock<std::mutex> lk(mutex);
     auto it = mapping.find(name);
-    if (it != mapping.end() && it->second.meta.n_active > 0) {
-        it->second.meta.n_active--;
+    if (it != mapping.end()) {
+        // n_active may have been wiped to 0 by the stale watchdog for a long generation;
+        // n_pending must still drain or the model becomes permanently unevictable
+        if (it->second.meta.n_active > 0) {
+            it->second.meta.n_active--;
+        }
+        if (it->second.meta.n_pending > 0) {
+            it->second.meta.n_pending--;
+        }
+        if (it->second.meta.n_pending == 0 && it->second.meta.n_active == 0) {
+            // last request drained: keep the model resident briefly so a same-model burst
+            // does not pay an eviction+reload (switch churn)
+            it->second.meta.evict_grace_until = ggml_time_ms() + evict_grace_ms;
+        }
         cv.notify_all();
     }
 }
 
 // watchdog: if a child was force-killed mid-request the n_active counter would never
 // reach 0, permanently blocking eviction. any counter that has not seen a new request
-// for N seconds is considered stale and reset. caller must hold mutex
+// for N seconds is considered stale and reset. caller must hold mutex.
+// a model that is still LOADING is not dead: a request may be parked in the load wait
+// for a long time (huge model on a slow disk). resetting n_active there would strip the
+// eviction protection right before the load finishes, making the fresh model an instant LRU.
 void server_models::reconcile_stale_n_active() {
     const int64_t stale_ms = 300000; // 5 min: far longer than any single generation we expect
     const int64_t now = ggml_time_ms();
     for (auto & [name, inst] : mapping) {
+        if (inst.meta.status == SERVER_MODEL_STATUS_LOADING) {
+            continue;
+        }
         if (inst.meta.n_active > 0) {
             int64_t idle_ms = now - inst.meta.last_request_time;
             if (idle_ms > stale_ms) {
@@ -874,7 +916,7 @@ void server_models::load(const std::string & name, const load_options & opts) {
     }
 
     // re-check capacity under the lock (blocks until a free slot, evicting an idle LRU
-    // model as needed). busy models (n_active > 0 or live conversations) are never evicted
+    // model as needed). busy models (n_pending > 0 or live conversations) are never evicted
     if (base_params.models_max > 0) {
         ensure_capacity_locked(lk, name); // returns with lk held
     }
@@ -1115,6 +1157,16 @@ void server_models::update_status(const std::string & name, const update_status_
             it->second.evicting = false;
             // a dead instance can no longer serve resumable-stream conversations
             conv_models.forget_all_for_model(name);
+            // its queued requests are dead too: either the child failed and the parked
+            // request was already answered, or an eviction ended the load wait. reset so
+            // the model is evictable and does not pin the capacity slot forever
+            it->second.meta.n_pending = 0;
+        }
+        // a model that just became ready should not be the instant LRU victim: last_used was
+        // stamped at spawn, which for a slow load is long ago. refresh it so the waiting
+        // request gets a chance to proxy before a queued other-model request evicts the slot
+        if (args.status == SERVER_MODEL_STATUS_LOADED) {
+            meta.last_used = ggml_time_ms();
         }
     }
     // broadcast status change to SSE
@@ -1701,7 +1753,7 @@ void server_models_routes::init_routes() {
         // this request instead of leaving an orphan generation
         std::string conv_id = server_stream_conv_id_from_headers(req.headers);
         uint64_t ticket = models.conv_models.remember(conv_id, name);
-        // count this request against the model before the load wait: while n_active > 0 the
+        // count this request against the model before the load wait: while n_pending > 0 the
         // capacity gate will not evict this model, even if it is the LRU
         models.begin_request(name);
         try {
