@@ -494,7 +494,9 @@ struct server_slot {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
 
-        return true;
+        // if alloc returned the write-through scratch (state too large for the RAM
+        // tier), finish the disk write now and release the transient KV copy
+        return prompt_cache.commit_disk_state(cur);
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
@@ -1258,8 +1260,8 @@ private:
         if (!prompt_cache || params_base.cache_disk_path.empty() || !prompt_cache->states.empty()) {
             return 0;
         }
-        const size_t n = prompt_cache->load_from_disk(prompt_cache_disk_dir(), prompt_cache_disk_fingerprint());
-        SRV_INF("loaded %zu prompt cache states from disk\n", n);
+        const size_t n = prompt_cache->load_disk_index(prompt_cache_disk_dir(), prompt_cache_disk_fingerprint());
+        SRV_INF("loaded %zu prompt cache entries from disk\n", n);
         return n;
     }
 
@@ -1834,15 +1836,15 @@ private:
             }
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx, params_base.cache_disk_max_mib);
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
         if (params_base.n_ctx_checkpoints > 0) {
-            SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
-                    params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
+            SRV_TRC("context checkpoints enabled, max = %d, min spacing = %" PRId64 " (effective)\n",
+                        params_base.n_ctx_checkpoints, checkpoint_min_step_eff());
         } else {
             SRV_TRC("%s", "context checkpoints disabled\n");
         }
@@ -2788,7 +2790,7 @@ private:
     // llama_state_seq file format. persist them in a sidecar file so that
     // action=restore in a fresh process can roll back mid-prompt (e.g. after a
     // BPE boundary re-tokenization of the prompt tail) instead of re-prefilling.
-    static bool checkpoints_save_sidecar(const std::list<common_prompt_checkpoint> & checkpoints, const std::string & filepath) {
+    static bool checkpoints_save_sidecar(const server_prompt & prompt, const std::string & filepath) {
         FILE * f = fopen(filepath.c_str(), "wb");
         if (f == nullptr) {
             return false;
@@ -2797,14 +2799,25 @@ private:
         bool ok = true;
 
         const uint32_t magic   = 0x4C434B50; // "PKCL"
-        const uint32_t version = 1;
-        const uint32_t count   = (uint32_t) checkpoints.size();
+        const uint32_t version = 2;
+        const uint32_t count   = (uint32_t) prompt.checkpoints.size();
 
         ok = ok && fwrite(&magic,   sizeof(magic),   1, f) == 1;
         ok = ok && fwrite(&version, sizeof(version), 1, f) == 1;
         ok = ok && fwrite(&count,   sizeof(count),   1, f) == 1;
 
-        for (const auto & cur : checkpoints) {
+        // v2 header carries the shared base fields (dedup, now removed); write empty base
+        const int64_t  base_n_tokens = 0;
+        const int32_t  base_pos_max  = 0;
+        const uint64_t len_base_tgt  = 0;
+        const uint64_t len_base_dft  = 0;
+
+        ok = ok && fwrite(&base_n_tokens, sizeof(base_n_tokens), 1, f) == 1;
+        ok = ok && fwrite(&base_pos_max,  sizeof(base_pos_max),  1, f) == 1;
+        ok = ok && fwrite(&len_base_tgt,  sizeof(len_base_tgt),  1, f) == 1;
+        ok = ok && fwrite(&len_base_dft,  sizeof(len_base_dft),  1, f) == 1;
+
+        for (const auto & cur : prompt.checkpoints) {
             const int64_t  n_tokens = cur.n_tokens;
             const int32_t  pos_min  = cur.pos_min;
             const int32_t  pos_max  = cur.pos_max;
@@ -2824,7 +2837,7 @@ private:
         return ok;
     }
 
-    static bool checkpoints_load_sidecar(std::list<common_prompt_checkpoint> & checkpoints, const std::string & filepath) {
+    static bool checkpoints_load_sidecar(server_prompt & prompt, const std::string & filepath) {
         FILE * f = fopen(filepath.c_str(), "rb");
         if (f == nullptr) {
             return false;
@@ -2835,7 +2848,29 @@ private:
         bool ok = fread(&magic,   sizeof(magic),   1, f) == 1 &&
                   fread(&version, sizeof(version), 1, f) == 1 &&
                   fread(&count,   sizeof(count),   1, f) == 1 &&
-                  magic == 0x4C434B50 && version == 1 && count <= 1024;
+                  magic == 0x4C434B50 && (version == 1 || version == 2) && count <= 1024;
+
+        // v2 header carries the shared base (dedup, now removed); skip-and-discard
+        if (ok && version == 2) {
+            int64_t  base_n_tokens = 0;
+            int32_t  base_pos_max  = 0;
+            uint64_t len_base_tgt  = 0;
+            uint64_t len_base_dft  = 0;
+
+            ok = ok && fread(&base_n_tokens, sizeof(base_n_tokens), 1, f) == 1 &&
+                      fread(&base_pos_max,   sizeof(base_pos_max),  1, f) == 1 &&
+                      fread(&len_base_tgt,   sizeof(len_base_tgt),  1, f) == 1 &&
+                      fread(&len_base_dft,   sizeof(len_base_dft),  1, f) == 1;
+
+            // sanity: refuse absurd blob sizes (16 GiB per blob)
+            ok = ok && len_base_tgt <= (1ull << 34) && len_base_dft <= (1ull << 34);
+            ok = ok && (base_n_tokens >= 0) && (base_pos_max >= 0);
+
+            if (ok) {
+                ok = ok && (len_base_tgt == 0 || fseek(f, (long) len_base_tgt, SEEK_CUR) == 0);
+                ok = ok && (len_base_dft == 0 || fseek(f, (long) len_base_dft, SEEK_CUR) == 0);
+            }
+        }
 
         std::list<common_prompt_checkpoint> loaded;
 
@@ -2868,9 +2903,21 @@ private:
             return false;
         }
 
-        checkpoints = std::move(loaded);
+        prompt.checkpoints = std::move(loaded);
 
         return true;
+    }
+
+    // effective minimum spacing between context checkpoints.
+    // shrink the default min-step so long contexts actually use more of the
+    // n_ctx_checkpoints budget; never exceed the user-provided value.
+    int64_t checkpoint_min_step_eff() const {
+        if (params_base.checkpoint_min_step == 0) {
+            return 0;
+        }
+        const int64_t step  = params_base.checkpoint_min_step;
+        const int64_t n_ctx = params_base.n_ctx > 0 ? params_base.n_ctx : 65536;
+        return std::min(step, std::max<int64_t>(1024, n_ctx / 64));
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
@@ -2882,7 +2929,7 @@ private:
         // created by the current task
         int64_t last = -1;
         for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
-            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
+            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + (int64_t) checkpoint_min_step_eff()) {
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
@@ -3130,7 +3177,7 @@ private:
                     // persist context checkpoints alongside the state file so that a
                     // restore in a fresh process can roll back mid-prompt (see restore path)
                     if (!slot->prompt.checkpoints.empty()) {
-                        if (checkpoints_save_sidecar(slot->prompt.checkpoints, filepath + ".ckpt")) {
+                        if (checkpoints_save_sidecar(slot->prompt, filepath + ".ckpt")) {
                             SLT_INF(*slot, "saved %zu context checkpoints to sidecar\n", slot->prompt.checkpoints.size());
                         } else {
                             SLT_WRN(*slot, "failed to write checkpoint sidecar %s\n", (filepath + ".ckpt").c_str());
@@ -3187,7 +3234,7 @@ private:
                     // to synthesizing a tip checkpoint from the just-restored state, which at
                     // least covers exact continuations.
                     if (params_base.n_ctx_checkpoints > 0 && token_count > 0) {
-                        if (checkpoints_load_sidecar(slot->prompt.checkpoints, filepath + ".ckpt")) {
+                        if (checkpoints_load_sidecar(slot->prompt, filepath + ".ckpt")) {
                             SLT_INF(*slot, "restored %zu context checkpoints from sidecar\n", slot->prompt.checkpoints.size());
                         } else {
                             const llama_pos p_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot->id);
@@ -3922,16 +3969,37 @@ private:
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
 
                                     if (!do_reset) {
-                                        // restore the context checkpoint
-                                        it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        // restore the draft's speculative state
-                                        common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+                                        // restore the context checkpoint: every checkpoint carries its own
+                                        // payload (dedup is removed); a payload the memory refuses to apply
+                                        // falls back to a full re-processing.
+                                        const auto set_state = [&](llama_context * ctx, const std::vector<uint8_t> & own) -> bool {
+                                            if (ctx == nullptr) {
+                                                return true;
+                                            }
+                                            if (own.empty()) {
+                                                return false;
+                                            }
 
-                                        pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
-                                        n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
-                                        slot.prompt_checkpoint_restored = true;
-                                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+                                            return llama_state_seq_set_data_ext(ctx, own.data(), own.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == own.size();
+                                        };
+
+                                        const bool ok = set_state(ctx_tgt, it->data_tgt)
+                                                    && set_state(ctx_dft, it->data_dft);
+
+                                        if (ok) {
+                                            // restore the draft's speculative state
+                                            common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+
+                                            pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                                            n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                            slot.prompt_checkpoint_restored = true;
+                                            SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+                                        } else {
+                                            // the checkpoint data could not be applied (or is intentionally empty):
+                                            // fall back to a full re-processing
+                                            do_reset = true;
+                                            SLT_TRC(slot, "context checkpoint unavailable for restore (pos_min = %d, pos_max = %d)\n", it->pos_min, it->pos_max);
+                                        }
                                     }
 
                                     if (do_reset) {
@@ -4106,7 +4174,7 @@ private:
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
+                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + checkpoint_min_step_eff()) {
                                 break;
                             }
                         }
@@ -4184,7 +4252,7 @@ private:
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
                             is_last_user_message || near_prompt_end ||
-                            n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+                            n_tokens_start > slot.prompt.checkpoints.back().n_tokens + checkpoint_min_step_eff());
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not

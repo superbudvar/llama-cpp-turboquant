@@ -149,6 +149,11 @@ if (LLAMA_BUILD_TOOLS)
     target_link_libraries  (${TARGET} PRIVATE llama-common mtmd Threads::Threads)
     target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
+    add_executable(llama-clip-quantize-cli clip-quantize-cli.cpp)
+    set_target_properties(llama-clip-quantize-cli PROPERTIES OUTPUT_NAME llama-clip-quantize-cli)
+    target_link_libraries(llama-clip-quantize-cli PRIVATE llama-common mtmd Threads::Threads)
+    target_compile_features(llama-clip-quantize-cli PRIVATE cxx_std_17)
+
     # mtmd-debug tool
     add_executable(llama-mtmd-debug debug/mtmd-debug.cpp)
     set_target_properties(llama-mtmd-debug PROPERTIES OUTPUT_NAME llama-mtmd-debug)

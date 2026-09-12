@@ -7,6 +7,8 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <memory>
+#include <vector>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -636,9 +638,10 @@ struct server_prompt_cache_state {
 };
 
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, size_t disk_max_mib = 0) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
+        this->disk_max_size = 1024ull*1024ull*disk_max_mib;
     }
 
     std::list<server_prompt_cache_state> states;
@@ -648,6 +651,34 @@ struct server_prompt_cache {
 
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
+
+    // decoupled disk tier.
+    // the disk is an independent pool: it is indexed at load time (tokens + sizes
+    // only, no KV blobs in RAM) and entries are kept after they leave the RAM tier,
+    // so the disk capacity is not tied to the --cache-ram budget. a RAM load miss
+    // searches the disk index and either promotes the entry into the RAM tier (when
+    // it fits the budget) or restores it directly from disk.
+    struct disk_entry {
+        std::string fname;
+        std::string path;
+        server_tokens tokens;
+        size_t byte_size = 0;
+    };
+
+    // in bytes, 0 = no limit
+    size_t disk_max_size = 0;
+
+    std::vector<disk_entry> disk_entries;
+    bool disk_index_valid = false;
+
+    // write-through scratch for a state too large for the RAM budget: it is
+    // committed to the disk pool immediately after the caller fills in the KV
+    // data and is never held in the RAM tier
+    std::unique_ptr<server_prompt_cache_state> disk_state_;
+
+    // disk location + fingerprint for in-run write-through and index updates
+    std::string disk_dir_;
+    std::string disk_fingerprint_;
 
     size_t size() const;
 
@@ -661,11 +692,25 @@ struct server_prompt_cache {
 
     // persist/restore the cache to a directory of <sha256-of-tokens>.dpc files.
     // save_to_disk writes a meta file carrying the caller-provided fingerprint and
-    // removes stale entry files so the directory mirrors the in-memory cache.
-    // load_from_disk only imports entries when the stored fingerprint matches the
-    // caller-provided one. returns the number of states loaded.
+    // enforces the independent disk budget (oldest-mtime entries are removed first);
+    // it does not delete entries that left the in-memory cache.
+    // load_disk_index builds the token-only index of entries that match the stored
+    // fingerprint, without reading any KV blobs into RAM.
     bool save_to_disk(const std::string & dir, const std::string & fingerprint) const;
-    size_t load_from_disk(const std::string & dir, const std::string & fingerprint);
+    size_t load_disk_index(const std::string & dir, const std::string & fingerprint);
+
+    // commit a single state to the disk pool immediately (write-through); a no-op
+    // for states that are not the pending disk scratch
+    bool commit_disk_state(server_prompt_cache_state * state);
+
+private:
+    bool restore_state(server_prompt & prompt, server_prompt_cache_state & state, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+
+    bool load_from_disk_tier(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+
+    // enforce the disk budget by oldest-mtime eviction; only touches the
+    // filesystem, the in-memory index is synced by the (non-const) callers
+    void prune_disk_budget(const std::string & dir) const;
 };
 
 // used exclusively by router mode

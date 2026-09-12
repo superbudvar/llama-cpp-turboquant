@@ -1693,6 +1693,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_DISK").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--cache-disk-max"}, "N",
+        string_format("set the maximum disk prompt cache size in MiB (default: %d, 0 - no limit).\n"
+            "the disk cache is an independent pool: entries are kept even after they leave the in-memory cache\n"
+            "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_disk_max_mib),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("cache-disk-max must be non-negative");
+            }
+            params.cache_disk_max_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_MAX").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",
