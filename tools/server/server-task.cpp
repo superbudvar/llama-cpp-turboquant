@@ -2514,9 +2514,54 @@ void server_prompt_cache::prune_disk_budget(const std::string & dir) const {
     }
 }
 
-bool server_prompt_cache::commit_disk_state(server_prompt_cache_state * state) {
+void server_prompt_cache::disk_prune_dpc(const std::string & dir) const {
     namespace fs = std::filesystem;
 
+    if (disk_max_size == 0) {
+        return;
+    }
+
+    struct dpc_file {
+        fs::path path;
+        fs::file_time_type mtime;
+        uint64_t size;
+    };
+
+    std::error_code ec;
+    std::vector<dpc_file> files;
+    uint64_t used = 0;
+
+    for (auto & entry : fs::directory_iterator(dir, ec)) {
+        if (entry.path().extension() != ".dpc") {
+            continue;
+        }
+        const auto size = fs::file_size(entry.path(), ec);
+        if (ec) {
+            continue;
+        }
+        used += (uint64_t) size;
+        files.push_back({ entry.path(), fs::last_write_time(entry.path(), ec), (uint64_t) size });
+    }
+
+    if (used > disk_max_size) {
+        std::sort(files.begin(), files.end(), [](const dpc_file & a, const dpc_file & b) {
+            return a.mtime < b.mtime;
+        });
+
+        for (const auto & file : files) {
+            if (used <= disk_max_size) {
+                break;
+            }
+            fs::remove(file.path, ec);
+            used -= file.size;
+        }
+
+        SRV_INF(" - disk prompt cache: pruned .dpc to %.3f MiB (budget %.3f MiB)\n",
+                used / (1024.0 * 1024.0), disk_max_size / (1024.0 * 1024.0));
+    }
+}
+
+bool server_prompt_cache::commit_disk_state(server_prompt_cache_state * state) {
     // only the pending write-through entry gets committed here; RAM-tier entries
     // (and callers with no pending scratch) are passed through untouched
     if (state != disk_state_.get()) {
@@ -2530,60 +2575,156 @@ bool server_prompt_cache::commit_disk_state(server_prompt_cache_state * state) {
         return true;
     }
 
+    if (disk_dir_.empty()) {
+        disk_state_.reset();
+        return true;
+    }
+
+    // move state into the job and free RAM before the write is done
+    disk_write_job job;
+    job.kind        = disk_write_job::type::state;
+    job.state       = std::move(disk_state_);
+    job.dir         = disk_dir_;
+    job.fingerprint = disk_fingerprint_;
+
+    disk_state_.reset();
+
+    start_disk_thread();
+
+    {
+        std::lock_guard<std::mutex> lock(disk_jobs_mtx_);
+        disk_jobs_.push_back(std::move(job));
+    }
+    disk_jobs_cv_.notify_one();
+
+    return true;
+}
+
+void server_prompt_cache::start_disk_thread() {
+    if (disk_thread_.joinable()) {
+        return;
+    }
+    disk_thread_stop_ = false;
+    try {
+        disk_thread_ = std::thread([this] { disk_thread_main(); });
+    } catch (const std::system_error & e) {
+        SRV_WRN(" - disk prompt cache: failed to start writer thread: %s\n", e.what());
+    }
+}
+
+void server_prompt_cache::drain_disk_writes() {
+    if (!disk_thread_.joinable()) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(disk_jobs_mtx_);
+        disk_thread_stop_ = true;
+    }
+    disk_jobs_cv_.notify_one();
+    disk_thread_.join();
+}
+
+bool server_prompt_cache::enqueue_sidecar(const std::string & path, std::vector<uint8_t> bytes) {
+    start_disk_thread();
+    if (!disk_thread_.joinable()) {
+        return false;
+    }
+    disk_write_job job;
+    job.kind  = disk_write_job::type::sidecar;
+    job.path  = path;
+    job.bytes = std::move(bytes);
+    {
+        std::lock_guard<std::mutex> lock(disk_jobs_mtx_);
+        disk_jobs_.push_back(std::move(job));
+    }
+    disk_jobs_cv_.notify_one();
+    return true;
+}
+
+void server_prompt_cache::disk_thread_main() {
+    while (true) {
+        disk_write_job job;
+        {
+            std::unique_lock<std::mutex> lock(disk_jobs_mtx_);
+            disk_jobs_cv_.wait(lock, [this] { return disk_thread_stop_ || !disk_jobs_.empty(); });
+            if (disk_thread_stop_ && disk_jobs_.empty()) {
+                return;
+            }
+            job = std::move(disk_jobs_.front());
+            disk_jobs_.pop_front();
+        }
+
+        switch (job.kind) {
+        case disk_write_job::type::state:
+            disk_run_state_job(job);
+            break;
+        case disk_write_job::type::sidecar:
+            disk_run_sidecar_job(job);
+            break;
+        }
+    }
+}
+
+void server_prompt_cache::disk_run_state_job(disk_write_job & job) {
+    namespace fs = std::filesystem;
+
+    const auto & dir        = job.dir;
+    const auto & fingerprint = job.fingerprint;
+    auto & state             = *job.state;
+
     std::error_code ec;
-    if (!fs::is_directory(disk_dir_, ec)) {
-        fs::create_directories(disk_dir_, ec);
+    if (!fs::is_directory(dir, ec)) {
+        fs::create_directories(dir, ec);
         if (ec) {
-            SRV_WRN(" - disk prompt cache: failed to create directory '%s': %s\n", disk_dir_.c_str(), ec.message().c_str());
-            disk_state_.reset();
-            return false;
+            SRV_WRN(" - disk prompt cache: failed to create directory '%s': %s\n", dir.c_str(), ec.message().c_str());
+            return;
         }
     }
 
-    const llama_tokens tokens = state->prompt.tokens.get_text_tokens();
+    const llama_tokens tokens = state.prompt.tokens.get_text_tokens();
     const std::string fname = dpc_sha256_hex((const uint8_t *) tokens.data(), tokens.size() * sizeof(llama_token)) + ".dpc";
-    const std::string path  = (fs::path(disk_dir_) / fname).string();
+    const std::string path  = (fs::path(dir) / fname).string();
     const std::string tmp   = path + ".tmp";
 
     FILE * f = fopen(tmp.c_str(), "wb");
     if (f == nullptr) {
         SRV_WRN(" - disk prompt cache: cannot open '%s'\n", tmp.c_str());
-        disk_state_.reset();
-        return false;
+        return;
     }
 
     const uint32_t magic   = DPC_MAGIC;
     const uint32_t version = DPC_VERSION;
 
-    bool entry_ok = fwrite(&magic, 4, 1, f) == 1 && fwrite(&version, 4, 1, f) == 1 && dpc_write_state(f, *state);
+    bool ok = fwrite(&magic, 4, 1, f) == 1 && fwrite(&version, 4, 1, f) == 1 && dpc_write_state(f, state);
     fclose(f);
 
-    if (!entry_ok) {
+    if (!ok) {
         SRV_WRN(" - disk prompt cache: write to '%s' failed\n", tmp.c_str());
-        disk_state_.reset();
-        return false;
+        std::error_code ec_rm;
+        fs::remove(tmp, ec_rm);
+        return;
     }
 
     fs::rename(tmp, path, ec);
     if (ec) {
         SRV_WRN(" - disk prompt cache: rename to '%s' failed: %s\n", path.c_str(), ec.message().c_str());
-        disk_state_.reset();
-        return false;
+        return;
     }
 
-    // the entry is immediately usable: append it to the index and flag it valid
-    // so later matches do not depend on a disk index reload
-    disk_entries.push_back({ fname, path, state->prompt.tokens.clone(), (size_t) fs::file_size(path, ec) });
-    disk_index_valid = true;
+    // append to the index and flag it valid so later matches do not need a reload
+    {
+        std::lock_guard<std::mutex> lock(disk_index_mtx_);
+        disk_entries.push_back({ fname, path, state.prompt.tokens.clone(), (size_t) fs::file_size(path, ec) });
+        disk_index_valid = true;
+    }
 
-    const size_t state_bytes = state->size();
-    disk_state_.reset();
-
-    prune_disk_budget(disk_dir_);
+    // .dpc-only prune; .ccn files are owned by the main thread and budgeted at exit
+    disk_prune_dpc(dir);
 
     // keep the in-memory index in sync with any entries the prune removed
     {
         std::error_code ec_x;
+        std::lock_guard<std::mutex> lock(disk_index_mtx_);
         disk_entries.erase(
             std::remove_if(disk_entries.begin(), disk_entries.end(),
                 [&](const disk_entry & e) {
@@ -2595,11 +2736,11 @@ bool server_prompt_cache::commit_disk_state(server_prompt_cache_state * state) {
     // keep the meta file current so a later shutdown save does not treat this
     // directory as a config mismatch and clear the freshly written entries
     {
-        const std::string meta_path = (fs::path(disk_dir_) / "meta").string();
+        const std::string meta_path = (fs::path(dir) / "meta").string();
         const std::string meta_tmp  = meta_path + ".tmp";
 
         std::ofstream out(meta_tmp, std::ios::binary);
-        out.write(disk_fingerprint_.data(), (std::streamsize) disk_fingerprint_.size());
+        out.write(fingerprint.data(), (std::streamsize) fingerprint.size());
         out.close();
 
         fs::rename(meta_tmp, meta_path, ec);
@@ -2608,61 +2749,98 @@ bool server_prompt_cache::commit_disk_state(server_prompt_cache_state * state) {
         }
     }
 
+    const size_t state_bytes = state.size();
     SRV_INF(" - disk prompt cache: wrote through state '%s' (%.3f MiB)\n", fname.c_str(), state_bytes / (1024.0 * 1024.0));
+}
 
-    return true;
+void server_prompt_cache::disk_run_sidecar_job(disk_write_job & job) {
+    namespace fs = std::filesystem;
+
+    const std::string tmp = job.path + ".tmp";
+
+    FILE * f = fopen(tmp.c_str(), "wb");
+    if (f == nullptr) {
+        SRV_WRN(" - disk prompt cache: cannot open sidecar '%s'\n", tmp.c_str());
+        return;
+    }
+    const bool ok = !job.bytes.empty() && fwrite(job.bytes.data(), 1, job.bytes.size(), f) == job.bytes.size();
+    fclose(f);
+
+    if (!ok) {
+        SRV_WRN(" - disk prompt cache: write to sidecar '%s' failed\n", tmp.c_str());
+        std::error_code ec;
+        fs::remove(tmp, ec);
+        return;
+    }
+
+    std::error_code ec;
+    fs::rename(tmp, job.path, ec);
+    if (ec) {
+        SRV_WRN(" - disk prompt cache: rename sidecar to '%s' failed: %s\n", job.path.c_str(), ec.message().c_str());
+    }
 }
 
 bool server_prompt_cache::load_from_disk_tier(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
-    if (!disk_index_valid || disk_entries.empty()) {
-        return true;
-    }
+    // scan the index under lock; file I/O happens outside the lock so the writer
+    // thread can keep pushing entries while a slow restore runs
+    std::string best_path;
+    std::string best_fname;
+    float f_keep_best = 0.0f;
+    float f_sim_best  = 0.0f;
 
-    // selection mirrors the in-RAM search in load()
-    const int lcp_base = prompt.tokens.get_common_prefix(tokens_new);
-
-    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_base) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
-    float f_sim_best  = float(lcp_base) / tokens_new.size();
-
-    size_t idx_best = SIZE_MAX;
-
-    for (size_t i = 0; i < disk_entries.size(); ++i) {
-        const auto & entry = disk_entries[i];
-
-        const int lcp_cur = entry.tokens.get_common_prefix(tokens_new);
-
-        const float f_keep_cur = entry.tokens.size() > 0 ? float(lcp_cur) / entry.tokens.size() : -1.0f;
-        const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
-
-        SRV_TRC(" - disk prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n",
-                entry.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
-
-        // don't trash large prompts
-        if (f_keep_cur < 0.25f) {
-            continue;
+    {
+        std::lock_guard<std::mutex> lock(disk_index_mtx_);
+        if (!disk_index_valid || disk_entries.empty()) {
+            return true;
         }
 
-        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
-            f_keep_best = f_keep_cur;
-            f_sim_best  = f_sim_cur;
+        // selection mirrors the in-RAM search in load()
+        const int lcp_base = prompt.tokens.get_common_prefix(tokens_new);
 
-            idx_best = i;
+        f_keep_best = prompt.tokens.size() > 0 ? float(lcp_base) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
+        f_sim_best  = float(lcp_base) / tokens_new.size();
+
+        size_t idx_best = SIZE_MAX;
+
+        for (size_t i = 0; i < disk_entries.size(); ++i) {
+            const auto & entry = disk_entries[i];
+
+            const int lcp_cur = entry.tokens.get_common_prefix(tokens_new);
+
+            const float f_keep_cur = entry.tokens.size() > 0 ? float(lcp_cur) / entry.tokens.size() : -1.0f;
+            const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
+
+            SRV_TRC(" - disk prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n",
+                    entry.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
+
+            // don't trash large prompts
+            if (f_keep_cur < 0.25f) {
+                continue;
+            }
+
+            if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
+                f_keep_best = f_keep_cur;
+                f_sim_best  = f_sim_cur;
+
+                idx_best = i;
+            }
         }
+
+        if (idx_best == SIZE_MAX) {
+            return true;
+        }
+
+        best_path  = disk_entries[idx_best].path;
+        best_fname = disk_entries[idx_best].fname;
     }
 
-    if (idx_best == SIZE_MAX) {
-        return true;
-    }
-
-    const auto & entry = disk_entries[idx_best];
-
-    SRV_TRC(" - disk prompt cache: found entry '%s' with f_keep = %.3f, f_sim = %.3f\n", entry.fname.c_str(), f_keep_best, f_sim_best);
+    SRV_TRC(" - disk prompt cache: found entry '%s' with f_keep = %.3f, f_sim = %.3f\n", best_fname.c_str(), f_keep_best, f_sim_best);
 
     server_prompt_cache_state state;
     {
-        FILE * f = fopen(entry.path.c_str(), "rb");
+        FILE * f = fopen(best_path.c_str(), "rb");
         if (f == nullptr) {
-            SRV_WRN(" - disk prompt cache: cannot open '%s'\n", entry.path.c_str());
+            SRV_WRN(" - disk prompt cache: cannot open '%s'\n", best_path.c_str());
 
             return true;
         }
@@ -2674,7 +2852,7 @@ bool server_prompt_cache::load_from_disk_tier(server_prompt & prompt, const serv
         fclose(f);
 
         if (!ok) {
-            SRV_ERR("failed to load prompt state from disk ('%s')\n", entry.fname.c_str());
+            SRV_ERR("failed to load prompt state from disk ('%s')\n", best_fname.c_str());
 
             return false;
         }
@@ -2696,13 +2874,13 @@ bool server_prompt_cache::load_from_disk_tier(server_prompt & prompt, const serv
         // consume like a RAM hit: the state now lives in the slot
         states.pop_back();
 
-        SRV_INF(" - disk prompt cache: promoted entry '%s' into RAM (%.3f MiB)\n", entry.fname.c_str(), state_bytes / (1024.0 * 1024.0));
+        SRV_INF(" - disk prompt cache: promoted entry '%s' into RAM (%.3f MiB)\n", best_fname.c_str(), state_bytes / (1024.0 * 1024.0));
     } else {
         if (!restore_state(prompt, state, ctx_tgt, ctx_dft, id_slot)) {
             return false;
         }
 
-        SRV_INF(" - disk prompt cache: restored entry '%s' directly from disk (%.3f MiB, RAM budget exhausted)\n", entry.fname.c_str(), state_bytes / (1024.0 * 1024.0));
+        SRV_INF(" - disk prompt cache: restored entry '%s' directly from disk (%.3f MiB, RAM budget exhausted)\n", best_fname.c_str(), state_bytes / (1024.0 * 1024.0));
     }
 
     return true;
@@ -2713,9 +2891,6 @@ size_t server_prompt_cache::load_disk_index(const std::string & dir, const std::
 
     disk_dir_         = dir;
     disk_fingerprint_ = fingerprint;
-
-    disk_entries.clear();
-    disk_index_valid = false;
 
     std::error_code ec;
     if (!fs::is_directory(dir, ec)) {
@@ -2752,7 +2927,10 @@ size_t server_prompt_cache::load_disk_index(const std::string & dir, const std::
     std::sort(files.begin(), files.end());
 
     // read the token prefix and tracked sizes only; the KV blobs stay on disk
-    // until a matching entry is actually restored
+    // until a matching entry is actually restored. build the index locally and
+    // swap it in under the lock so the writer thread never sees a partial index
+    std::vector<disk_entry> new_entries;
+
     size_t n_indexed = 0;
     for (const auto & path : files) {
         FILE * f = fopen(path.string().c_str(), "rb");
@@ -2783,7 +2961,7 @@ size_t server_prompt_cache::load_disk_index(const std::string & dir, const std::
             continue;
         }
 
-        disk_entries.push_back({
+        new_entries.push_back({
             /*.fname      =*/ path.filename().string(),
             /*.path       =*/ path.string(),
             /*.tokens     =*/ server_tokens(tokens, false),
@@ -2793,7 +2971,11 @@ size_t server_prompt_cache::load_disk_index(const std::string & dir, const std::
         n_indexed++;
     }
 
-    disk_index_valid = true;
+    {
+        std::lock_guard<std::mutex> lock(disk_index_mtx_);
+        disk_entries     = std::move(new_entries);
+        disk_index_valid = true;
+    }
 
     return n_indexed;
 }

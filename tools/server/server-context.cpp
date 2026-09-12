@@ -1276,6 +1276,9 @@ private:
                 slot.prompt_save(*prompt_cache);
             }
         }
+        // wait for the background writer to flush all pending .dpc and .ckpt
+        // writes before the RAM states are saved to disk
+        prompt_cache->drain_disk_writes();
         prompt_cache->update();
         const bool ok = prompt_cache->save_to_disk(prompt_cache_disk_dir(), prompt_cache_disk_fingerprint());
         SRV_INF("saved %zu prompt cache states to disk%s\n", prompt_cache->states.size(), ok ? "" : " (with errors)");
@@ -2790,25 +2793,26 @@ private:
     // llama_state_seq file format. persist them in a sidecar file so that
     // action=restore in a fresh process can roll back mid-prompt (e.g. after a
     // BPE boundary re-tokenization of the prompt tail) instead of re-prefilling.
-    static bool checkpoints_save_sidecar(server_prompt & prompt, const std::string & filepath) {
+    static bool checkpoints_save_sidecar(server_prompt & prompt, const std::string & filepath, server_prompt_cache & cache) {
         // spilled checkpoints hold their payloads on the disk tier; always rehydrate
-        // them here so the sidecar never writes empty payloads
+        // them here so the sidecar never writes empty payloads. .ccn reads are only
+        // done on the main thread, so the background writer can never race them
         server_prompt_checkpoints_rehydrate(prompt);
 
-        FILE * f = fopen(filepath.c_str(), "wb");
-        if (f == nullptr) {
-            return false;
-        }
-
-        bool ok = true;
+        // serialize the sidecar to a byte buffer on the main thread, then hand the
+        // bytes to the background writer for an atomic tmp+rename
+        std::vector<uint8_t> buf;
+        auto put = [&buf](const void * p, size_t n) {
+            buf.insert(buf.end(), (const uint8_t *) p, (const uint8_t *) p + n);
+        };
 
         const uint32_t magic   = 0x4C434B50; // "PKCL"
         const uint32_t version = 2;
         const uint32_t count   = (uint32_t) prompt.checkpoints.size();
 
-        ok = ok && fwrite(&magic,   sizeof(magic),   1, f) == 1;
-        ok = ok && fwrite(&version, sizeof(version), 1, f) == 1;
-        ok = ok && fwrite(&count,   sizeof(count),   1, f) == 1;
+        put(&magic,   sizeof(magic));
+        put(&version, sizeof(version));
+        put(&count,   sizeof(count));
 
         // v2 header carries the shared base fields (dedup, now removed); write empty base
         const int64_t  base_n_tokens = 0;
@@ -2816,10 +2820,10 @@ private:
         const uint64_t len_base_tgt  = 0;
         const uint64_t len_base_dft  = 0;
 
-        ok = ok && fwrite(&base_n_tokens, sizeof(base_n_tokens), 1, f) == 1;
-        ok = ok && fwrite(&base_pos_max,  sizeof(base_pos_max),  1, f) == 1;
-        ok = ok && fwrite(&len_base_tgt,  sizeof(len_base_tgt),  1, f) == 1;
-        ok = ok && fwrite(&len_base_dft,  sizeof(len_base_dft),  1, f) == 1;
+        put(&base_n_tokens, sizeof(base_n_tokens));
+        put(&base_pos_max,  sizeof(base_pos_max));
+        put(&len_base_tgt,  sizeof(len_base_tgt));
+        put(&len_base_dft,  sizeof(len_base_dft));
 
         for (const auto & cur : prompt.checkpoints) {
             const int64_t  n_tokens = cur.n_tokens;
@@ -2828,17 +2832,19 @@ private:
             const uint64_t n_tgt    = cur.data_tgt.size();
             const uint64_t n_dft    = cur.data_dft.size();
 
-            ok = ok && fwrite(&n_tokens, sizeof(n_tokens), 1, f) == 1;
-            ok = ok && fwrite(&pos_min,  sizeof(pos_min),  1, f) == 1;
-            ok = ok && fwrite(&pos_max,  sizeof(pos_max),  1, f) == 1;
-            ok = ok && fwrite(&n_tgt,    sizeof(n_tgt),    1, f) == 1;
-            ok = ok && fwrite(&n_dft,    sizeof(n_dft),    1, f) == 1;
-            ok = ok && (n_tgt == 0 || fwrite(cur.data_tgt.data(), 1, n_tgt, f) == n_tgt);
-            ok = ok && (n_dft == 0 || fwrite(cur.data_dft.data(), 1, n_dft, f) == n_dft);
+            put(&n_tokens, sizeof(n_tokens));
+            put(&pos_min,  sizeof(pos_min));
+            put(&pos_max,  sizeof(pos_max));
+            put(&n_tgt,    sizeof(n_tgt));
+            put(&n_dft,    sizeof(n_dft));
+            if (n_tgt > 0) put(cur.data_tgt.data(), n_tgt);
+            if (n_dft > 0) put(cur.data_dft.data(), n_dft);
         }
 
-        fclose(f);
-        return ok;
+        if (buf.empty()) {
+            return false;
+        }
+        return cache.enqueue_sidecar(filepath, std::move(buf));
     }
 
     static bool checkpoints_load_sidecar(server_prompt & prompt, const std::string & filepath) {
@@ -3220,10 +3226,10 @@ private:
                     // persist context checkpoints alongside the state file so that a
                     // restore in a fresh process can roll back mid-prompt (see restore path)
                     if (!slot->prompt.checkpoints.empty()) {
-                        if (checkpoints_save_sidecar(slot->prompt, filepath + ".ckpt")) {
-                            SLT_INF(*slot, "saved %zu context checkpoints to sidecar\n", slot->prompt.checkpoints.size());
+                        if (checkpoints_save_sidecar(slot->prompt, filepath + ".ckpt", *prompt_cache)) {
+                            SLT_INF(*slot, "queued %zu context checkpoints for sidecar write\n", slot->prompt.checkpoints.size());
                         } else {
-                            SLT_WRN(*slot, "failed to write checkpoint sidecar %s\n", (filepath + ".ckpt").c_str());
+                            SLT_WRN(*slot, "failed to queue checkpoint sidecar %s\n", (filepath + ".ckpt").c_str());
                         }
                     }
 

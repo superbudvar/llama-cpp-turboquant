@@ -9,6 +9,10 @@
 #include <map>
 #include <memory>
 #include <vector>
+#include <deque>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -731,6 +735,29 @@ struct server_prompt_cache {
     // for states that are not the pending disk scratch
     bool commit_disk_state(server_prompt_cache_state * state);
 
+    // background disk writer: all disk I/O from commit_disk_state and slot save
+    // sidecars is serialized here so the decode loop never blocks on storage.
+    // the writer owns all .dpc files, metadata, and sidecar writes; the main
+    // thread owns .ccn spill files (create/rehydrate/compact).
+    struct disk_write_job {
+        enum class type { state, sidecar } kind = type::state;
+
+        // kind == state: write-through .dpc + prune .dpc + index update + meta
+        std::unique_ptr<server_prompt_cache_state> state;
+        std::string dir;
+        std::string fingerprint;
+
+        // kind == sidecar: slot checkpoint sidecar (.ckpt)
+        std::string path;
+        std::vector<uint8_t> bytes;
+    };
+
+    // enqueue a slot checkpoint sidecar write (bytes already serialized)
+    bool enqueue_sidecar(const std::string & path, std::vector<uint8_t> bytes);
+
+    // drain the writer queue and stop the background thread; no-op when idle
+    void drain_disk_writes();
+
 private:
     bool restore_state(server_prompt & prompt, server_prompt_cache_state & state, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
@@ -739,6 +766,24 @@ private:
     // enforce the disk budget by oldest-mtime eviction; only touches the
     // filesystem, the in-memory index is synced by the (non-const) callers
     void prune_disk_budget(const std::string & dir) const;
+
+    // prune .dpc files only (writer thread); .ccn are budgeted at exit
+    void disk_prune_dpc(const std::string & dir) const;
+
+    // background writer thread lifecycle
+    void start_disk_thread();
+    void disk_thread_main();
+    void disk_run_state_job(disk_write_job & job);
+    void disk_run_sidecar_job(disk_write_job & job);
+
+    std::thread disk_thread_;
+    std::mutex  disk_jobs_mtx_;
+    std::condition_variable disk_jobs_cv_;
+    std::deque<disk_write_job> disk_jobs_;
+    bool disk_thread_stop_ = false;
+
+    // guards disk_entries and disk_index_valid between the loop thread and the writer
+    std::mutex disk_index_mtx_;
 };
 
 // used exclusively by router mode
