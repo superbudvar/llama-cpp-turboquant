@@ -211,8 +211,10 @@ static int64_t fit_device_used(const common_device_memory_data & dmd) {
 static bool fit_fits_margins(
         const common_device_memory_data_vec & memory,
         const std::vector<int64_t> & margins,
-        const common_fit_analysis & analysis) {
+        const common_fit_analysis & analysis,
+        size_t * fail_dev = nullptr) {
     const size_t nd = analysis.devices.size();
+    if (fail_dev) { *fail_dev = (size_t) -1; }
     LOG_DBG("%s: memory.size()=%zu nd+1=%zu margins.size()=%zu nd=%zu\n",
             __func__, memory.size(), nd + 1, margins.size(), nd);
     if (memory.size() != nd + 1 || margins.size() < nd) {
@@ -242,6 +244,7 @@ static bool fit_fits_margins(
         if (used > INT64_MAX ||
             rem < margins[id]) {
             LOG_DBG("%s: fit_fits_margins FAIL dev[%zu]\n", __func__, id);
+            if (fail_dev) { *fail_dev = id; }
             return false;
         }
     }
@@ -581,6 +584,134 @@ static int32_t fit_grow_context(
     return best_ctx;
 }
 
+// for an rpc-split CPU spill at a fixed n_gpu_layers, find the rpc_frac split and
+// grow the context from it. the full-offload scan pinned rpc_frac to the RPC
+// ceiling; once layers move to CPU neither device overflows at that ceiling, so
+// the RPC-maximizing split fills RPC first and strands the local device. this
+// re-brackets the feasible interval at this layer count (coarse 0.05 scan, then
+// bisection when the window is narrower than the step) and keeps the split that
+// reaches the largest context, using the smallest rpc_frac (least RPC offload)
+// on ties. returns the chosen n_ctx (>= 0) or -1 when no split reaches the
+// minimum context; sets out_frac to the chosen rpc_frac.
+static int32_t fit_spill_split_at_ngl(
+        const common_fit_analysis & analysis,
+        const std::vector<int64_t> & margins,
+        const common_params & params,
+        llama_model_params * mparams,
+        llama_context_params * cparams,
+        const common_fit_probe & probe,
+        const fit_candidate_spec & spec,
+        uint32_t hp_ngl,
+        const std::string & path_model,
+        int32_t ngl,
+        float scan_hi,
+        common_fit_plan & out_plan,
+        fit_measure_result & out_measure,
+        float & out_frac) {
+    out_frac = -1.0f;
+    const int32_t min_ctx = (int32_t) (params.n_ctx > 0 ? params.n_ctx : params.fit_strategy_min_ctx);
+    const float step = 0.05f;
+    const size_t nd = analysis.devices.size();
+
+    struct row_t {
+        float f;
+        bool ok;
+        size_t fail_dev;
+    };
+    std::vector<row_t> rows;
+    std::vector<float> feas;
+
+    // coarse scan top-down, mirroring the full-offload bracket. rpc_frac
+    // feasibility is an interval: low f overflows the local device, high f
+    // overflows RPC.
+    for (float f = scan_hi; f >= -step * 0.5f; f -= step) {
+        if (f < 0.0f) { f = 0.0f; }
+        common_fit_plan plan = fit_plan_from_spec(analysis, spec, hp_ngl, min_ctx, f, ngl);
+        fit_measure_result m;
+        const bool ok_measure = fit_measure_plan(probe, plan, mparams, cparams, path_model, m);
+        const bool ok_devs    = ok_measure && fit_same_devices(m.devs, analysis);
+        size_t fail = (size_t) -1;
+        const bool ok_margin  = ok_devs && fit_fits_margins(m.memory, margins, analysis, &fail);
+        LOG_DBG("%s: ngl=%d rpc_frac=%.4f measure=%d devs=%d margin=%d -> %s\n",
+                __func__, ngl, f, ok_measure ? 1 : 0, ok_devs ? 1 : 0, ok_margin ? 1 : 0,
+                ok_margin ? "FEASIBLE" : "rejected");
+        rows.push_back({ f, ok_margin, fail });
+        if (ok_margin) {
+            feas.push_back(f);
+        }
+        if (f <= 0.0f) { break; }
+    }
+
+    // window narrower than one step: the scan straddles it (high rows overflow
+    // RPC, low rows overflow the local device). bisect into the window; when no
+    // feasible split exists the search converges on the balancing point and
+    // returns no feasible result, which is the correct verdict for that ngl.
+    if (feas.empty()) {
+        float f_lo = 0.0f;
+        float f_hi = scan_hi;
+        bool have_lo = false;
+        bool have_hi = false;
+        for (const auto & r : rows) {
+            if (!r.ok && r.fail_dev < nd && analysis.devices[r.fail_dev].is_rpc) {
+                f_hi = std::min(f_hi, r.f); // feasible window lies below RPC overflow
+                have_hi = true;
+            } else if (!r.ok && r.fail_dev < nd) {
+                f_lo = std::max(f_lo, r.f); // ... and above local-device overflow
+                have_lo = true;
+            }
+        }
+        if (have_lo && have_hi) {
+            for (int it = 0; it < 13 && f_hi - f_lo > 1e-4f; it++) {
+                const float fm = (f_lo + f_hi) * 0.5f;
+                common_fit_plan plan = fit_plan_from_spec(analysis, spec, hp_ngl, min_ctx, fm, ngl);
+                fit_measure_result m;
+                const bool ok_measure = fit_measure_plan(probe, plan, mparams, cparams, path_model, m);
+                const bool ok_devs    = ok_measure && fit_same_devices(m.devs, analysis);
+                size_t fail = (size_t) -1;
+                const bool ok_margin  = ok_devs && fit_fits_margins(m.memory, margins, analysis, &fail);
+                LOG_DBG("%s: ngl=%d bisect rpc_frac=%.4f measure=%d devs=%d margin=%d -> %s\n",
+                        __func__, ngl, fm, ok_measure ? 1 : 0, ok_devs ? 1 : 0, ok_margin ? 1 : 0,
+                        ok_margin ? "FEASIBLE" : "rejected");
+                if (ok_margin) {
+                    feas.push_back(fm);
+                    f_hi = fm; // keep probing lower (local-first)
+                } else if (fail < nd && analysis.devices[fail].is_rpc) {
+                    f_hi = fm; // too much RPC: split must move lower
+                } else {
+                    f_lo = fm; // local overflow: split must move higher
+                }
+            }
+        }
+    }
+
+    // grow the context from each feasible split and keep the one at the largest
+    // context. scan ascending rpc_frac so among splits reaching the same maximum
+    // context the smallest rpc_frac (least RPC offload) wins: RPC is used last.
+    std::sort(feas.begin(), feas.end());
+    int32_t best_ctx = -1;
+    common_fit_plan best_plan;
+    fit_measure_result best_m;
+    for (float f : feas) {
+        common_fit_plan plan;
+        fit_measure_result m;
+        const int32_t ctx = fit_grow_context(analysis, margins, params, mparams, cparams,
+                probe, spec, f, hp_ngl, path_model, plan, m, ngl);
+        if (ctx < 0) { continue; }
+        if (best_ctx < 0 || ctx > best_ctx) {
+            best_ctx = ctx;
+            out_frac = f;
+            best_plan = plan;
+            best_m = m;
+        }
+    }
+    if (best_ctx < 0) {
+        return -1;
+    }
+    out_plan = best_plan;
+    out_measure = best_m;
+    return best_ctx;
+}
+
 // effective per-device margins: base margins plus every soft reservation that
 // was not shed. device indices follow the analysis device order.
 static std::vector<int64_t> fit_effective_margins(
@@ -632,6 +763,24 @@ static bool fit_split_has_rpc(const common_fit_analysis & analysis, const std::v
         if (d >= 0 && analysis.devices[d].is_rpc) return true;
     }
     return false;
+}
+
+// upper bound of the rpc_frac scan for a split: the fraction of the full model
+// RPC can hold above its 2 GiB context reserve. device memory does not change
+// with n_gpu_layers, so the same bound brackets every spill node.
+static float fit_rpc_scan_hi(const common_fit_analysis & analysis, const std::vector<int> & split_devices) {
+    int rpc_device = -1;
+    for (int d : split_devices) {
+        if (d >= 0 && analysis.devices[d].is_rpc) { rpc_device = d; break; }
+    }
+    GGML_ASSERT(rpc_device >= 0);
+    const int64_t context_reserve = 2LL * 1024 * 1024 * 1024;
+    const int64_t rpc_avail = analysis.devices[rpc_device].total_bytes - context_reserve;
+    size_t total_model = 0;
+    for (const auto & t : analysis.tensors) {
+        total_model += t.bytes;
+    }
+    return total_model > 0 ? std::min(1.0f, (float) rpc_avail / (float) total_model) : 0.0f;
 }
 
 // pool that is never the main_gpu device. first fit wins; returns false when no
@@ -730,7 +879,6 @@ static bool fit_solve_rpc_aware(
         bool have_spill = false;
         bool have_rpc_spill = false;
         fit_candidate_spec spill_spec;
-        float spill_rpc_frac = -1.0f;
 
         for (const auto & cand : candidates) {
             // rpc-split candidates split the full model across local + RPC via
@@ -765,25 +913,13 @@ static bool fit_solve_rpc_aware(
                         __func__, cand.label.c_str());
                 if (!have_spill) {
                     spill_spec = cand;
-                    spill_rpc_frac = -1.0f;
                     have_spill = true;
                 }
                 continue;
             }
 
             // bracket the feasible rpc_frac interval at the minimum context
-            int rpc_device = -1;
-            for (int d : cand.split_devices) {
-                if (d >= 0 && analysis.devices[d].is_rpc) { rpc_device = d; break; }
-            }
-            GGML_ASSERT(rpc_device >= 0);
-            const int64_t context_reserve = 2LL * 1024 * 1024 * 1024;
-            const int64_t rpc_avail = analysis.devices[rpc_device].total_bytes - context_reserve;
-            size_t total_model = 0;
-            for (const auto & t : analysis.tensors) {
-                total_model += t.bytes;
-            }
-            const float hi = total_model > 0 ? std::min(1.0f, (float) rpc_avail / (float) total_model) : 0.0f;
+            const float hi = fit_rpc_scan_hi(analysis, cand.split_devices);
 
             // coarse floor scan (step 0.05) to find feasible rpc_frac values
             std::vector<float> feas;
@@ -807,7 +943,6 @@ static bool fit_solve_rpc_aware(
                     // this candidate overrides a local-only spill base recorded
                     // above, so RPC stays in use (rocm+rpc+cpu) during the spill
                     spill_spec = cand;
-                    spill_rpc_frac = hi;
                     have_rpc_spill = true;
                     have_spill = true;
                 }
@@ -816,7 +951,6 @@ static bool fit_solve_rpc_aware(
             // scanned top-down: front = largest rpc_frac (max offload), back = smallest
             const float f_hi_off = feas.front();
             const float f_lo_off = feas.back();
-            const float f_mid = (f_hi_off + f_lo_off) * 0.5f;
 
             // pick the rpc_frac that maximizes the achievable context. with a layer
             // split the KV cache follows the weights, so the device holding the larger
@@ -856,7 +990,6 @@ static bool fit_solve_rpc_aware(
                     __func__, cand.label.c_str());
             if (!have_rpc_spill) {
                 spill_spec = cand;
-                spill_rpc_frac = f_mid;
                 have_rpc_spill = true;
                 have_spill = true;
             }
@@ -871,22 +1004,35 @@ static bool fit_solve_rpc_aware(
             const bool spec_is_rpc_split = (spill_spec.split_devices.size() > 1) &&
                     fit_split_has_rpc(analysis, spill_spec.split_devices);
             const int32_t min_ctx = (int32_t) (params.n_ctx > 0 ? params.n_ctx : params.fit_strategy_min_ctx);
+            // rpc-split spills re-bracket the rpc_frac interval per n_gpu_layers
+            // instead of reusing the full-offload ceiling: with layers on CPU the
+            // RPC-maximizing split would overflow nothing and fill RPC first.
+            const float scan_hi = spec_is_rpc_split ? fit_rpc_scan_hi(analysis, spill_spec.split_devices) : 0.0f;
             int32_t lo_ngl = 0;            // all layers on CPU -> max context
             int32_t hi_ngl = (int32_t) hp_ngl; // full offload (failed min_ctx)
             int32_t best_ngl = -1;
             common_fit_plan best_plan;
             fit_measure_result best_m;
+            float best_frac = -1.0f;
             while (lo_ngl <= hi_ngl) {
                 const int32_t mid_ngl = lo_ngl + (hi_ngl - lo_ngl) / 2;
                 common_fit_plan plan;
                 fit_measure_result m;
-                const int32_t ctx = fit_grow_context(analysis, margins, params, mparams, cparams,
-                        probe, spill_spec, spec_is_rpc_split ? spill_rpc_frac : -1.0f,
-                        hp_ngl, path_model, plan, m, mid_ngl);
+                int32_t ctx;
+                float frac = -1.0f;
+                if (spec_is_rpc_split) {
+                    ctx = fit_spill_split_at_ngl(analysis, margins, params, mparams, cparams,
+                            probe, spill_spec, hp_ngl, path_model, mid_ngl, scan_hi,
+                            plan, m, frac);
+                } else {
+                    ctx = fit_grow_context(analysis, margins, params, mparams, cparams,
+                            probe, spill_spec, -1.0f, hp_ngl, path_model, plan, m, mid_ngl);
+                }
                 if (ctx >= min_ctx) {
                     best_ngl = mid_ngl;
                     best_plan = plan;
                     best_m = m;
+                    best_frac = frac;
                     lo_ngl = mid_ngl + 1; // try keeping more layers on GPU
                 } else {
                     hi_ngl = mid_ngl - 1;
@@ -896,8 +1042,13 @@ static bool fit_solve_rpc_aware(
                 out_plan = best_plan;
                 out_measure = best_m;
                 out_plan.shed_reserves = shed_tags;
-                LOG_WRN("%s: spilling %u layers to CPU to reach min-ctx %d (n_gpu_layers=%d of %u)\n",
-                        __func__, (uint32_t) (hp_ngl - best_ngl), min_ctx, best_ngl, hp_ngl);
+                if (best_frac >= 0.0f) {
+                    LOG_WRN("%s: spilling %u layers to CPU to reach min-ctx %d (n_gpu_layers=%d of %u, rpc_frac=%.4f)\n",
+                            __func__, (uint32_t) (hp_ngl - best_ngl), min_ctx, best_ngl, hp_ngl, best_frac);
+                } else {
+                    LOG_WRN("%s: spilling %u layers to CPU to reach min-ctx %d (n_gpu_layers=%d of %u)\n",
+                            __func__, (uint32_t) (hp_ngl - best_ngl), min_ctx, best_ngl, hp_ngl);
+                }
                 return true;
             }
         }
