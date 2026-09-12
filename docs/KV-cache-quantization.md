@@ -67,6 +67,44 @@ llama-quantize model-f16.gguf model-tq4.gguf TQ4_1S
 cooperative mmvq), Metal, and Vulkan kernels. MoE models disable CUDA graphs
 for TQ `MUL_MAT_ID` automatically.
 
+## Context checkpoint offload and the disk prompt cache
+
+The server adds a disk tier for two kinds of KV data so long contexts keep
+their rollback and reuse state without pinning it in RAM:
+
+- **Context checkpoints** (`--ctx-checkpoints N`, default 32) snapshot the
+  evicted KV window of the context so a task restart can roll back mid-prompt
+  (for example after a BPE-boundary retokenization of the prompt tail) instead
+  of re-prefilling. The snapshot payload is spilled to a per-slot `.ccn` file
+  in the disk cache directory; only the lightweight `n_tokens`/`pos_min`/`
+  pos_max` metadata stays in RAM. Checkpoints are created only for completion
+  tasks on models that need them (SWA, or contexts without partial sequence
+  removal), and are erased when invalidated.
+- **Prompt cache states** (`--cache-ram N` + `--cache-disk PATH`) persist the
+  prompt KV state so a fresh process can restore the prefix. The in-RAM pool
+  is capped by `--cache-ram` (MiB); there is a separate disk pool capped by
+  `--cache-disk-max` (MiB, entries survive eviction from the RAM pool). A state
+  larger than the RAM cap is *written through* to a `.dpc` file instead of
+  held in RAM: the write goes to the background disk thread and the RAM is
+  freed immediately, so a 500 MiB state at a 64 MiB RAM cap costs no decode
+  stalls.
+
+All disk I/O for `.dpc` and `.ccn` payloads runs on a single background writer
+thread. The server enqueues jobs (write-through states, checkpoint spills, and
+the `.ckpt` sidecar written by the SLOT_SAVE endpoint) and returns to decoding
+immediately; every file is written to a `.tmp` path and atomically renamed, so
+a crash never leaves a torn `.dpc`/`.ccn`/`.ckpt`. Before exit the server
+drains the writer queue (joins the thread), then flushes the RAM-tier entries
+to disk, so a clean shutdown preserves everything. On startup the disk index is
+rebuilt by scanning the `.dpc` files and matching prompts by token prefix.
+
+The `.ccn`/`.ckpt`/`.dpc` payloads are stored raw (uncompressed). The turbo
+cache types are already nearly incompressible: a zstd level-3 run over
+turbo4-at-64k production states measured a median ratio of 1.065x at ~150 MiB/s
+(versus ~780 MiB/s for the raw write), so compression was explicitly rejected
+(see the measurement log). Adding a compressor here would burn more CPU than
+it would save disk space.
+
 ## Fit strategies
 
 `--fit-strategy` selects the fit engine that sizes the model placement and the
