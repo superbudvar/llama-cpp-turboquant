@@ -596,9 +596,14 @@ struct server_prompt {
 
     std::list<common_prompt_checkpoint> checkpoints;
 
+    // disk spill file for the checkpoint payloads (only set while a disk tier is
+    // active); payloads are moved out of RAM here and rehydrated on demand
+    std::string checkpoint_spill_path;
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
+        checkpoint_spill_path.clear();
     }
 
     int n_tokens() const {
@@ -609,6 +614,7 @@ struct server_prompt {
         return server_prompt {
             tokens.clone(),
             checkpoints,
+            checkpoint_spill_path,
         };
     }
 };
@@ -621,6 +627,28 @@ struct server_prompt_data {
         return main.size() + drft.size();
     }
 };
+
+// write the blobs of a checkpoint to the disk spill file; on success the RAM
+// blobs are cleared and the spill offset is recorded. truncates the file when
+// requested so a fresh conversation never reuses stale segments.
+// returns the byte offset of the segment, or -1 on failure.
+int64_t server_ckpt_spill_store(common_prompt_checkpoint & ckpt, const std::string & path, bool truncate);
+
+// restore the blobs of a spilled checkpoint from the disk spill file.
+// clears the spill record on success and leaves the checkpoint spilled otherwise.
+bool server_ckpt_spill_load(common_prompt_checkpoint & ckpt, const std::string & path);
+
+// rewrite the spill file with only the live spilled segments when it has grown
+// past 2x the live payload; keeps every recorded offset valid.
+void server_ckpt_spill_compact(server_prompt & prompt, const std::string & path);
+
+// atomically rehydrate every spilled checkpoint in a prompt from its own blob
+// offsets; returns false if any spill file is missing or corrupt.
+bool server_prompt_checkpoints_rehydrate(server_prompt & prompt);
+
+// drop all spill records of a prompt's checkpoints (they hold full blobs);
+// used on RAM cache tiers so stale `.ccn` offsets never leak into cache states.
+void server_prompt_checkpoints_wipe(server_prompt & prompt);
 
 struct server_prompt_cache_state {
     server_prompt prompt;

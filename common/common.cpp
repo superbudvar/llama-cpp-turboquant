@@ -2199,11 +2199,14 @@ bool common_prompt_batch_decode(
 }
 
 size_t common_prompt_checkpoint::size() const {
+    if (spilled()) {
+        return spill_len;
+    }
     return data_tgt.size() + data_dft.size() + data_spec.size();
 }
 
 bool common_prompt_checkpoint::empty() const {
-    return data_tgt.empty();
+    return !spilled() && data_tgt.empty();
 }
 
 void common_prompt_checkpoint::clear() {
@@ -2215,6 +2218,9 @@ void common_prompt_checkpoint::clear() {
     data_tgt.clear();
     data_dft.clear();
     data_spec.clear();
+
+    spill_off = -1;
+    spill_len = 0;
 }
 
 void common_prompt_checkpoint::update_pos(

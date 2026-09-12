@@ -2790,7 +2790,11 @@ private:
     // llama_state_seq file format. persist them in a sidecar file so that
     // action=restore in a fresh process can roll back mid-prompt (e.g. after a
     // BPE boundary re-tokenization of the prompt tail) instead of re-prefilling.
-    static bool checkpoints_save_sidecar(const server_prompt & prompt, const std::string & filepath) {
+    static bool checkpoints_save_sidecar(server_prompt & prompt, const std::string & filepath) {
+        // spilled checkpoints hold their payloads on the disk tier; always rehydrate
+        // them here so the sidecar never writes empty payloads
+        server_prompt_checkpoints_rehydrate(prompt);
+
         FILE * f = fopen(filepath.c_str(), "wb");
         if (f == nullptr) {
             return false;
@@ -2904,8 +2908,20 @@ private:
         }
 
         prompt.checkpoints = std::move(loaded);
+        prompt.checkpoint_spill_path.clear();
 
         return true;
+    }
+
+    // one constant filename per slot: the `.dpc` directory is already per-model,
+    // so a slot's spill file is stable across conversations and new spills of old
+    // buffers simply truncate it
+    std::string server_ckpt_spill_path_for(const server_slot & slot, const server_prompt_cache * cache) {
+        if (!cache || cache->disk_dir_.empty()) {
+            return "";
+        }
+        std::string slot_path = "ckpt-" + std::to_string(slot.id) + ".ccn";
+        return (std::filesystem::path(cache->disk_dir_) / slot_path).string();
     }
 
     // effective minimum spacing between context checkpoints.
@@ -2924,6 +2940,9 @@ private:
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         // Slot restore can synthesize a checkpoint without an active inference task.
         const int id_task = slot.task ? slot.task->id : -1;
+
+        // snapshot the pre-eviction count: it drives fresh-file truncation below
+        const size_t checkpoints_before = slot.prompt.checkpoints.size();
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
@@ -2964,6 +2983,30 @@ private:
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+
+        // move the payload of the new checkpoint onto the disk tier when it is
+        // active; the metadata (n_tokens/pos_min/pos_max) stays in RAM so the
+        // eviction and restore logic is unchanged
+        if (prompt_cache && !prompt_cache->disk_dir_.empty()) {
+            if (slot.prompt.checkpoint_spill_path.empty()) {
+                slot.prompt.checkpoint_spill_path = server_ckpt_spill_path_for(slot, prompt_cache.get());
+            }
+
+            const int64_t spill_off = server_ckpt_spill_store(cur, slot.prompt.checkpoint_spill_path, checkpoints_before == 0);
+            if (spill_off >= 0) {
+                SLT_TRC(slot, "spilled context checkpoint payload to %s (offset %" PRId64 ", freed %.3f MiB)\n",
+                        slot.prompt.checkpoint_spill_path.c_str(), spill_off, (float) cur.size() / 1024 / 1024);
+            } else {
+                SLT_WRN(slot, "failed to spill context checkpoint payload to %s, keeping it in RAM\n", slot.prompt.checkpoint_spill_path.c_str());
+                slot.prompt.checkpoint_spill_path.clear();
+            }
+        }
+
+        // dropped checkpoints leave dead segments in the spill file; rewrite when
+        // it has grown past 2x the live payload
+        if (!slot.prompt.checkpoint_spill_path.empty()) {
+            server_ckpt_spill_compact(slot.prompt, slot.prompt.checkpoint_spill_path);
+        }
 
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
@@ -3967,6 +4010,15 @@ private:
                                     );
 
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
+
+                                    if (!do_reset && it->spilled()) {
+                                        // rehydrate the payload of a spilled checkpoint from the disk tier
+                                        // before restoring; on failure the empty payload forces a full re-prefill
+                                        if (!server_ckpt_spill_load(*it, slot.prompt.checkpoint_spill_path)) {
+                                            SLT_WRN(slot, "failed to rehydrate spilled context checkpoint (%s), forcing full re-prefill\n",
+                                                    slot.prompt.checkpoint_spill_path.c_str());
+                                        }
+                                    }
 
                                     if (!do_reset) {
                                         // restore the context checkpoint: every checkpoint carries its own

@@ -1191,6 +1191,16 @@ struct common_prompt_checkpoint {
     // (e.g. eagle3's deferred-boundary g_embd row)
     std::vector<uint8_t> data_spec;
 
+    // optional disk-spill record: blobs are moved out of RAM into a `.ccn` file
+    // next to the decoupled disk tier; the payload is rehydrated on demand. a
+    // spilled checkpoint keeps its metadata (n_tokens/pos_min/pos_max) in RAM.
+    int64_t spill_off = -1;
+    size_t spill_len  = 0;
+
+    bool spilled() const {
+        return spill_off >= 0;
+    }
+
     size_t size() const;
 
     bool empty() const;
