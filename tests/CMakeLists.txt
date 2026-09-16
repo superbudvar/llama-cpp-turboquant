@@ -310,6 +310,9 @@ set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED 
 llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED test-download-model)
 
+# Test KV state byte-stability across independent decode schedules (chunked disk format premis, pm-20260916-301)
+llama_build(test-kv-prefix-stability.cpp)
+
 if (APPLE)
     llama_build(test-rset-release.cpp)
 endif()
