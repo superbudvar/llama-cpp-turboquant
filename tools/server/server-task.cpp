@@ -3922,7 +3922,7 @@ bool server_prompt_cache::save_to_disk(const std::string & dir, const std::strin
             std::error_code ec_space;
             const auto free0 = fs::space(root, ec_space).available;
             if (!ec_space && free0 < need) {
-                prune_disk_budget(dir);
+                prune_disk_budget(dir, need);
                 const auto free1 = fs::space(root, ec_space).available;
                 if (ec_space || free1 < need) {
                     SRV_WRN(" - disk prompt cache: skipping save '%s' - %.3f MiB free (need %.3f MiB)\n",
@@ -3978,23 +3978,23 @@ bool server_prompt_cache::save_to_disk(const std::string & dir, const std::strin
     return ok;
 }
 
-void server_prompt_cache::prune_disk_budget(const std::string & dir) const {
+void server_prompt_cache::prune_disk_budget(const std::string & dir, uint64_t min_free) const {
     namespace fs = std::filesystem;
 
     // the pool root is the parent of the per-preset dir (cache_disk_path/<name>)
     const fs::path root = fs::path(dir).parent_path();
-    prune_pool(root.string(), dir, true);
+    prune_pool(root.string(), dir, true, nullptr, min_free);
 }
 
-void server_prompt_cache::disk_prune_dpc(const std::string & dir, std::vector<std::array<uint8_t, 32>> * evicted) const {
+void server_prompt_cache::disk_prune_dpc(const std::string & dir, std::vector<std::array<uint8_t, 32>> * evicted, uint64_t min_free) const {
     namespace fs = std::filesystem;
 
     const fs::path root = fs::path(dir).parent_path();
-    prune_pool(root.string(), dir, false, evicted);
+    prune_pool(root.string(), dir, false, evicted, min_free);
 }
 
 void server_prompt_cache::prune_pool(const std::string & root, const std::string & own_dir, bool include_own_ccn,
-                                    std::vector<std::array<uint8_t, 32>> * evicted) const {
+                                    std::vector<std::array<uint8_t, 32>> * evicted, uint64_t min_free) const {
     namespace fs = std::filesystem;
 
     if (disk_max_size == 0) {
@@ -4011,13 +4011,14 @@ void server_prompt_cache::prune_pool(const std::string & root, const std::string
                 }
             }
         }
-        return;
+        // the budget pass below is disabled, but the free-space pass still runs
     }
 
     struct pool_file {
         fs::path path;
         fs::file_time_type mtime;
         uint64_t size;
+        bool is_ccn;
     };
 
     std::error_code ec;
@@ -4040,14 +4041,14 @@ void server_prompt_cache::prune_pool(const std::string & root, const std::string
                     continue;
                 }
                 used += (uint64_t) size;
-                files.push_back({ entry.path(), fs::last_write_time(entry.path(), ec), (uint64_t) size });
+                files.push_back({ entry.path(), fs::last_write_time(entry.path(), ec), (uint64_t) size, false });
             } else if (ext == ".ccn" && is_own_dir && include_own_ccn) {
                 const auto size = fs::file_size(entry.path(), ec);
                 if (ec) {
                     continue;
                 }
                 used += (uint64_t) size;
-                files.push_back({ entry.path(), fs::last_write_time(entry.path(), ec), (uint64_t) size });
+                files.push_back({ entry.path(), fs::last_write_time(entry.path(), ec), (uint64_t) size, true });
             } else if (ext == ".dcp" || ext == ".dci") {
                 // chunk store files count toward the budget but are never evicted
                 const auto size = fs::file_size(entry.path(), ec);
@@ -4058,25 +4059,24 @@ void server_prompt_cache::prune_pool(const std::string & root, const std::string
         }
     }
 
-    if (used > disk_max_size) {
+    // evict oldest first (shared with the free-space pass below)
+    const auto eval_oldest = [&files]() {
         std::sort(files.begin(), files.end(), [](const pool_file & a, const pool_file & b) {
             return a.mtime < b.mtime;
         });
+    };
 
-        for (const auto & file : files) {
-            if (used <= disk_max_size) {
-                break;
-            }
-
-            // extract the fingerprint from the .dts sidecar before removing it,
-            // so the caller can drop the stale state from the chunk store
-            if (evicted && file.path.extension() == ".dts") {
-                FILE * f = fopen(file.path.string().c_str(), "rb");
-                if (f) {
-                    uint32_t magic = 0, version = 0, n_tokens = 0;
-                    if (fread(&magic, 4, 1, f) == 1 && magic == DTS_MAGIC &&
-                        fread(&version, 4, 1, f) == 1 && version == DTS_VERSION &&
-                        fread(&n_tokens, 4, 1, f) == 1 && n_tokens > 0 && n_tokens <= 131072) {
+    // remove one file, returning its size if the removal freed the bytes.
+    // .dts fingerprint extraction must happen before the file is gone so the
+    // caller can drop the stale state from the chunk store
+    const auto evict_one = [this, evicted](pool_file & file) -> uint64_t {
+        if (evicted && file.path.extension() == ".dts") {
+            FILE * f = fopen(file.path.string().c_str(), "rb");
+            if (f) {
+                uint32_t magic = 0, version = 0, n_tokens = 0;
+                if (fread(&magic, 4, 1, f) == 1 && magic == DTS_MAGIC &&
+                    fread(&version, 4, 1, f) == 1 && version == DTS_VERSION &&
+                    fread(&n_tokens, 4, 1, f) == 1 && n_tokens > 0 && n_tokens <= 131072) {
                         // skip len_main(8) + len_drft(8) + n_ckpt(4) = 20 bytes
                         fseek(f, 20, SEEK_CUR);
                         std::vector<int32_t> tokens(n_tokens);
@@ -4086,20 +4086,56 @@ void server_prompt_cache::prune_pool(const std::string & root, const std::string
                             evicted->push_back(fp);
                         }
                     }
-                    fclose(f);
-                }
+                fclose(f);
             }
+        }
 
-            std::error_code ec_remove;
-            fs::remove(file.path, ec_remove);
-            if (ec_remove) {
-                continue; // file still occupied budget, keep its size
+        std::error_code ec_remove;
+        fs::remove(file.path, ec_remove);
+        if (ec_remove) {
+            return 0; // file still occupied budget, keep its size
+        }
+        return file.size;
+    };
+
+    eval_oldest();
+
+    if (disk_max_size > 0 && used > disk_max_size) {
+        for (auto & file : files) {
+            if (used <= disk_max_size) {
+                break;
             }
-            used -= file.size;
+            used -= evict_one(file);
         }
 
         SRV_INF(" - disk prompt cache: pruned shared pool '%s' to %.3f MiB (budget %.3f MiB)\n",
                 root.c_str(), used / (1024.0 * 1024.0), disk_max_size / (1024.0 * 1024.0));
+    }
+
+    // free-space pass: even under budget, a full volume must evict the oldest
+    // .dpc/.dts entries until the requested bytes are available. .ccn files are
+    // only released by the budget pass (owned by the main thread); .dcp/.dci
+    // are never evicted here (store compaction owns them)
+    if (min_free > 0) {
+        std::error_code ec_free;
+        auto available = fs::space(root, ec_free).available;
+        if (!ec_free && available < min_free) {
+            for (auto & file : files) {
+                if (available >= min_free) {
+                    break;
+                }
+                if (file.is_ccn) {
+                    continue;
+                }
+                evict_one(file);
+                available = fs::space(root, ec_free).available;
+                if (ec_free) {
+                    break;
+                }
+            }
+            SRV_INF(" - disk prompt cache: evicted shared pool '%s' for free space (now %.3f MiB free, need %.3f MiB)\n",
+                    root.c_str(), (double) available / (1024.0 * 1024.0), (double) min_free / (1024.0 * 1024.0));
+        }
     }
 }
 
@@ -4368,6 +4404,16 @@ bool server_prompt_cache::disk_store_write(disk_write_job & job, const llama_tok
             const uint64_t need = disk_store_->batch_appended_bytes() + 64ull * 1024 * 1024;
             if (!ecs && free < need) {
                 disk_store_->abort_commit();
+                // evict across the shared pool; drop_evicted needs a cleared
+                // queued batch (the abort above frees it)
+                std::vector<std::array<uint8_t, 32>> evicted;
+                disk_prune_dpc(job.dir, &evicted, need);
+                if (!evicted.empty()) {
+                    std::lock_guard<std::mutex> store_lock(disk_store_mtx_);
+                    if (disk_store_) {
+                        disk_store_->drop_evicted(evicted);
+                    }
+                }
                 return false;
             }
         }
@@ -4483,7 +4529,7 @@ void server_prompt_cache::disk_run_state_job(disk_write_job & job) {
         const auto free0 = fs::space(root, ec_space).available;
         if (!ec_space && free0 < need) {
             std::vector<std::array<uint8_t, 32>> evicted;
-            disk_prune_dpc(dir, &evicted);
+            disk_prune_dpc(dir, &evicted, need);
             if (!evicted.empty()) {
                 std::lock_guard<std::mutex> store_lock(disk_store_mtx_);
                 if (disk_store_) {

@@ -968,27 +968,30 @@ struct server_prompt_cache {
     // state is not sliceable or the store cannot take it
     bool disk_store_write(disk_write_job & job, const llama_tokens & tokens);
 
-private:
-    bool restore_state(server_prompt & prompt, server_prompt_cache_state & state, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
-
-    bool load_from_disk_tier(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
-
     // enforce the shared pool budget by oldest-mtime eviction; iterates every
     // preset dir under the cache root. .ccn files of foreign dirs are never
     // selected nor counted (they belong to the owning worker). only touches the
     // filesystem, the in-memory index is synced by the (non-const) callers
-    void prune_disk_budget(const std::string & dir) const;
+    void prune_disk_budget(const std::string & dir, uint64_t min_free = 0) const;
 
     // prune .dpc files only (writer thread); .ccn are budgeted at exit.
     // when evicted is non-null, fingerprints of evicted .dts files are appended
     // so the caller can drop them from the chunk store.
-    void disk_prune_dpc(const std::string & dir, std::vector<std::array<uint8_t, 32>> * evicted = nullptr) const;
+    // min_free > 0 additionally evicts oldest .dpc/.dts until the volume has at
+    // least that many free bytes, even when the pool is under its budget.
+    void disk_prune_dpc(const std::string & dir, std::vector<std::array<uint8_t, 32>> * evicted = nullptr, uint64_t min_free = 0) const;
 
     // shared pool prune: root is the cache root holding one dir per preset;
     // own_dir is this worker's dir. include_own_ccn lets the exit-time budget
-    // still count this worker's own .ccn spill
+    // still count this worker's own .ccn spill. min_free > 0 adds the
+    // free-space eviction pass (see disk_prune_dpc).
     void prune_pool(const std::string & root, const std::string & own_dir, bool include_own_ccn,
-                    std::vector<std::array<uint8_t, 32>> * evicted = nullptr) const;
+                    std::vector<std::array<uint8_t, 32>> * evicted = nullptr, uint64_t min_free = 0) const;
+
+private:
+    bool restore_state(server_prompt & prompt, server_prompt_cache_state & state, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+
+    bool load_from_disk_tier(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     // background writer thread lifecycle
     void start_disk_thread();
