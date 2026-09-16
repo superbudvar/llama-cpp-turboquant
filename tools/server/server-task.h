@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <array>
 #include <memory>
 #include <vector>
 #include <deque>
@@ -653,6 +654,162 @@ bool server_prompt_checkpoints_rehydrate(server_prompt & prompt);
 // drop all spill records of a prompt's checkpoints (they hold full blobs);
 // used on RAM cache tiers so stale `.ccn` offsets never leak into cache states.
 void server_prompt_checkpoints_wipe(server_prompt & prompt);
+
+// chunked append-only disk store for prompt-cache states.
+//
+// a state blob is sliced into fixed-cell chunks (one per (region, layer, cell
+// range) sheet); each unique chunk is appended once to a generation-tagged
+// log (cache.dcp), and a state record then references the chunk ids that
+// rebuild the blob in canonical byte order. two states sharing a token prefix
+// dedup to the same chunks; a lineage epoch (chained over the token stream)
+// disambiguates different token streams that occupy the same cells, so the
+// dedup oracle never mistakes one conversation's bytes for another's.
+//
+// crash safety: records are committed by a header generation bump after fsync,
+// so a torn tail (partial write, bad crc, or a record tagged with a higher gen
+// than the committed header) is detected and truncated at open. the in-memory
+// index is a scan-sidecar cache (cache.dci) that is always rebuildable from a
+// full cache.dcp scan, so a stale index never loses data. a generation change
+// while a restore is in flight (compact) fences that restore: it re-opens.
+//
+// a config/fingerprint change is a new lineage base and truncates the store,
+// matching the existing .dpc/.ccn wipe-on-fingerprint-mismatch semantics.
+class prompt_cache_chunk_store {
+public:
+    static constexpr uint32_t DCP_MAGIC   = 0x54514331; // "TQC1"
+    static constexpr uint32_t DCI_MAGIC   = 0x31494344; // "DCI1"
+    static constexpr uint32_t FORMAT_VER  = 1;
+
+    // max payload a chunk record may carry (256 MiB); larger is a corrupt file
+    static constexpr uint64_t MAX_REC_LEN = 1ull << 28;
+
+    // blob regions a chunk can belong to; the save path picks the region while
+    // slicing a llama_state_seq blob into fixed-cell chunks
+    enum region : uint8_t {
+        REGION_K        = 0,
+        REGION_V        = 1,
+        REGION_META_ROW = 2,
+        REGION_HEADER   = 3,
+        REGION_TAIL     = 4,
+        REGION_DRAFT    = 5,
+    };
+
+    // identity of a chunk sheet; the dedup oracle matches on all fields
+    struct chunk_key {
+        uint8_t  region        = REGION_K;
+        uint16_t layer         = 0;
+        uint32_t cell_lo       = 0;
+        uint32_t cell_hi       = 0;
+        uint64_t lineage_epoch = 0;
+
+        bool operator==(const chunk_key & o) const {
+            return region == o.region && layer == o.layer && cell_lo == o.cell_lo
+                && cell_hi == o.cell_hi && lineage_epoch == o.lineage_epoch;
+        }
+        bool operator<(const chunk_key & o) const {
+            if (region        != o.region)        return region        < o.region;
+            if (layer         != o.layer)         return layer         < o.layer;
+            if (cell_lo       != o.cell_lo)       return cell_lo       < o.cell_lo;
+            if (cell_hi       != o.cell_hi)       return cell_hi       < o.cell_hi;
+            return lineage_epoch < o.lineage_epoch;
+        }
+    };
+
+    // one persisted state: the fingerprint + which chunk ids rebuild the blob
+    struct state_ref {
+        std::array<uint8_t, 32> fp{};       // sha256 of the text token ids
+        uint64_t n_tokens = 0;
+        std::vector<uint64_t> chunks;       // chunk ids, canonical byte order
+    };
+
+    struct stats {
+        uint64_t n_chunks     = 0;
+        uint64_t n_dead       = 0;   // refcount == 0 (awaiting compact)
+        uint64_t n_states     = 0;
+        uint64_t payload_bytes = 0;  // live chunk payload bytes
+        uint64_t store_bytes  = 0;   // physical cache.dcp + cache.dci on disk
+    };
+
+    prompt_cache_chunk_store();
+    ~prompt_cache_chunk_store();
+
+    // open the store under dir/. resets it when the existing cache.dcp was
+    // written by a different lineage base (config change). returns false when
+    // the store cannot be used at all (e.g. lock taken and file foreign).
+    bool open(const std::string & dir, uint64_t base_lineage);
+    void close();
+
+    bool is_open() const;
+
+    // dedup toggle; TURBO_DISK_CHUNK_STORE=0 opts out and every put_chunk
+    // appends unconditionally (byte-identical, just no overlap compression)
+    bool wants_dedup() const;
+
+    // writer: queue records for one save, then commit makes them durable.
+    // begin_commit+drop back out cleanly (disk-full guard); committed states
+    // and chunks survive a process crash to the last committed generation.
+    bool begin_commit();
+    int64_t put_chunk(const chunk_key & key, const uint8_t * data, size_t len);
+    bool put_state(const state_ref & st);
+    bool commit();
+    void abort_commit();
+
+    // reader
+    bool get_chunk(uint64_t id, std::vector<uint8_t> & out) const;
+    bool get_state(const std::array<uint8_t, 32> & fp, state_ref & out) const;
+    bool has_state(const std::array<uint8_t, 32> & fp) const;
+
+    // lifecycle
+    void drop_state(const std::array<uint8_t, 32> & fp);
+    uint64_t compact();          // returns bytes freed; keeps all offsets valid
+    void write_index();          // lazily flush cache.dci (before close/compact)
+
+    stats get_stats() const;
+
+    uint64_t generation() const;
+    uint32_t refcount(uint64_t id) const;
+
+    // chained sha256 of the token prefix ending at the given cell boundary;
+    // the lineage a chunk at that boundary must carry. two token streams with
+    // a shared prefix produce equal chain values at every shared boundary.
+    static std::vector<uint64_t> cell_lineages(uint64_t base, const int32_t * tokens, size_t n_tokens);
+
+private:
+    struct impl;
+    std::unique_ptr<impl> p_;
+};
+
+// little-endian helpers shared by the chunk store (offset 0 = least significant)
+namespace cc_io {
+    inline void put_u16(uint8_t * v, uint16_t x) {
+        v[0] = (uint8_t) (x & 0xff);
+        v[1] = (uint8_t) (x >> 8);
+    }
+    inline void put_u32(uint8_t * v, uint32_t x) {
+        v[0] = (uint8_t) (x & 0xff);
+        v[1] = (uint8_t) ((x >> 8) & 0xff);
+        v[2] = (uint8_t) ((x >> 16) & 0xff);
+        v[3] = (uint8_t) (x >> 24);
+    }
+    inline void put_u64(uint8_t * v, uint64_t x) {
+        for (int b = 0; b < 8; b++) {
+            v[b] = (uint8_t) (x >> (8 * b));
+        }
+    }
+    inline uint16_t get_u16(const uint8_t * p) {
+        return (uint16_t) p[0] | (uint16_t) (p[1] << 8);
+    }
+    inline uint32_t get_u32(const uint8_t * p) {
+        return (uint32_t) p[0] | ((uint32_t) p[1] << 8) | ((uint32_t) p[2] << 16) | ((uint32_t) p[3] << 24);
+    }
+    inline uint64_t get_u64(const uint8_t * p) {
+        uint64_t r = 0;
+        for (int b = 0; b < 8; b++) {
+            r |= (uint64_t) p[b] << (8 * b);
+        }
+        return r;
+    }
+}
 
 struct server_prompt_cache_state {
     server_prompt prompt;

@@ -174,6 +174,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     target_include_directories(test-prompt-cache-pool PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-prompt-cache-pool PRIVATE server-context)
 
+    llama_build_and_test(test-chunk-store.cpp)
+    target_include_directories(test-chunk-store PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-chunk-store PRIVATE server-context)
+
     if (NOT GGML_BACKEND_DL)
         llama_build(test-quantize-stats.cpp)
     endif()
