@@ -2165,6 +2165,7 @@ struct prompt_cache_chunk_store::impl {
     uint64_t queued_gen_      = 0;   // 0 = no open batch
     uint64_t batch_start_     = 0;   // file offset where the open batch appends
     size_t   batch_chunks_    = 0;   // chunks_.size() at batch start
+    uint64_t batch_appended_  = 0;   // bytes this batch physically appended
     std::vector<std::array<uint8_t, 32>> batch_states_;
     std::vector<std::array<uint8_t, 32>> batch_tombs_;
 
@@ -2736,6 +2737,10 @@ bool prompt_cache_chunk_store::wants_dedup() const {
     return p_ ? p_->want_dedup_ : true;
 }
 
+uint64_t prompt_cache_chunk_store::batch_appended_bytes() const {
+    return p_ ? p_->batch_appended_ : 0;
+}
+
 bool prompt_cache_chunk_store::begin_commit() {
     if (!p_) {
         return false;
@@ -2753,6 +2758,7 @@ bool prompt_cache_chunk_store::begin_commit() {
     }
     I.batch_start_  = batch_start;
     I.batch_chunks_ = I.chunks_.size();
+    I.batch_appended_ = 0;
     I.batch_states_.clear();
     I.batch_tombs_.clear();
     I.queued_gen_ = I.committed_gen_ + 1;
@@ -2780,6 +2786,7 @@ int64_t prompt_cache_chunk_store::put_chunk(const chunk_key & key, const uint8_t
         I.abort_batch_locked();
         return -1;
     }
+    I.batch_appended_ += I.rec_size(len);
     impl::chunk c;
     c.key   = key;
     c.offset = p_off;
@@ -2797,6 +2804,7 @@ void prompt_cache_chunk_store::impl::abort_batch_locked() {
         return;
     }
     queued_gen_ = 0;
+    batch_appended_ = 0;
     chunks_.resize(batch_chunks_);
     // drop any states queued this batch (tombs were never tracked in-memory)
     for (const auto & fp : batch_states_) {
@@ -2827,6 +2835,7 @@ void prompt_cache_chunk_store::impl::reset_log_locked() {
     queued_gen_     = 0;
     batch_start_    = 0;
     batch_chunks_   = 0;
+    batch_appended_ = 0;
     batch_states_.clear();
     batch_tombs_.clear();
     dci_valid_ = false;
@@ -2869,6 +2878,7 @@ bool prompt_cache_chunk_store::put_state(const state_ref & st) {
         I.abort_batch_locked();
         return false;
     }
+    I.batch_appended_ += I.rec_size(payload.size());
     for (uint64_t id : st.chunks) {
         I.chunks_[id].refs++;
     }
@@ -3225,6 +3235,176 @@ std::vector<uint64_t> prompt_cache_chunk_store::cell_lineages(uint64_t base, con
         out.push_back(cc_io::get_u64(h));
     }
     return out;
+}
+
+// slice a llama_state_seq blob into fixed 128-token cell sheets, in canonical
+// (blob-order) slice order. the slices tile [0, blob_size) contiguously, so
+// reassembly by concatenation is byte-exact for any accepted blob. acceptance
+// requires the single-stream write-through layout the store persists; anything
+// else - a draft stream, a non-consecutive or multi-sequence meta section, a
+// transposed V, an out-of-range header, or an ambiguous meta stride - returns
+// false and the caller keeps the legacy .dpc writer.
+bool slice_state_blob(const uint8_t * blob, size_t blob_size, size_t n_tokens,
+                      std::vector<state_blob_slice> & out) {
+    constexpr uint32_t SEQ_MAGIC = 0xaf143cd8;
+    constexpr uint64_t MAX_ROW   = 1ull << 24;
+    constexpr uint32_t CELL      = 128;
+    out.clear();
+
+    if (blob_size < 24) {
+        return false;
+    }
+    if (cc_io::get_u32(blob) != SEQ_MAGIC ||
+        cc_io::get_u32(blob + 8) != 1 ||
+        cc_io::get_u32(blob + 12) != (uint32_t) n_tokens) {
+        return false;
+    }
+
+    // the single stream's tree section ([16, meta_start)) holds its own
+    // n_tokens/n_cur; the KV meta rows begin after it
+    const size_t meta_start = 16 + (size_t) 8 * 1;
+
+    // meta stride: 12 bytes/cell without M-RoPE ext, 20 with ext. the right
+    // stride makes every cell a single-sequence entry (n_seq_id == 1) with
+    // pos == its row index, which is exactly the contiguous write-through
+    // layout the store requires. acceptance is exclusive: two candidates that
+    // validate are a layout the walk cannot prove, none is unsupported
+    size_t meta_stride = 0;
+    size_t d           = 0;
+    const size_t strides[] = { 12, 20 };
+    for (const size_t cand : strides) {
+        size_t off = meta_start;
+        bool   ok  = true;
+        for (size_t i = 0; i < n_tokens && ok; ++i) {
+            if (off + cand > blob_size) {
+                ok = false;
+                break;
+            }
+            // a write-through cell reads id == i, pos == i, single sequence
+            if (cc_io::get_u32(blob + off) != (uint32_t) i ||
+                cc_io::get_u32(blob + off + 4) != (uint32_t) i ||
+                cc_io::get_u32(blob + off + 8) != 1) {
+                ok = false;
+                break;
+            }
+            off += cand;
+        }
+        if (ok) {
+            if (meta_stride != 0) {
+                return false;
+            }
+            meta_stride = cand;
+            d           = off;
+        }
+    }
+    if (meta_stride == 0) {
+        return false;
+    }
+
+    if (d + 8 > blob_size) {
+        return false;
+    }
+    const uint32_t v_trans = cc_io::get_u32(blob + d);
+    const uint32_t n_layer = cc_io::get_u32(blob + d + 4);
+    if (v_trans != 0 || n_layer == 0 || n_layer > 4096) {
+        return false;
+    }
+
+    // K blocks: one 12 B header then n_tokens rows of row_size bytes, per layer.
+    // the header must be a plausible ggml type and the data block must fit
+    size_t k_end = d + 8;
+    std::vector<uint64_t> k_off;
+    std::vector<uint64_t> k_row;
+    k_off.reserve(n_layer);
+    k_row.reserve(n_layer);
+    for (uint32_t l = 0; l < n_layer; ++l) {
+        if (k_end + 12 > blob_size) {
+            return false;
+        }
+        const int32_t type = (int32_t) cc_io::get_u32(blob + k_end);
+        const uint64_t row = cc_io::get_u64(blob + k_end + 4);
+        if (type < 0 || type >= (int32_t) GGML_TYPE_COUNT || row == 0 || row > MAX_ROW ||
+            (uint64_t) n_tokens * row > blob_size - k_end - 12) {
+            return false;
+        }
+        k_off.push_back(k_end);
+        k_row.push_back(row);
+        k_end += 12 + (uint64_t) n_tokens * row;
+    }
+
+    // V blocks: present for non-MLA models, absent for MLA. parse them
+    // best-effort with the same header checks; any failure turns the whole
+    // remainder into one opaque tail chunk, which reassembles equally
+    // byte-exactly on restore
+    std::vector<uint64_t> v_off;
+    std::vector<uint64_t> v_row;
+    size_t v_end = k_end;
+    for (uint32_t l = 0; l < n_layer; ++l) {
+        if (v_end + 12 > blob_size) {
+            v_off.clear();
+            v_row.clear();
+            break;
+        }
+        const int32_t type = (int32_t) cc_io::get_u32(blob + v_end);
+        const uint64_t row = cc_io::get_u64(blob + v_end + 4);
+        if (type < 0 || type >= (int32_t) GGML_TYPE_COUNT || row == 0 || row > MAX_ROW ||
+            (uint64_t) n_tokens * row > blob_size - v_end - 12) {
+            v_off.clear();
+            v_row.clear();
+            break;
+        }
+        v_off.push_back(v_end);
+        v_row.push_back(row);
+        v_end += 12 + (uint64_t) n_tokens * row;
+    }
+    const size_t attn_end = v_off.size() == n_layer ? v_end : k_end;
+
+    const uint32_t n_cells   = (uint32_t) ((n_tokens + CELL - 1) / CELL);
+    const uint32_t n_tok32   = (uint32_t) n_tokens;
+
+    // 1) fixed prefix [0, meta_start): magic, seq id, n_stream, stream tree
+    out.push_back({ prompt_cache_chunk_store::REGION_HEADER, 0, 0, n_tok32, 0, (uint64_t) meta_start });
+
+    // 2) meta rows [meta_start, d): one sheet per 128-token cell
+    for (uint32_t c = 0; c < n_cells; ++c) {
+        const uint32_t lo = c * CELL;
+        const uint32_t hi = std::min(n_tok32, lo + CELL);
+        out.push_back({ prompt_cache_chunk_store::REGION_META_ROW, 0, lo, hi,
+                        (uint64_t) (meta_start + (size_t) lo * meta_stride),
+                        (uint64_t) ((size_t) (hi - lo) * meta_stride) });
+    }
+
+    // 3) v_trans + n_layer table [d, d + 8); keyed apart from the prefix so the
+    //    two header chunks never share a dedup identity
+    out.push_back({ prompt_cache_chunk_store::REGION_HEADER, 0, 0, 0, (uint64_t) d, 8 });
+
+    // 4) + 5) K and V cell sheets: the 12 B block header folds into cell 0 so
+    //    the sheet ranges stay contiguous byte ranges of the blob
+    auto emit_cells = [&](prompt_cache_chunk_store::region region, uint16_t layer, uint64_t block_off, uint64_t row) {
+        const uint64_t cell_bytes = (uint64_t) CELL * row;
+        for (uint32_t c = 0; c < n_cells; ++c) {
+            const uint32_t lo = c * CELL;
+            const uint32_t hi = std::min(n_tok32, lo + CELL);
+            const uint64_t n  = (uint64_t) (hi - lo);
+            out.push_back({ region, layer, lo, hi,
+                            block_off + (c == 0 ? 0 : 12) + (uint64_t) c * cell_bytes,
+                            n * row + (c == 0 ? 12 : 0) });
+        }
+    };
+    for (uint32_t l = 0; l < n_layer; ++l) {
+        emit_cells(prompt_cache_chunk_store::REGION_K, (uint16_t) l, k_off[l], k_row[l]);
+    }
+    for (uint32_t l = 0; l < v_off.size(); ++l) {
+        emit_cells(prompt_cache_chunk_store::REGION_V, (uint16_t) l, v_off[l], v_row[l]);
+    }
+
+    // 6) recurrent-state tail [attn_end, blob_size); absent when the model has
+    //    no recurrent head
+    if (attn_end < blob_size) {
+        out.push_back({ prompt_cache_chunk_store::REGION_TAIL, 0, 0, n_tok32,
+                        (uint64_t) attn_end, (uint64_t) (blob_size - attn_end) });
+    }
+    return true;
 }
 
 // n_*(): not used by the store contract itself but kept for parity with the
@@ -3888,6 +4068,140 @@ bool server_prompt_cache::enqueue_sidecar(const std::string & path, std::vector<
     return true;
 }
 
+// base lineage for the chunk store: the low 8 bytes of sha256 of the prompt
+// cache fingerprint. a config change changes the fingerprint, hence the
+// lineage, which resets the store exactly like the .dpc/.ccn wipe
+static uint64_t fingerprint_lineage(const std::string & fingerprint) {
+    uint8_t h[32];
+    dpc_sha256_raw((const uint8_t *) fingerprint.data(), fingerprint.size(), h);
+    return cc_io::get_u64(h);
+}
+
+// keep the meta fingerprint current so later saves do not treat the directory
+// as a config mismatch; shared by the legacy and chunk-store writers
+static void disk_write_meta_file(const std::string & dir, const std::string & fingerprint) {
+    namespace fs = std::filesystem;
+    const std::string meta_path = (fs::path(dir) / "meta").string();
+    const std::string meta_tmp  = meta_path + ".tmp";
+
+    std::ofstream out(meta_tmp, std::ios::binary);
+    out.write(fingerprint.data(), (std::streamsize) fingerprint.size());
+    out.close();
+
+    std::error_code ec;
+    fs::rename(meta_tmp, meta_path, ec);
+    if (ec) {
+        SRV_WRN(" - disk prompt cache: failed to update meta: %s\n", ec.message().c_str());
+    }
+}
+
+bool server_prompt_cache::disk_store_write(disk_write_job & job, const llama_tokens & tokens) {
+    namespace fs = std::filesystem;
+    auto & state = *job.state;
+    // TODO(I3): restore side for store states is not wired yet; until the read
+    // path lands, store-saved states miss on --cache-disk restore (.dpc fallback
+    // and .ccn spill restores still work)
+    if (state.data.main.empty()) {
+        return false;
+    }
+
+    // open lazily on the writer thread; a config change is a different base
+    // lineage and resets the store like the .dpc/.ccn wipe
+    const uint64_t base = fingerprint_lineage(job.fingerprint);
+    if (!disk_store_) {
+        disk_store_ = std::make_unique<prompt_cache_chunk_store>();
+    }
+    if (!disk_store_->is_open() && !disk_store_->open(job.dir, base)) {
+        SRV_WRN(" - disk prompt cache: chunk store unavailable in '%s', using .dpc writer\n", job.dir.c_str());
+        return false;
+    }
+    if (!disk_store_->wants_dedup()) {
+        return false;
+    }
+
+    std::vector<state_blob_slice> slices;
+    if (!slice_state_blob(state.data.main.data(), state.data.main.size(), tokens.size(), slices)) {
+        return false;
+    }
+
+    const std::vector<uint64_t> lineages =
+        prompt_cache_chunk_store::cell_lineages(base, tokens.data(), tokens.size());
+    const uint64_t last_epoch = lineages.empty() ? base : lineages.back();
+
+    // the epoch of a K/V/meta sheet is the token chain up to and including its
+    // cell; the header/tail chunks span the whole state and carry the last one
+    auto epoch_of = [&](const state_blob_slice & sl) -> uint64_t {
+        switch (sl.region) {
+        case prompt_cache_chunk_store::REGION_K:
+        case prompt_cache_chunk_store::REGION_V:
+        case prompt_cache_chunk_store::REGION_META_ROW:
+            return lineages[sl.cell_lo / 128];
+        default:
+            return last_epoch;
+        }
+    };
+
+    // one batch per save; abort leaves no trace. disk-full is checked on the
+    // appended delta (dedup hits add nothing), then compacted and retried once
+    auto write_batch = [&]() -> bool {
+        if (!disk_store_->begin_commit()) {
+            return false;
+        }
+        std::vector<uint64_t> ids;
+        ids.reserve(slices.size());
+        for (const auto & sl : slices) {
+            prompt_cache_chunk_store::chunk_key key;
+            key.region        = sl.region;
+            key.layer         = sl.layer;
+            key.cell_lo       = sl.cell_lo;
+            key.cell_hi       = sl.cell_hi;
+            key.lineage_epoch = epoch_of(sl);
+            const int64_t id = disk_store_->put_chunk(key, state.data.main.data() + sl.byte_off, sl.byte_len);
+            if (id < 0) {
+                disk_store_->abort_commit();
+                return false;
+            }
+            ids.push_back((uint64_t) id);
+        }
+
+        // never commit when the appended bytes would push the volume full
+        {
+            std::error_code ecs;
+            const uint64_t free = fs::space(fs::path(job.dir).parent_path(), ecs).available;
+            const uint64_t need = disk_store_->batch_appended_bytes() + 64ull * 1024 * 1024;
+            if (!ecs && free < need) {
+                disk_store_->abort_commit();
+                return false;
+            }
+        }
+
+        prompt_cache_chunk_store::state_ref st;
+        dpc_sha256_raw((const uint8_t *) tokens.data(), tokens.size() * sizeof(llama_token), st.fp.data());
+        st.n_tokens = tokens.size();
+        st.chunks   = std::move(ids);
+        if (!disk_store_->put_state(st) || !disk_store_->commit()) {
+            disk_store_->abort_commit();
+            return false;
+        }
+        return true;
+    };
+
+    if (!write_batch()) {
+        disk_store_->compact();
+        if (!write_batch()) {
+            SRV_WRN(" - disk prompt cache: chunk store write failed after compact in '%s', using .dpc writer\n", job.dir.c_str());
+            return false;
+        }
+    }
+
+    disk_write_meta_file(job.dir, job.fingerprint);
+
+    const size_t state_bytes = state.size();
+    SRV_INF(" - disk prompt cache: wrote through state '%zu' tokens to chunk store (%.3f MiB, %zu slices)\n",
+            tokens.size(), (double) state_bytes / (1024.0 * 1024.0), slices.size());
+    return true;
+}
+
 void server_prompt_cache::disk_thread_main() {
     while (true) {
         disk_write_job job;
@@ -3929,6 +4243,15 @@ void server_prompt_cache::disk_run_state_job(disk_write_job & job) {
     }
 
     const llama_tokens tokens = state.prompt.tokens.get_text_tokens();
+
+    // chunk-store write-through: slice the KV blob into fixed cells and commit
+    // one append-only batch. a sliceable state + usable store replaces the .dpc
+    // write; a draft model, an unslicable blob, or a failed batch keeps the
+    // legacy writer below (its own disk-full guard then decides)
+    if (state.data.drft.empty() && disk_store_write(job, tokens)) {
+        return;
+    }
+
     const std::string fname = dpc_sha256_hex((const uint8_t *) tokens.data(), tokens.size() * sizeof(llama_token)) + ".dpc";
     const std::string path  = (fs::path(dir) / fname).string();
     const std::string tmp   = path + ".tmp";
@@ -4003,19 +4326,7 @@ void server_prompt_cache::disk_run_state_job(disk_write_job & job) {
 
     // keep the meta file current so a later shutdown save does not treat this
     // directory as a config mismatch and clear the freshly written entries
-    {
-        const std::string meta_path = (fs::path(dir) / "meta").string();
-        const std::string meta_tmp  = meta_path + ".tmp";
-
-        std::ofstream out(meta_tmp, std::ios::binary);
-        out.write(fingerprint.data(), (std::streamsize) fingerprint.size());
-        out.close();
-
-        fs::rename(meta_tmp, meta_path, ec);
-        if (ec) {
-            SRV_WRN(" - disk prompt cache: failed to update meta: %s\n", ec.message().c_str());
-        }
-    }
+    disk_write_meta_file(dir, fingerprint);
 
     const size_t state_bytes = state.size();
     SRV_INF(" - disk prompt cache: wrote through state '%s' (%.3f MiB)\n", fname.c_str(), state_bytes / (1024.0 * 1024.0));

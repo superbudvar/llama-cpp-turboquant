@@ -745,6 +745,11 @@ public:
     // appends unconditionally (byte-identical, just no overlap compression)
     bool wants_dedup() const;
 
+    // physical bytes the current batch has appended so far (dedup hits append
+    // nothing); the save path uses it to size the disk-full headroom before
+    // the commit. 0 outside an open batch.
+    uint64_t batch_appended_bytes() const;
+
     // writer: queue records for one save, then commit makes them durable.
     // begin_commit+drop back out cleanly (disk-full guard); committed states
     // and chunks survive a process crash to the last committed generation.
@@ -778,6 +783,27 @@ private:
     struct impl;
     std::unique_ptr<impl> p_;
 };
+
+// a byte range of a llama_state_seq blob plus the token span it covers, in
+// canonical (blob-order) slice order. slice_state_blob tiles [0, blob_size)
+// contiguously, so any clean tiling reassembles the blob byte-exactly.
+struct state_blob_slice {
+    prompt_cache_chunk_store::region region   = prompt_cache_chunk_store::REGION_K;
+    uint16_t                         layer    = 0;
+    uint32_t                         cell_lo  = 0;
+    uint32_t                         cell_hi  = 0;
+    uint64_t                         byte_off = 0;
+    uint64_t                         byte_len = 0;
+};
+
+// slice a llama_state_seq blob (state_seq_get_data layout) into fixed 128-token
+// cell sheets for the chunk store. returns false when the blob does not match
+// the store contract (multi-stream, non-consecutive meta rows, v_trans, out of
+// range headers, or an ambiguous meta stride); the caller then keeps the legacy
+// .dpc writer. the V region is parsed best-effort: an invalid header turns the
+// remainder into a single opaque tail chunk, which is equally byte-exact.
+bool slice_state_blob(const uint8_t * blob, size_t blob_size, size_t n_tokens,
+                      std::vector<state_blob_slice> & out);
 
 // little-endian helpers shared by the chunk store (offset 0 = least significant)
 namespace cc_io {
@@ -869,6 +895,11 @@ struct server_prompt_cache {
     std::string disk_dir_;
     std::string disk_fingerprint_;
 
+    // chunk store writer (cache.dcp): opened lazily on the disk writer thread
+    // and owned by the pool for its whole run. when it is open and the state
+    // blob is sliceable, write-through states bypass the .dpc writer entirely.
+    std::unique_ptr<prompt_cache_chunk_store> disk_store_;
+
     size_t size() const;
 
     size_t n_tokens() const;
@@ -922,6 +953,11 @@ struct server_prompt_cache {
 
     // drain the writer queue and stop the background thread; no-op when idle
     void drain_disk_writes();
+
+    // chunk-store write-through for one state job; returns true only when the
+    // batch committed durably. fails (and leaves the job untouched) when the
+    // state is not sliceable or the store cannot take it
+    bool disk_store_write(disk_write_job & job, const llama_tokens & tokens);
 
 private:
     bool restore_state(server_prompt & prompt, server_prompt_cache_state & state, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);

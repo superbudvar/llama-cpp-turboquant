@@ -3,9 +3,11 @@
 //  Runs the real prompt_cache_chunk_store codec round-trip paths against a
 //  temp directory: dedup, refcounts, corruption handling on reopen (crc flip
 //  and torn tail), compaction, the store_bytes budget metric, the always-append
-//  mode (TURBO_DISK_CHUNK_STORE=0), and the flock read-only fence.
+//  mode (TURBO_DISK_CHUNK_STORE=0), and the flock read-only fence. s9/s10
+//  exercise the llama_state_seq blob walker: canonical slice tile + byte-exact
+//  reassembly, and the exclusive path (multi-stream, v_trans, stride ambiguity).
 //
-//  Scenario filter: pass "s1".."s8" as argv[1] to run that scenario alone.
+//  Scenario filter: pass "s1".."s10" as argv[1] to run that scenario alone.
 
 #include "common.h"
 #include "server-task.h"
@@ -466,6 +468,187 @@ check(back.size() == cell.size() && memcmp(back.data(), cell.data(), cell.size()
 
         writer.close();
         reader.close();
+    }
+
+    //
+    //  scenario 9: blob walker - canonical slice map + exclusive path
+    //
+    if (only.empty() || only == "s9") {
+        fprintf(stderr, "\n== s9: state blob walker ==\n");
+
+        auto push_u32 = [](std::vector<uint8_t> & v, uint32_t x) {
+            for (int i = 0; i < 4; i++) {
+                v.push_back((uint8_t) (x >> (8 * i)));
+            }
+        };
+        auto push_u64 = [](std::vector<uint8_t> & v, uint64_t x) {
+            for (int i = 0; i < 8; i++) {
+                v.push_back((uint8_t) (x >> (8 * i)));
+            }
+        };
+
+        // single-stream tree section spans [16, 16+8); KV meta begins at 24
+        auto build_blob = [&](uint32_t n_stream, uint32_t n_tokens, uint32_t v_trans,
+                              uint32_t n_layer, uint32_t meta_ext) -> std::vector<uint8_t> {
+            std::vector<uint8_t> v;
+            push_u32(v, 0xaf143cd8);
+            push_u32(v, 0);
+            push_u32(v, n_stream);
+            push_u32(v, n_tokens);
+            for (uint32_t s = 0; s < n_stream; s++) {
+                push_u32(v, n_tokens);
+                push_u32(v, n_tokens);
+            }
+            for (uint32_t i = 0; i < n_tokens; i++) {
+                push_u32(v, i);
+                push_u32(v, i);
+                push_u32(v, 1);
+                if (meta_ext) {
+                    push_u32(v, i + 1);
+                    push_u32(v, 0);
+                }
+            }
+            push_u32(v, v_trans);
+            push_u32(v, n_layer);
+            push_u32(v, 1);
+            push_u64(v, 8);
+            for (uint32_t i = 0; i < n_tokens * 8; i++) {
+                v.push_back((uint8_t) i);
+            }
+            if (!v_trans) {
+                push_u32(v, 1);
+                push_u64(v, 8);
+                for (uint32_t i = 0; i < n_tokens * 8; i++) {
+                    v.push_back((uint8_t) (0x80 + i));
+                }
+            }
+            return v;
+        };
+
+        const std::vector<uint8_t> ok = build_blob(1, 2, 0, 1, 0);
+        check(ok.size() == 112, "s9: canonical blob is 112 bytes");
+
+        std::vector<state_blob_slice> slices;
+        const bool acc = slice_state_blob(ok.data(), ok.size(), 2, slices);
+        check(acc, "s9: canonical blob accepted");
+        if (acc) {
+            check(slices.size() == 5, "s9: five slices (header, meta, table, K, V)");
+
+            const size_t region_order[] = {
+                (size_t) prompt_cache_chunk_store::REGION_HEADER,
+                (size_t) prompt_cache_chunk_store::REGION_META_ROW,
+                (size_t) prompt_cache_chunk_store::REGION_HEADER,
+                (size_t) prompt_cache_chunk_store::REGION_K,
+                (size_t) prompt_cache_chunk_store::REGION_V,
+            };
+            bool order_ok = slices.size() == 5;
+            for (size_t i = 0; i < slices.size() && order_ok; i++) {
+                order_ok = order_ok && (size_t) slices[i].region == region_order[i];
+            }
+            check(order_ok, "s9: slices in canonical blob order");
+
+            check(slices[1].cell_lo == 0 && slices[1].cell_hi == 2, "s9: meta sheet covers both tokens");
+            check(slices[3].layer == 0 && slices[3].cell_lo == 0 && slices[3].cell_hi == 2, "s9: K sheet covers the cell");
+            check(slices[4].region == prompt_cache_chunk_store::REGION_V && slices[4].cell_hi == 2, "s9: V sheet present for non-MLA");
+
+            // contiguous coverage: reassembly concatenates to the source bytes
+            std::vector<uint8_t> rebuilt;
+            for (const auto & sl : slices) {
+                check(sl.byte_off + sl.byte_len <= ok.size(), "s9: slice in-range");
+                rebuilt.insert(rebuilt.end(), ok.begin() + (ptrdiff_t) sl.byte_off,
+                               ok.begin() + (ptrdiff_t) (sl.byte_off + sl.byte_len));
+            }
+            check(rebuilt == ok, "s9: reassembly is byte-exact");
+
+            // the blob ends at the V block: last slice must be REGION_V, no tail
+            check(slices.back().region == prompt_cache_chunk_store::REGION_V, "s9: no tail region when blob is exact");
+        }
+
+        // exclusive path: multi-stream
+        const std::vector<uint8_t> ms = build_blob(2, 2, 0, 1, 0);
+        check(!slice_state_blob(ms.data(), ms.size(), 2, slices), "s9: multi-stream rejected");
+
+        // exclusive path: v_trans
+        const std::vector<uint8_t> vt = build_blob(1, 2, 1, 0, 0);
+        check(!slice_state_blob(vt.data(), vt.size(), 2, slices), "s9: v_trans rejected");
+
+        // exclusive path: wrong token count
+        check(!slice_state_blob(ok.data(), ok.size(), 3, slices), "s9: token mismatch rejected");
+    }
+
+    //
+    //  scenario 10: blob walker - 20-byte meta cells + recurrent tail
+    //
+    if (only.empty() || only == "s10") {
+        fprintf(stderr, "\n== s10: extended meta walk ==\n");
+
+        auto push_u32 = [](std::vector<uint8_t> & v, uint32_t x) {
+            for (int i = 0; i < 4; i++) {
+                v.push_back((uint8_t) (x >> (8 * i)));
+            }
+        };
+        auto push_u64 = [](std::vector<uint8_t> & v, uint64_t x) {
+            for (int i = 0; i < 8; i++) {
+                v.push_back((uint8_t) (x >> (8 * i)));
+            }
+        };
+
+        // one stream, 2 tokens, extended meta; one layer; an opaque tail that
+        // the best-effort V parse turns into REGION_TAIL (MLA-shaped save)
+        std::vector<uint8_t> v;
+        push_u32(v, 0xaf143cd8);
+        push_u32(v, 0);
+        push_u32(v, 1);
+        push_u32(v, 2);
+        push_u32(v, 2); // stream n_tokens
+        push_u32(v, 2); // stream n_cur
+        for (uint32_t i = 0; i < 2; i++) {
+            push_u32(v, i);
+            push_u32(v, i);
+            push_u32(v, 1);
+            push_u32(v, i + 1);
+            push_u32(v, 0);
+        }
+        push_u32(v, 0); // v_trans
+        push_u32(v, 2); // n_layer
+        push_u32(v, 1);
+        push_u64(v, 16);
+        for (uint32_t i = 0; i < 2 * 16; i++) {
+            v.push_back((uint8_t) (0x30 + i));
+        }
+        push_u32(v, 1);
+        push_u64(v, 16);
+        for (uint32_t i = 0; i < 2 * 16; i++) {
+            v.push_back((uint8_t) (0x50 + i));
+        }
+        for (int i = 0; i < 8; i++) {
+            v.push_back((uint8_t) (0x90 + i)); // opaque tail
+        }
+        check(v.size() == 168, "s10: extended blob is 168 bytes");
+
+        std::vector<state_blob_slice> slices;
+        const bool acc = slice_state_blob(v.data(), v.size(), 2, slices);
+        check(acc, "s10: extended blob accepted");
+        if (acc) {
+            check(slices.size() == 6, "s10: six slices (header, meta, table, K, K, tail)");
+
+            check(slices[1].region == prompt_cache_chunk_store::REGION_META_ROW &&
+                  slices[1].byte_len == 40, "s10: one 40-byte meta sheet for two 20-byte cells");
+            check(slices[2].region == prompt_cache_chunk_store::REGION_HEADER &&
+                  slices[2].byte_off == 64 && slices[2].byte_len == 8, "s10: kv table stays a 8-byte header chunk");
+            check(slices[3].layer == 0 && slices[3].byte_off == 72 && slices[3].byte_len == 44, "s10: K layer 0 sheet");
+            check(slices[4].layer == 1 && slices[4].byte_off == 116 && slices[4].byte_len == 44, "s10: K layer 1 sheet");
+            check(slices[5].region == prompt_cache_chunk_store::REGION_TAIL &&
+                  slices[5].byte_off == 160 && slices[5].byte_len == 8, "s10: tail sheet from the best-effort V parse");
+
+            // contiguous coverage is byte-exact here too
+            std::vector<uint8_t> rebuilt;
+            for (const auto & sl : slices) {
+                rebuilt.insert(rebuilt.end(), v.begin() + (ptrdiff_t) sl.byte_off,
+                               v.begin() + (ptrdiff_t) (sl.byte_off + sl.byte_len));
+            }
+            check(rebuilt == v, "s10: reassembly is byte-exact");
+        }
     }
 
     fs::remove_all(tmp, ec_tmp);
