@@ -1464,7 +1464,11 @@ private:
                 try {
                     auto mparams_tgt = common_model_params_to_llama(params_base);
                     auto cparams_tgt = common_context_params_to_llama(params_base);
-                    const char * path_dft = spec_mtp ? params_base.model.path.c_str() : params_dft.model.path.c_str();
+                    // with a separate draft model the predictor lives in that file;
+                    // embedded MTP shares the target model. select the right file and
+                    // its own params so the MTP measurement matches the real load
+                    const char * path_dft = has_draft ? params_dft.model.path.c_str()
+                                                      : params_base.model.path.c_str();
                     auto measure_spec_memory = [&](const llama_model_params & mparams_measure,
                                                    const llama_model_params & mparams_parent,
                                                    std::vector<ggml_backend_dev_t> & measured_devs,
@@ -1490,7 +1494,7 @@ private:
                         return data;
                     };
 
-                    const llama_model_params & mparams_measure = spec_mtp ? mparams_tgt : mparams_dft;
+                    const llama_model_params & mparams_measure = has_draft ? mparams_dft : mparams_tgt;
                     auto dmd = measure_spec_memory(
                         mparams_measure, mparams_tgt, devs, hp_ngl, hp_nct, hp_nex);
 
@@ -1525,7 +1529,7 @@ private:
                                 mparams_tgt_main.tensor_buft_overrides = mtp_overrides;
                                 mparams_tgt_main.use_extra_bufts = false;
                             }
-                            const llama_model_params & mparams_measure_main = spec_mtp ? mparams_tgt_main : mparams_dft;
+                            const llama_model_params & mparams_measure_main = has_draft ? mparams_dft : mparams_tgt_main;
                             std::vector<ggml_backend_dev_t> devs_main;
                             uint32_t hp_ngl_main = 0;
                             uint32_t hp_nct_main = 0;
