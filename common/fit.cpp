@@ -310,7 +310,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         uint32_t & hp_n_expert,
         ggml_log_level log_level,
         std::vector<llama_moe_tensor_info> * moe_tensors = nullptr,
-        llama_context * ctx_parent = nullptr) {
+        llama_context * ctx_parent = nullptr,
+        uint32_t * n_layer_all = nullptr) {
     common_fit_logger_guard logger_guard(log_level);
 
     llama_model_params mparams_copy = *mparams;
@@ -399,6 +400,11 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         devs.push_back(llama_model_get_device(model.get(), i));
     }
 
+    if (n_layer_all) {
+        // the loader always reserves n_layer_all + 1 slots regardless of
+        // load_mtp: a skipped in-file MTP block still occupies its layer slot
+        *n_layer_all = llama_model_n_layer(model.get()) + llama_model_n_layer_nextn(model.get());
+    }
     hp_ngl         = llama_model_n_layer(model.get());
     if (mparams->load_mtp) {
         hp_ngl    += llama_model_n_layer_nextn(model.get());
@@ -497,6 +503,7 @@ static void common_params_fit_impl(
 
     std::vector<ggml_backend_dev_t> devs;
     uint32_t hp_ngl = 0; // hparams.n_gpu_layers
+    uint32_t n_layer_all = 0; // loader layer slots (n_layer + nextn, regardless of load_mtp)
     uint32_t hp_nct = 0; // hparams.n_ctx_train
     uint32_t hp_nex = 0; // hparams.n_expert
     std::vector<llama_moe_tensor_info> moe_tensors;
@@ -510,7 +517,7 @@ static void common_params_fit_impl(
     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
     const dmds_t dmds_full = common_get_device_memory_data_impl(
             path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex,
-            log_level, &moe_tensors);
+            log_level, &moe_tensors, nullptr, &n_layer_all);
     const size_t nd = devs.size(); // number of devices
 
     auto log_stock_fit = [&] {
@@ -796,8 +803,8 @@ static void common_params_fit_impl(
                 tensor_split[id] = ngl_per_device[id].n_layer;
             }
         }
-        assert(uint32_t(mparams.n_gpu_layers) <= hp_ngl + 1);
-        uint32_t il0 = hp_ngl + 1 - mparams.n_gpu_layers; // start index for tensor buft overrides
+        assert(uint32_t(mparams.n_gpu_layers) <= n_layer_all + 1);
+        uint32_t il0 = n_layer_all + 1 - mparams.n_gpu_layers; // start index for tensor buft overrides
 
         mparams.tensor_split = tensor_split;
 
@@ -963,7 +970,7 @@ static void common_params_fit_impl(
         LOG_TRC("%s: filling dense-only layers back-to-front:\n", __func__);
     }
     for (int id = nd - 1; id >= 0; id--) {
-        uint32_t n_unassigned = hp_ngl + 1;
+        uint32_t n_unassigned = n_layer_all + 1;
         for (size_t jd = id + 1; jd < nd; ++jd) {
             assert(n_unassigned >= ngl_per_device[jd].n_layer);
             n_unassigned -= ngl_per_device[jd].n_layer;
@@ -1027,7 +1034,7 @@ static void common_params_fit_impl(
             assigned_layers += dense_layers[id];
         }
 
-        const uint64_t required_layers = (uint64_t)hp_ngl + 1;
+        const uint64_t required_layers = (uint64_t)n_layer_all + 1;
         if (assigned_layers == required_layers) {
             const int main_gpu = mparams->main_gpu;
             if (main_gpu >= 0 && main_gpu < (int)nd && required_layers <= UINT32_MAX) {
@@ -1228,7 +1235,7 @@ static void common_params_fit_impl(
                 LOG_INF("%s: MoE cache soft mode: spare-VRAM insufficient (%s), searching for minimum expert eviction\n",
                         __func__, soft_fit.reason.c_str());
 
-                const int total_layers = (int)(hp_ngl + 1);
+                const int total_layers = (int)(n_layer_all + 1);
                 static std::vector<std::string> pattern_strings;
                 pattern_strings.clear();
                 pattern_strings.reserve(total_layers);

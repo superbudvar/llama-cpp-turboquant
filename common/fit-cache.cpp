@@ -298,6 +298,11 @@ key += "model=";
     key += "min_ctx=";
     key += std::to_string(params.fit_strategy_min_ctx);
     key += "\n";
+    // an explicit --ctx-size is a hard requirement on the fit result; a cached
+    // placement for a different context must not be reused
+    key += "n_ctx=";
+    key += std::to_string(params.n_ctx);
+    key += "\n";
 
     std::string rpc;
     for (const auto & h : params.rpc_hosts) {

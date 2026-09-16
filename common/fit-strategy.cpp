@@ -88,6 +88,24 @@ static bool fit_is_rpc_device(ggml_backend_dev_t dev) {
     return reg_name != nullptr && strstr(reg_name, "RPC") != nullptr;
 }
 
+// parse the layer index from a "blk.<N>." tensor name; -1 if the tensor does
+// not belong to a block layer (embeddings, output, rope, etc.)
+static int fit_tensor_layer(const std::string & name) {
+    const std::string prefix = "blk.";
+    if (name.compare(0, prefix.size(), prefix) != 0) {
+        return -1;
+    }
+    size_t i = prefix.size();
+    if (i >= name.size() || name[i] < '0' || name[i] > '9') {
+        return -1;
+    }
+    int il = 0;
+    for (; i < name.size() && name[i] >= '0' && name[i] <= '9'; i++) {
+        il = il * 10 + (name[i] - '0');
+    }
+    return (i < name.size() && name[i] == '.') ? il : -1;
+}
+
 // the device list index of the best non-RPC device by free memory, or -1
 static int fit_best_local(const common_fit_analysis & analysis, int exclude = -1) {
     int best = -1;
@@ -375,10 +393,11 @@ static common_fit_analysis fit_analyze(
 
     analysis.model_id = path_model;
 
-    hp_ngl = llama_model_n_layer(model.get());
-    if (mparams->load_mtp) {
-        hp_ngl += llama_model_n_layer_nextn(model.get());
-    }
+    // solver math keys on the loader span: the loader always reserves
+    // n_layer_all + 1 slots regardless of load_mtp, and a skipped in-file MTP
+    // block still occupies its layer slot. count nextn unconditionally here.
+    // memory-side accounting (the probe) derives its own gated count.
+    hp_ngl = llama_model_n_layer(model.get()) + llama_model_n_layer_nextn(model.get());
 
     return analysis;
 }
@@ -1009,7 +1028,7 @@ static bool fit_solve_rpc_aware(
             // RPC-maximizing split would overflow nothing and fill RPC first.
             const float scan_hi = spec_is_rpc_split ? fit_rpc_scan_hi(analysis, spill_spec.split_devices) : 0.0f;
             int32_t lo_ngl = 0;            // all layers on CPU -> max context
-            int32_t hi_ngl = (int32_t) hp_ngl; // full offload (failed min_ctx)
+            int32_t hi_ngl = (int32_t) hp_ngl + 1; // full offload incl. output layer (failed min_ctx)
             int32_t best_ngl = -1;
             common_fit_plan best_plan;
             fit_measure_result best_m;
@@ -1044,10 +1063,10 @@ static bool fit_solve_rpc_aware(
                 out_plan.shed_reserves = shed_tags;
                 if (best_frac >= 0.0f) {
                     LOG_WRN("%s: spilling %u layers to CPU to reach min-ctx %d (n_gpu_layers=%d of %u, rpc_frac=%.4f)\n",
-                            __func__, (uint32_t) (hp_ngl - best_ngl), min_ctx, best_ngl, hp_ngl, best_frac);
+                            __func__, (uint32_t) (hp_ngl + 1 - best_ngl), min_ctx, best_ngl, hp_ngl + 1, best_frac);
                 } else {
                     LOG_WRN("%s: spilling %u layers to CPU to reach min-ctx %d (n_gpu_layers=%d of %u)\n",
-                            __func__, (uint32_t) (hp_ngl - best_ngl), min_ctx, best_ngl, hp_ngl);
+                            __func__, (uint32_t) (hp_ngl + 1 - best_ngl), min_ctx, best_ngl, hp_ngl + 1);
                 }
                 return true;
             }
@@ -1222,6 +1241,7 @@ static void fit_validate(
         const common_fit_plan & plan,
         const common_fit_analysis & analysis,
         const std::vector<int64_t> & margins,
+        const uint32_t hp_ngl,
         llama_model_params * mparams,
         llama_context_params * cparams,
         const common_fit_probe & probe,
@@ -1304,15 +1324,22 @@ static void fit_validate(
     if (n_tensors > 0) {
         llama_model_get_tensor_devices(model.get(), tensor_infos.data(), n_tensors);
     }
+    // Layers the plan keeps off the GPU (n_gpu_layers below full offload,
+    // which is hp_ngl + 1) load on the host: the loader assigns the lowest
+    // block indices to the CPU buffer. Expert tensors in those layers may
+    // legitimately land on CPU.
+    const int spill_layers = std::max((int) hp_ngl + 1 - plan.n_gpu_layers, 0);
     for (const auto & info : tensor_infos) {
         const common_fit_role role = fit_classify_role(info.name);
         const bool is_expert = role == COMMON_FIT_ROLE_EXPERT_UP ||
                                role == COMMON_FIT_ROLE_EXPERT_GATE ||
                                role == COMMON_FIT_ROLE_EXPERT_DOWN;
+        const int il = fit_tensor_layer(info.name);
+        const bool spilled_to_cpu = info.dev == nullptr && spill_layers > 0 && il >= 0 && il < spill_layers;
         // a CPU pool may land on the CPU buffer or on a device host buffer
         // (the CPU override path selects from buft_list_cpu, which can be host)
         const bool ok = is_expert
-            ? std::find(allowed_expert.begin(), allowed_expert.end(), info.dev) != allowed_expert.end()
+            ? std::find(allowed_expert.begin(), allowed_expert.end(), info.dev) != allowed_expert.end() || spilled_to_cpu
             : std::find(allowed_non_expert.begin(), allowed_non_expert.end(), info.dev) != allowed_non_expert.end();
         if (!ok) {
             throw std::runtime_error(std::string("tensor ") + info.name + " (role " + fit_role_name(role) +
@@ -1373,6 +1400,13 @@ common_params_fit_status common_fit_strategy_apply_impl(
             if (common_fit_cache_load(params, params.model.path, analysis, cache_plan)) {
                 LOG_INF("%s: fit cache hit for %s, validating cached placement\n",
                         __func__, params.model.path.c_str());
+                // an explicit --ctx-size is a hard requirement: never replay a
+                // placement measured for a different context
+                const bool ctx_mismatch = params.n_ctx > 0 && cache_plan.n_ctx != (int32_t) params.n_ctx;
+                if (ctx_mismatch) {
+                    LOG_WRN("%s: cached placement n_ctx=%d != requested n_ctx=%d, refitting\n",
+                            __func__, cache_plan.n_ctx, params.n_ctx);
+                }
                 bool in_bounds = true;
                 for (int id : cache_plan.role_devices) {
                     if (id >= (int) analysis.devices.size()) {
@@ -1382,7 +1416,7 @@ common_params_fit_status common_fit_strategy_apply_impl(
                         break;
                     }
                 }
-                if (in_bounds &&
+                if (!ctx_mismatch && in_bounds &&
                         fit_measure_plan(probe, cache_plan, mparams, cparams, params.model.path, win_measure) &&
                         fit_same_devices(win_measure.devs, analysis)) {
                     // validate the cached placement against the margins that
@@ -1460,7 +1494,7 @@ common_params_fit_status common_fit_strategy_apply_impl(
             fit_effective_margins(margins, params.fit_params_reserves, final_plan.shed_reserves);
 
         fit_serialize(final_plan, params, mparams, cparams, analysis, win_measure, final_margins);
-        fit_validate(final_plan, analysis, final_margins, mparams, cparams, probe, params.model.path);
+        fit_validate(final_plan, analysis, final_margins, hp_ngl, mparams, cparams, probe, params.model.path);
 
         // publish the shed state so callers can move companions off VRAM
         params.fit_params_shed_tags = final_plan.shed_reserves;
