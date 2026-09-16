@@ -3,11 +3,12 @@
 //  Runs the real prompt_cache_chunk_store codec round-trip paths against a
 //  temp directory: dedup, refcounts, corruption handling on reopen (crc flip
 //  and torn tail), compaction, the store_bytes budget metric, the always-append
-//  mode (TURBO_DISK_CHUNK_STORE=0), and the flock read-only fence. s9/s10
-//  exercise the llama_state_seq blob walker: canonical slice tile + byte-exact
-//  reassembly, and the exclusive path (multi-stream, v_trans, stride ambiguity).
+//  mode (TURBO_DISK_CHUNK_STORE=0), the flock read-only fence, s9/s10 exercise
+//  the llama_state_seq blob walker: canonical slice tile + byte-exact reassembly
+//  and the exclusive path, and s11 validates a full write-through + reopen
+//  round-trip proving persisted chunks reassemble byte-exactly.
 //
-//  Scenario filter: pass "s1".."s10" as argv[1] to run that scenario alone.
+//  Scenario filter: pass "s1".."s11" as argv[1] to run that scenario alone.
 
 #include "common.h"
 #include "server-task.h"
@@ -649,6 +650,113 @@ check(back.size() == cell.size() && memcmp(back.data(), cell.data(), cell.size()
             }
             check(rebuilt == v, "s10: reassembly is byte-exact");
         }
+    }
+
+    //
+    //  scenario 11: full write-through + reopen round-trip. the walker slices a
+    //  blob, put_chunk stores each slice, put_state commits the index, and a
+    //  fresh open (simulating a cold boot) sees the same state; get_state +
+    //  get_chunk reassembly must be byte-exact
+    //
+    if (only.empty() || only == "s11") {
+        fprintf(stderr, "\n== s11: store round-trip reassembly ==\n");
+
+        prompt_cache_chunk_store cs;
+        const fs::path dir = tmp / "s11";
+        check(cs.open(dir.string(), BASE), "s11: open creates the store");
+
+        // canonical single-stream blob matching s9's proven layout: header(16)
+        // + stream headers(8) + kv table(4*2) + v_trans/n_layer(8) + K(8+32) + V(8+32) = 112 bytes
+        const uint32_t n_tokens = 2;
+        auto push_u32_v = [](std::vector<uint8_t> & v, uint32_t x) {
+            for (int i = 0; i < 4; i++) {
+                v.push_back((uint8_t) (x >> (i * 8)));
+            }
+        };
+        auto push_u64_v = [](std::vector<uint8_t> & v, uint64_t x) {
+            for (int i = 0; i < 8; i++) {
+                v.push_back((uint8_t) (x >> (i * 8)));
+            }
+        };
+        std::vector<uint8_t> blob;
+        push_u32_v(blob, 0xaf143cd8); // header magic
+        push_u32_v(blob, 0);          // version
+        push_u32_v(blob, 1);          // n_stream
+        push_u32_v(blob, n_tokens);   // stream header: total n_tokens
+        for (uint32_t s = 0; s < 1; s++) {
+            push_u32_v(blob, n_tokens); // n_tokens
+            push_u32_v(blob, n_tokens); // n_cur
+        }
+        for (uint32_t i = 0; i < n_tokens; i++) {
+            push_u32_v(blob, i);   // kv_pos
+            push_u32_v(blob, i);   // kv_id
+            push_u32_v(blob, 1);   // kv_len
+        }
+        push_u32_v(blob, 0); // v_trans
+        push_u32_v(blob, 1); // n_layer
+        // K block
+        push_u32_v(blob, 1);
+        push_u64_v(blob, 8);
+        for (uint32_t i = 0; i < n_tokens * 8; i++) {
+            blob.push_back((uint8_t) i);
+        }
+        // V block
+        push_u32_v(blob, 1);
+        push_u64_v(blob, 8);
+        for (uint32_t i = 0; i < n_tokens * 8; i++) {
+            blob.push_back((uint8_t) (0x80 + i));
+        }
+        check(blob.size() == 112, "s11: canonical blob is 112 bytes");
+
+        // slice into chunks
+        std::vector<state_blob_slice> slices;
+        check(slice_state_blob(blob.data(), blob.size(), n_tokens, slices),
+              "s11: slice_state_blob succeeds");
+
+        // store each slice in the chunk store
+        const uint64_t lineage = BASE;
+        check(cs.begin_commit(), "s11: begin_commit (slices)");
+        std::vector<int64_t> ids;
+        for (const auto & sl : slices) {
+            const auto k = key_of(sl.region, sl.layer, sl.cell_lo, sl.cell_hi, lineage);
+            int64_t id = cs.put_chunk(k, blob.data() + (ptrdiff_t) sl.byte_off, sl.byte_len);
+            check(id >= 0, "s11: put_chunk succeeded");
+            ids.push_back(id);
+        }
+        check(cs.commit(), "s11: commit (slices)");
+
+        // commit the state
+        std::array<uint8_t, 32> fp;
+        memcpy(fp.data(), "s11-fp", 6);
+        prompt_cache_chunk_store::state_ref st;
+        st.fp = fp;
+        st.n_tokens = n_tokens;
+        for (int64_t id : ids) {
+            st.chunks.push_back((uint64_t) id);
+        }
+        check(cs.begin_commit(), "s11: begin_commit (state)");
+        check(cs.put_state(st), "s11: put_state");
+        check(cs.commit(), "s11: commit (state)");
+        check(cs.has_state(fp), "s11: has_state finds the persisted state");
+
+        // close and reopen (simulates a cold boot)
+        cs.close();
+        prompt_cache_chunk_store cs2;
+        check(cs2.open(dir.string(), BASE), "s11: reopen on a fresh instance");
+        check(cs2.has_state(fp), "s11: fresh instance sees the persisted state");
+
+        // get_state + get_chunk reassembly: must be byte-exact
+        prompt_cache_chunk_store::state_ref got;
+        check(cs2.get_state(fp, got), "s11: get_state on fresh instance");
+        check(got.n_tokens == n_tokens, "s11: n_tokens matches");
+
+        std::vector<uint8_t> rebuilt;
+        for (uint64_t id : got.chunks) {
+            std::vector<uint8_t> cell;
+            check(cs2.get_chunk(id, cell), "s11: get_chunk succeeded");
+            rebuilt.insert(rebuilt.end(), cell.begin(), cell.end());
+        }
+        check(rebuilt == blob, "s11: reassembly after reopen is byte-exact");
     }
 
     fs::remove_all(tmp, ec_tmp);

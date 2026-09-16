@@ -1960,6 +1960,14 @@ void server_prompt_cache::update() {
 
 constexpr uint32_t DPC_MAGIC   = 0x31435044; // "DPC1"
 constexpr uint32_t DPC_VERSION = 3;
+
+// token-only state index: same header shape as DPC but len_main/len_drft/n_ckpt
+// are always zero. the KV lives in cache.dcp as lineage-chained cells; the .dts
+// sidecar exists only so boot-time load_disk_index can build a restore candidate
+// without scanning the store log. a distinct magic means a legacy reader can
+// never mistake it for a full state.
+constexpr uint32_t DTS_MAGIC   = 0x31535444; // "DTS1"
+constexpr uint32_t DTS_VERSION = 1;
 constexpr uint32_t DPC_MAX_TOKENS = 1u << 24;
 constexpr uint32_t DPC_MAX_CHECKPOINTS = 1024;
 
@@ -3805,7 +3813,8 @@ bool server_prompt_cache::save_to_disk(const std::string & dir, const std::strin
     if (stored != fingerprint) {
         SRV_INF(" - disk prompt cache: fingerprint changed, clearing '%s'\n", dir.c_str());
         for (auto & entry : fs::directory_iterator(dir, ec)) {
-            if (entry.path().extension() == ".dpc" || entry.path().extension() == ".ccn") {
+            if (entry.path().extension() == ".dpc" || entry.path().extension() == ".dts" ||
+                entry.path().extension() == ".ccn") {
                 fs::remove(entry.path(), ec);
             }
         }
@@ -3941,14 +3950,14 @@ void server_prompt_cache::prune_pool(const std::string & root, const std::string
         if (!sd.is_directory(ec)) {
             continue;
         }
-        // cross-dir eviction is .dpc-only: a foreign preset dir's .ccn is
+        // cross-dir eviction is .dpc/.dts-only: a foreign preset dir's .ccn is
         // owned by that worker's main thread (live segment offsets), so the
         // shared pool never selects or counts it
         const bool is_own_dir = sd.path() == own_path;
 
         for (const auto & entry : fs::directory_iterator(sd.path(), ec)) {
             const auto ext = entry.path().extension();
-            if (ext == ".dpc") {
+            if (ext == ".dpc" || ext == ".dts") {
                 const auto size = fs::file_size(entry.path(), ec);
                 if (ec) {
                     continue;
@@ -4095,25 +4104,68 @@ static void disk_write_meta_file(const std::string & dir, const std::string & fi
     }
 }
 
+// write the <fp>.dts token-only index for a chunk-store state. called after the
+// store batch commits, so a sidecar present always implies a durable state; a
+// failed sidecar only costs the entry at restore time (state stays on disk).
+static void disk_write_token_index(const std::string & dir, const std::string & fp_hex, const llama_tokens & tokens) {
+    namespace fs = std::filesystem;
+    const std::string dts_path = (fs::path(dir) / (fp_hex + ".dts")).string();
+    const std::string dts_tmp  = dts_path + ".tmp";
+
+    FILE * f = fopen(dts_tmp.c_str(), "wb");
+    if (f == nullptr) {
+        SRV_WRN(" - disk prompt cache: cannot create token index '%s': %s\n", dts_tmp.c_str(), strerror(errno));
+        return;
+    }
+
+    const uint32_t n_tokens = (uint32_t) tokens.size();
+    const uint64_t len_zero = 0;
+    const uint32_t n_ckpt   = 0;
+
+    bool ok = fwrite(&DTS_MAGIC,   4, 1, f) == 1;
+    ok = ok && fwrite(&DTS_VERSION, 4, 1, f) == 1;
+    ok = ok && fwrite(&n_tokens,    4, 1, f) == 1;
+    ok = ok && fwrite(&len_zero,    8, 1, f) == 1;
+    ok = ok && fwrite(&len_zero,    8, 1, f) == 1;
+    ok = ok && fwrite(&n_ckpt,      4, 1, f) == 1;
+    ok = ok && (n_tokens == 0 || fwrite(tokens.data(), sizeof(llama_token), n_tokens, f) == n_tokens);
+    fclose(f);
+
+    if (!ok) {
+        SRV_WRN(" - disk prompt cache: failed to write token index '%s'\n", dts_path.c_str());
+        std::error_code ec;
+        fs::remove(dts_tmp, ec);
+        return;
+    }
+
+    std::error_code ec;
+    fs::rename(dts_tmp, dts_path, ec);
+    if (ec) {
+        SRV_WRN(" - disk prompt cache: failed to finalize token index '%s': %s\n", dts_path.c_str(), ec.message().c_str());
+    }
+}
+
 bool server_prompt_cache::disk_store_write(disk_write_job & job, const llama_tokens & tokens) {
     namespace fs = std::filesystem;
     auto & state = *job.state;
-    // TODO(I3): restore side for store states is not wired yet; until the read
-    // path lands, store-saved states miss on --cache-disk restore (.dpc fallback
-    // and .ccn spill restores still work)
     if (state.data.main.empty()) {
         return false;
     }
 
-    // open lazily on the writer thread; a config change is a different base
-    // lineage and resets the store like the .dpc/.ccn wipe
     const uint64_t base = fingerprint_lineage(job.fingerprint);
-    if (!disk_store_) {
-        disk_store_ = std::make_unique<prompt_cache_chunk_store>();
-    }
-    if (!disk_store_->is_open() && !disk_store_->open(job.dir, base)) {
-        SRV_WRN(" - disk prompt cache: chunk store unavailable in '%s', using .dpc writer\n", job.dir.c_str());
-        return false;
+
+    // open lazily (writer thread first, and later any restore on the reader
+    // thread); a config change is a different base lineage and resets the store
+    // like the .dpc/.ccn wipe
+    {
+        std::lock_guard<std::mutex> store_lock(disk_store_mtx_);
+        if (!disk_store_) {
+            disk_store_ = std::make_unique<prompt_cache_chunk_store>();
+        }
+        if (!disk_store_->is_open() && !disk_store_->open(job.dir, base)) {
+            SRV_WRN(" - disk prompt cache: chunk store unavailable in '%s', using .dpc writer\n", job.dir.c_str());
+            return false;
+        }
     }
     if (!disk_store_->wants_dedup()) {
         return false;
@@ -4195,6 +4247,10 @@ bool server_prompt_cache::disk_store_write(disk_write_job & job, const llama_tok
     }
 
     disk_write_meta_file(job.dir, job.fingerprint);
+
+    // token-only index so a later boot can build a restore candidate for this
+    // state without scanning the store log
+    disk_write_token_index(job.dir, dpc_sha256_hex((const uint8_t *) tokens.data(), tokens.size() * sizeof(llama_token)), tokens);
 
     const size_t state_bytes = state.size();
     SRV_INF(" - disk prompt cache: wrote through state '%zu' tokens to chunk store (%.3f MiB, %zu slices)\n",
@@ -4433,16 +4489,101 @@ bool server_prompt_cache::load_from_disk_tier(server_prompt & prompt, const serv
                 continue;
             }
 
-            uint32_t magic = 0;
+            const auto drop_stale = [&]() {
+                std::lock_guard<std::mutex> lock(disk_index_mtx_);
+                disk_entries.erase(
+                    std::remove_if(disk_entries.begin(), disk_entries.end(),
+                        [&](const disk_entry & e) { return e.path == best_path; }),
+                    disk_entries.end());
+            };
+
+            uint32_t magic   = 0;
             uint32_t version = 0;
-            const bool ok = fread(&magic, 4, 1, f) == 1 && fread(&version, 4, 1, f) == 1 &&
-                            magic == DPC_MAGIC && (version == DPC_VERSION || version == 2 || version == 1) && dpc_read_state(f, version, state);
-            fclose(f);
+            bool ok = fread(&magic, 4, 1, f) == 1 && fread(&version, 4, 1, f) == 1;
 
-            if (!ok) {
-                SRV_ERR("failed to load prompt state from disk ('%s')\n", best_fname.c_str());
+            // store-backed entry: the KV lives in cache.dcp as lineage-chained
+            // cells. reassemble the blob from its chunks; a fresh full restore
+            // starts at position 0 and reuses via LCP, so the token-only sidecar
+            // needs no checkpoints
+            if (ok && magic == DTS_MAGIC) {
+                uint32_t n_tokens = 0;
+                uint64_t len_main = 0;
+                uint64_t len_drft = 0;
+                uint32_t n_ckpt   = 0;
 
-                return false;
+                ok = fread(&n_tokens, 4, 1, f) == 1 && fread(&len_main, 8, 1, f) == 1 &&
+                     fread(&len_drft, 8, 1, f) == 1 && fread(&n_ckpt, 4, 1, f) == 1 &&
+                     version == DTS_VERSION && n_tokens <= DPC_MAX_TOKENS &&
+                     len_main == 0 && len_drft == 0 && n_ckpt == 0;
+
+                llama_tokens dts_tokens(n_tokens);
+                ok = ok && (n_tokens == 0 || fread(dts_tokens.data(), sizeof(llama_token), n_tokens, f) == n_tokens);
+                fclose(f);
+
+                if (!ok) {
+                    SRV_ERR("failed to load prompt state from disk ('%s')\n", best_fname.c_str());
+
+                    return false;
+                }
+
+                // ensure the chunk store is open; the same pool instance serves
+                // the writer thread, and io_mtx_ guards the concurrent reads
+                const uint64_t base = fingerprint_lineage(disk_fingerprint_);
+                {
+                    std::lock_guard<std::mutex> store_lock(disk_store_mtx_);
+                    if (!disk_store_) {
+                        disk_store_ = std::make_unique<prompt_cache_chunk_store>();
+                    }
+                    if (!disk_store_->is_open() &&
+                        !disk_store_->open((fs::path(best_path).parent_path()).string(), base)) {
+                        SRV_WRN(" - disk prompt cache: chunk store unavailable, dropping stale entry '%s'\n", best_path.c_str());
+
+                        drop_stale();
+                        continue;
+                    }
+                }
+
+                std::array<uint8_t, 32> fp;
+                dpc_sha256_raw((const uint8_t *) dts_tokens.data(), dts_tokens.size() * sizeof(llama_token), fp.data());
+
+                prompt_cache_chunk_store::state_ref st;
+                if (!disk_store_->get_state(fp, st) || st.n_tokens != (uint64_t) dts_tokens.size()) {
+                    SRV_WRN(" - disk prompt cache: entry '%s' no longer in the chunk store, dropping stale entry\n", best_path.c_str());
+
+                    drop_stale();
+                    continue;
+                }
+
+                // chunk ids list the slices in the order they were written
+                // (disk_store_write), so concatenation is the canonical blob
+                try {
+                    state.data.main.clear();
+                    for (uint64_t id : st.chunks) {
+                        std::vector<uint8_t> cell;
+                        if (!disk_store_->get_chunk(id, cell)) {
+                            SRV_ERR("failed to restore chunk %llu for '%s'\n", (unsigned long long) id, best_fname.c_str());
+
+                            return false;
+                        }
+                        state.data.main.insert(state.data.main.end(), cell.begin(), cell.end());
+                    }
+                } catch (const std::bad_alloc & e) {
+                    SRV_ERR("failed to allocate memory for prompt state from disk ('%s'): %s\n", best_fname.c_str(), e.what());
+
+                    return false;
+                }
+
+                state.data.drft.clear();
+                state.prompt.tokens = server_tokens(dts_tokens, false);
+            } else {
+                ok = ok && (magic == DPC_MAGIC && (version == DPC_VERSION || version == 2 || version == 1)) && dpc_read_state(f, version, state);
+                fclose(f);
+
+                if (!ok) {
+                    SRV_ERR("failed to load prompt state from disk ('%s')\n", best_fname.c_str());
+
+                    return false;
+                }
             }
         }
 
@@ -4514,7 +4655,8 @@ size_t server_prompt_cache::load_disk_index(const std::string & dir, const std::
 
     std::vector<fs::path> files;
     for (auto & entry : fs::directory_iterator(dir, ec)) {
-        if (entry.path().extension() == ".dpc") {
+        const auto ext = entry.path().extension();
+        if (ext == ".dpc" || ext == ".dts") {
             files.push_back(entry.path());
         }
     }
@@ -4545,7 +4687,8 @@ size_t server_prompt_cache::load_disk_index(const std::string & dir, const std::
             fread(&magic, 4, 1, f) == 1 && fread(&version, 4, 1, f) == 1 &&
             fread(&n_tokens, 4, 1, f) == 1 && fread(&len_main, 8, 1, f) == 1 &&
             fread(&len_drft, 8, 1, f) == 1 && fread(&n_ckpt, 4, 1, f) == 1 &&
-            magic == DPC_MAGIC && (version == DPC_VERSION || version == 2 || version == 1) &&
+            (magic == DPC_MAGIC ? (version == DPC_VERSION || version == 2 || version == 1)
+                                : (magic == DTS_MAGIC && version == DTS_VERSION)) &&
             n_tokens <= DPC_MAX_TOKENS && n_ckpt <= DPC_MAX_CHECKPOINTS;
 
         llama_tokens tokens(n_tokens);

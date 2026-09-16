@@ -898,7 +898,10 @@ struct server_prompt_cache {
     // chunk store writer (cache.dcp): opened lazily on the disk writer thread
     // and owned by the pool for its whole run. when it is open and the state
     // blob is sliceable, write-through states bypass the .dpc writer entirely.
+    // disk_store_mtx_ guards the first open only (a reader-thread restore may
+    // race the writer's first save); per-call ops take the store's own io_mtx_.
     std::unique_ptr<prompt_cache_chunk_store> disk_store_;
+    std::mutex disk_store_mtx_;
 
     size_t size() const;
 
