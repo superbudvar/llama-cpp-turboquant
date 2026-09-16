@@ -490,7 +490,10 @@ check(back.size() == cell.size() && memcmp(back.data(), cell.data(), cell.size()
             }
         };
 
-        // single-stream tree section spans [16, 16+8); KV meta begins at 24
+        // real llama_state_seq layout: magic(4) + seq_id(4) + n_stream(4) +
+        // cell_count(4) + meta rows immediately after (no stream tree). a
+        // single-sequence contiguous write-through cell is [pos, 1, seq_id] at
+        // stride 12, [pos, 1, ext(8), seq_id] at stride 20 (M-RoPE)
         auto build_blob = [&](uint32_t n_stream, uint32_t n_tokens, uint32_t v_trans,
                               uint32_t n_layer, uint32_t meta_ext) -> std::vector<uint8_t> {
             std::vector<uint8_t> v;
@@ -498,18 +501,14 @@ check(back.size() == cell.size() && memcmp(back.data(), cell.data(), cell.size()
             push_u32(v, 0);
             push_u32(v, n_stream);
             push_u32(v, n_tokens);
-            for (uint32_t s = 0; s < n_stream; s++) {
-                push_u32(v, n_tokens);
-                push_u32(v, n_tokens);
-            }
             for (uint32_t i = 0; i < n_tokens; i++) {
-                push_u32(v, i);
                 push_u32(v, i);
                 push_u32(v, 1);
                 if (meta_ext) {
-                    push_u32(v, i + 1);
+                    push_u32(v, 0);
                     push_u32(v, 0);
                 }
+                push_u32(v, 0);
             }
             push_u32(v, v_trans);
             push_u32(v, n_layer);
@@ -529,7 +528,7 @@ check(back.size() == cell.size() && memcmp(back.data(), cell.data(), cell.size()
         };
 
         const std::vector<uint8_t> ok = build_blob(1, 2, 0, 1, 0);
-        check(ok.size() == 112, "s9: canonical blob is 112 bytes");
+        check(ok.size() == 104, "s9: canonical blob is 104 bytes");
 
         std::vector<state_blob_slice> slices;
         const bool acc = slice_state_blob(ok.data(), ok.size(), 2, slices);
@@ -596,20 +595,19 @@ check(back.size() == cell.size() && memcmp(back.data(), cell.data(), cell.size()
             }
         };
 
-        // one stream, 2 tokens, extended meta; one layer; an opaque tail that
-        // the best-effort V parse turns into REGION_TAIL (MLA-shaped save)
+        // one stream, 2 tokens, M-RoPE meta (stride 20); two K layers; an
+        // opaque tail that the best-effort V parse turns into REGION_TAIL
+        // (MLA-shaped save)
         std::vector<uint8_t> v;
         push_u32(v, 0xaf143cd8);
         push_u32(v, 0);
         push_u32(v, 1);
         push_u32(v, 2);
-        push_u32(v, 2); // stream n_tokens
-        push_u32(v, 2); // stream n_cur
         for (uint32_t i = 0; i < 2; i++) {
             push_u32(v, i);
-            push_u32(v, i);
             push_u32(v, 1);
-            push_u32(v, i + 1);
+            push_u32(v, 0);
+            push_u32(v, 0);
             push_u32(v, 0);
         }
         push_u32(v, 0); // v_trans
@@ -627,7 +625,7 @@ check(back.size() == cell.size() && memcmp(back.data(), cell.data(), cell.size()
         for (int i = 0; i < 8; i++) {
             v.push_back((uint8_t) (0x90 + i)); // opaque tail
         }
-        check(v.size() == 168, "s10: extended blob is 168 bytes");
+        check(v.size() == 160, "s10: extended blob is 160 bytes");
 
         std::vector<state_blob_slice> slices;
         const bool acc = slice_state_blob(v.data(), v.size(), 2, slices);
@@ -638,11 +636,11 @@ check(back.size() == cell.size() && memcmp(back.data(), cell.data(), cell.size()
             check(slices[1].region == prompt_cache_chunk_store::REGION_META_ROW &&
                   slices[1].byte_len == 40, "s10: one 40-byte meta sheet for two 20-byte cells");
             check(slices[2].region == prompt_cache_chunk_store::REGION_HEADER &&
-                  slices[2].byte_off == 64 && slices[2].byte_len == 8, "s10: kv table stays a 8-byte header chunk");
-            check(slices[3].layer == 0 && slices[3].byte_off == 72 && slices[3].byte_len == 44, "s10: K layer 0 sheet");
-            check(slices[4].layer == 1 && slices[4].byte_off == 116 && slices[4].byte_len == 44, "s10: K layer 1 sheet");
+                  slices[2].byte_off == 56 && slices[2].byte_len == 8, "s10: kv table stays a 8-byte header chunk");
+            check(slices[3].layer == 0 && slices[3].byte_off == 64 && slices[3].byte_len == 44, "s10: K layer 0 sheet");
+            check(slices[4].layer == 1 && slices[4].byte_off == 108 && slices[4].byte_len == 44, "s10: K layer 1 sheet");
             check(slices[5].region == prompt_cache_chunk_store::REGION_TAIL &&
-                  slices[5].byte_off == 160 && slices[5].byte_len == 8, "s10: tail sheet from the best-effort V parse");
+                  slices[5].byte_off == 152 && slices[5].byte_len == 8, "s10: tail sheet from the best-effort V parse");
 
             // contiguous coverage is byte-exact here too
             std::vector<uint8_t> rebuilt;
@@ -668,7 +666,7 @@ check(back.size() == cell.size() && memcmp(back.data(), cell.data(), cell.size()
         check(cs.open(dir.string(), BASE), "s11: open creates the store");
 
         // canonical single-stream blob matching s9's proven layout: header(16)
-        // + stream headers(8) + kv table(4*2) + v_trans/n_layer(8) + K(8+32) + V(8+32) = 112 bytes
+        // + meta(2*12) + v_trans/n_layer(8) + K(8+32) + V(8+32) = 104 bytes
         const uint32_t n_tokens = 2;
         auto push_u32_v = [](std::vector<uint8_t> & v, uint32_t x) {
             for (int i = 0; i < 4; i++) {
@@ -682,17 +680,13 @@ check(back.size() == cell.size() && memcmp(back.data(), cell.data(), cell.size()
         };
         std::vector<uint8_t> blob;
         push_u32_v(blob, 0xaf143cd8); // header magic
-        push_u32_v(blob, 0);          // version
+        push_u32_v(blob, 0);          // seq_id
         push_u32_v(blob, 1);          // n_stream
-        push_u32_v(blob, n_tokens);   // stream header: total n_tokens
-        for (uint32_t s = 0; s < 1; s++) {
-            push_u32_v(blob, n_tokens); // n_tokens
-            push_u32_v(blob, n_tokens); // n_cur
-        }
+        push_u32_v(blob, n_tokens);   // cell_count
         for (uint32_t i = 0; i < n_tokens; i++) {
             push_u32_v(blob, i);   // kv_pos
-            push_u32_v(blob, i);   // kv_id
-            push_u32_v(blob, 1);   // kv_len
+            push_u32_v(blob, 1);   // n_seq_id
+            push_u32_v(blob, 0);   // seq_id
         }
         push_u32_v(blob, 0); // v_trans
         push_u32_v(blob, 1); // n_layer
@@ -708,7 +702,7 @@ check(back.size() == cell.size() && memcmp(back.data(), cell.data(), cell.size()
         for (uint32_t i = 0; i < n_tokens * 8; i++) {
             blob.push_back((uint8_t) (0x80 + i));
         }
-        check(blob.size() == 112, "s11: canonical blob is 112 bytes");
+        check(blob.size() == 104, "s11: canonical blob is 104 bytes");
 
         // slice into chunks
         std::vector<state_blob_slice> slices;

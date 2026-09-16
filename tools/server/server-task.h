@@ -809,7 +809,7 @@ struct state_blob_slice {
 // .dpc writer. the V region is parsed best-effort: an invalid header turns the
 // remainder into a single opaque tail chunk, which is equally byte-exact.
 bool slice_state_blob(const uint8_t * blob, size_t blob_size, size_t n_tokens,
-                      std::vector<state_blob_slice> & out);
+                      std::vector<state_blob_slice> & out, uint8_t region_shift = 0);
 
 // little-endian helpers shared by the chunk store (offset 0 = least significant)
 namespace cc_io {

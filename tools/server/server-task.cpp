@@ -3324,13 +3324,13 @@ std::vector<uint64_t> prompt_cache_chunk_store::cell_lineages(uint64_t base, con
 // transposed V, an out-of-range header, or an ambiguous meta stride - returns
 // false and the caller keeps the legacy .dpc writer.
 bool slice_state_blob(const uint8_t * blob, size_t blob_size, size_t n_tokens,
-                      std::vector<state_blob_slice> & out) {
+                      std::vector<state_blob_slice> & out, uint8_t region_shift) {
     constexpr uint32_t SEQ_MAGIC = 0xaf143cd8;
     constexpr uint64_t MAX_ROW   = 1ull << 24;
     constexpr uint32_t CELL      = 128;
     out.clear();
 
-    if (blob_size < 24) {
+    if (blob_size < 16) {
         return false;
     }
     if (cc_io::get_u32(blob) != SEQ_MAGIC ||
@@ -3339,9 +3339,9 @@ bool slice_state_blob(const uint8_t * blob, size_t blob_size, size_t n_tokens,
         return false;
     }
 
-    // the single stream's tree section ([16, meta_start)) holds its own
-    // n_tokens/n_cur; the KV meta rows begin after it
-    const size_t meta_start = 16 + (size_t) 8 * 1;
+    // real llama_state_seq layout: magic(4) + seq_id(4) + n_stream(4) +
+    // cell_count(4) = 16 bytes prefix; meta rows begin immediately after
+    const size_t meta_start = 16;
 
     // meta stride: 12 bytes/cell without M-RoPE ext, 20 with ext. the right
     // stride makes every cell a single-sequence entry (n_seq_id == 1) with
@@ -3359,10 +3359,9 @@ bool slice_state_blob(const uint8_t * blob, size_t blob_size, size_t n_tokens,
                 ok = false;
                 break;
             }
-            // a write-through cell reads id == i, pos == i, single sequence
+            // a write-through cell has pos == i and n_seq_id == 1
             if (cc_io::get_u32(blob + off) != (uint32_t) i ||
-                cc_io::get_u32(blob + off + 4) != (uint32_t) i ||
-                cc_io::get_u32(blob + off + 8) != 1) {
+                cc_io::get_u32(blob + off + 4) != 1) {
                 ok = false;
                 break;
             }
@@ -3441,21 +3440,29 @@ bool slice_state_blob(const uint8_t * blob, size_t blob_size, size_t n_tokens,
     const uint32_t n_cells   = (uint32_t) ((n_tokens + CELL - 1) / CELL);
     const uint32_t n_tok32   = (uint32_t) n_tokens;
 
-    // 1) fixed prefix [0, meta_start): magic, seq id, n_stream, stream tree
-    out.push_back({ prompt_cache_chunk_store::REGION_HEADER, 0, 0, n_tok32, 0, (uint64_t) meta_start });
+    // every emitted region is offset by region_shift. the main store uses 0;
+    // the draft (MTP) stream uses REGION_DRAFT so its K/V/meta/header/tail
+    // sheets live in a disjoint chunk-key space from the main stream even
+    // though the walker sees an identical layout
+    auto sh = [region_shift](prompt_cache_chunk_store::region r) {
+        return (prompt_cache_chunk_store::region) ((uint8_t) r + region_shift);
+    };
+
+    // 1) fixed prefix [0, meta_start): magic, seq_id, n_stream, cell_count
+    out.push_back({ sh(prompt_cache_chunk_store::REGION_HEADER), 0, 0, n_tok32, 0, (uint64_t) meta_start });
 
     // 2) meta rows [meta_start, d): one sheet per 128-token cell
     for (uint32_t c = 0; c < n_cells; ++c) {
         const uint32_t lo = c * CELL;
         const uint32_t hi = std::min(n_tok32, lo + CELL);
-        out.push_back({ prompt_cache_chunk_store::REGION_META_ROW, 0, lo, hi,
+        out.push_back({ sh(prompt_cache_chunk_store::REGION_META_ROW), 0, lo, hi,
                         (uint64_t) (meta_start + (size_t) lo * meta_stride),
                         (uint64_t) ((size_t) (hi - lo) * meta_stride) });
     }
 
     // 3) v_trans + n_layer table [d, d + 8); keyed apart from the prefix so the
     //    two header chunks never share a dedup identity
-    out.push_back({ prompt_cache_chunk_store::REGION_HEADER, 0, 0, 0, (uint64_t) d, 8 });
+    out.push_back({ sh(prompt_cache_chunk_store::REGION_HEADER), 0, 0, 0, (uint64_t) d, 8 });
 
     // 4) + 5) K and V cell sheets: the 12 B block header folds into cell 0 so
     //    the sheet ranges stay contiguous byte ranges of the blob
@@ -3465,7 +3472,7 @@ bool slice_state_blob(const uint8_t * blob, size_t blob_size, size_t n_tokens,
             const uint32_t lo = c * CELL;
             const uint32_t hi = std::min(n_tok32, lo + CELL);
             const uint64_t n  = (uint64_t) (hi - lo);
-            out.push_back({ region, layer, lo, hi,
+            out.push_back({ sh(region), layer, lo, hi,
                             block_off + (c == 0 ? 0 : 12) + (uint64_t) c * cell_bytes,
                             n * row + (c == 0 ? 12 : 0) });
         }
@@ -3480,7 +3487,7 @@ bool slice_state_blob(const uint8_t * blob, size_t blob_size, size_t n_tokens,
     // 6) recurrent-state tail [attn_end, blob_size); absent when the model has
     //    no recurrent head
     if (attn_end < blob_size) {
-        out.push_back({ prompt_cache_chunk_store::REGION_TAIL, 0, 0, n_tok32,
+        out.push_back({ sh(prompt_cache_chunk_store::REGION_TAIL), 0, 0, n_tok32,
                         (uint64_t) attn_end, (uint64_t) (blob_size - attn_end) });
     }
     return true;
@@ -4206,7 +4213,8 @@ static void disk_write_meta_file(const std::string & dir, const std::string & fi
 // write the <fp>.dts token-only index for a chunk-store state. called after the
 // store batch commits, so a sidecar present always implies a durable state; a
 // failed sidecar only costs the entry at restore time (state stays on disk).
-static void disk_write_token_index(const std::string & dir, const std::string & fp_hex, const llama_tokens & tokens) {
+static void disk_write_token_index(const std::string & dir, const std::string & fp_hex,
+                                   const llama_tokens & tokens, uint64_t len_main, uint64_t len_drft) {
     namespace fs = std::filesystem;
     const std::string dts_path = (fs::path(dir) / (fp_hex + ".dts")).string();
     const std::string dts_tmp  = dts_path + ".tmp";
@@ -4218,14 +4226,16 @@ static void disk_write_token_index(const std::string & dir, const std::string & 
     }
 
     const uint32_t n_tokens = (uint32_t) tokens.size();
-    const uint64_t len_zero = 0;
     const uint32_t n_ckpt   = 0;
 
+    // len_* fields carry the chunk-id split in store order: the first len_main
+    // ids reassemble the main blob, the following len_drft reassemble the draft
+    // blob. a (0,0) pair reads as a legacy pre-split entry (all main chunks)
     bool ok = fwrite(&DTS_MAGIC,   4, 1, f) == 1;
     ok = ok && fwrite(&DTS_VERSION, 4, 1, f) == 1;
     ok = ok && fwrite(&n_tokens,    4, 1, f) == 1;
-    ok = ok && fwrite(&len_zero,    8, 1, f) == 1;
-    ok = ok && fwrite(&len_zero,    8, 1, f) == 1;
+    ok = ok && fwrite(&len_main,    8, 1, f) == 1;
+    ok = ok && fwrite(&len_drft,    8, 1, f) == 1;
     ok = ok && fwrite(&n_ckpt,      4, 1, f) == 1;
     ok = ok && (n_tokens == 0 || fwrite(tokens.data(), sizeof(llama_token), n_tokens, f) == n_tokens);
     fclose(f);
@@ -4281,14 +4291,37 @@ bool server_prompt_cache::disk_store_write(disk_write_job & job, const llama_tok
         return false;
     }
 
+    // a draft (MTP) stream is sliced with the same walker but its cells are
+    // tagged with the REGION_DRAFT offset so its chunks never share a dedup
+    // identity with the main stream. the draft blob is also a llama_state_seq
+    // blob: its own cell_count sits at byte 12 and its meta rows are
+    // consecutive from position 0, so the strict walker gate applies directly
+    std::vector<state_blob_slice> drft_slices;
+    if (!state.data.drft.empty()) {
+        if (state.data.drft.size() < 16) {
+            return false;
+        }
+        const uint32_t drft_cells = cc_io::get_u32(state.data.drft.data() + 12);
+        if (drft_cells == 0 || drft_cells > tokens.size() ||
+            !slice_state_blob(state.data.drft.data(), state.data.drft.size(), drft_cells, drft_slices,
+                              (uint8_t) prompt_cache_chunk_store::REGION_DRAFT)) {
+            return false;
+        }
+    }
+
     const std::vector<uint64_t> lineages =
         prompt_cache_chunk_store::cell_lineages(base, tokens.data(), tokens.size());
     const uint64_t last_epoch = lineages.empty() ? base : lineages.back();
 
     // the epoch of a K/V/meta sheet is the token chain up to and including its
-    // cell; the header/tail chunks span the whole state and carry the last one
+    // cell; the header/tail chunks span the whole state and carry the last one.
+    // draft regions are the main regions shifted by REGION_DRAFT; normalize
+    // before selecting, and note the draft cell grid is the main position grid
     auto epoch_of = [&](const state_blob_slice & sl) -> uint64_t {
-        switch (sl.region) {
+        const uint8_t base_region = (uint8_t) ((uint8_t) sl.region >= (uint8_t) prompt_cache_chunk_store::REGION_DRAFT
+                                    ? (uint8_t) sl.region - (uint8_t) prompt_cache_chunk_store::REGION_DRAFT
+                                    : (uint8_t) sl.region);
+        switch (base_region) {
         case prompt_cache_chunk_store::REGION_K:
         case prompt_cache_chunk_store::REGION_V:
         case prompt_cache_chunk_store::REGION_META_ROW:
@@ -4305,20 +4338,27 @@ bool server_prompt_cache::disk_store_write(disk_write_job & job, const llama_tok
             return false;
         }
         std::vector<uint64_t> ids;
-        ids.reserve(slices.size());
-        for (const auto & sl : slices) {
-            prompt_cache_chunk_store::chunk_key key;
-            key.region        = sl.region;
-            key.layer         = sl.layer;
-            key.cell_lo       = sl.cell_lo;
-            key.cell_hi       = sl.cell_hi;
-            key.lineage_epoch = epoch_of(sl);
-            const int64_t id = disk_store_->put_chunk(key, state.data.main.data() + sl.byte_off, sl.byte_len);
-            if (id < 0) {
-                disk_store_->abort_commit();
-                return false;
+        ids.reserve(slices.size() + drft_slices.size());
+        auto put_part = [&](const std::vector<state_blob_slice> & part, const uint8_t * blob) -> bool {
+            for (const auto & sl : part) {
+                prompt_cache_chunk_store::chunk_key key;
+                key.region        = sl.region;
+                key.layer         = sl.layer;
+                key.cell_lo       = sl.cell_lo;
+                key.cell_hi       = sl.cell_hi;
+                key.lineage_epoch = epoch_of(sl);
+                const int64_t id = disk_store_->put_chunk(key, blob + sl.byte_off, sl.byte_len);
+                if (id < 0) {
+                    return false;
+                }
+                ids.push_back((uint64_t) id);
             }
-            ids.push_back((uint64_t) id);
+            return true;
+        };
+        if (!put_part(slices, state.data.main.data()) ||
+            !put_part(drft_slices, state.data.drft.data())) {
+            disk_store_->abort_commit();
+            return false;
         }
 
         // never commit when the appended bytes would push the volume full
@@ -4354,12 +4394,15 @@ bool server_prompt_cache::disk_store_write(disk_write_job & job, const llama_tok
     disk_write_meta_file(job.dir, job.fingerprint);
 
     // token-only index so a later boot can build a restore candidate for this
-    // state without scanning the store log
-    disk_write_token_index(job.dir, dpc_sha256_hex((const uint8_t *) tokens.data(), tokens.size() * sizeof(llama_token)), tokens);
+    // state without scanning the store log. the split (main vs draft chunk ids)
+    // rides in the sidecar's len_* fields: a (0,0) pair means a legacy pre-split
+    // entry whose chunks are all main
+    disk_write_token_index(job.dir, dpc_sha256_hex((const uint8_t *) tokens.data(), tokens.size() * sizeof(llama_token)),
+                           tokens, slices.size(), drft_slices.size());
 
     const size_t state_bytes = state.size();
-    SRV_INF(" - disk prompt cache: wrote through state '%zu' tokens to chunk store (%.3f MiB, %zu slices)\n",
-            tokens.size(), (double) state_bytes / (1024.0 * 1024.0), slices.size());
+    SRV_INF(" - disk prompt cache: wrote through state '%zu' tokens to chunk store (%.3f MiB, %zu + %zu slices)\n",
+            tokens.size(), (double) state_bytes / (1024.0 * 1024.0), slices.size(), drft_slices.size());
     return true;
 }
 
@@ -4407,9 +4450,9 @@ void server_prompt_cache::disk_run_state_job(disk_write_job & job) {
 
     // chunk-store write-through: slice the KV blob into fixed cells and commit
     // one append-only batch. a sliceable state + usable store replaces the .dpc
-    // write; a draft model, an unslicable blob, or a failed batch keeps the
-    // legacy writer below (its own disk-full guard then decides)
-    if (state.data.drft.empty() && disk_store_write(job, tokens)) {
+    // write; an unslicable blob or a failed batch keeps the legacy writer below
+    // (its own disk-full guard then decides)
+    if (disk_store_write(job, tokens)) {
         // enforce pool budget after a store write; track .dts evictions so the
         // chunk store can drop the corresponding states
         std::vector<std::array<uint8_t, 32>> evicted;
@@ -4645,8 +4688,7 @@ bool server_prompt_cache::load_from_disk_tier(server_prompt & prompt, const serv
 
                 ok = fread(&n_tokens, 4, 1, f) == 1 && fread(&len_main, 8, 1, f) == 1 &&
                      fread(&len_drft, 8, 1, f) == 1 && fread(&n_ckpt, 4, 1, f) == 1 &&
-                     version == DTS_VERSION && n_tokens <= DPC_MAX_TOKENS &&
-                     len_main == 0 && len_drft == 0 && n_ckpt == 0;
+                     version == DTS_VERSION && n_tokens <= DPC_MAX_TOKENS && n_ckpt == 0;
 
                 llama_tokens dts_tokens(n_tokens);
                 ok = ok && (n_tokens == 0 || fread(dts_tokens.data(), sizeof(llama_token), n_tokens, f) == n_tokens);
@@ -4693,25 +4735,42 @@ bool server_prompt_cache::load_from_disk_tier(server_prompt & prompt, const serv
                 }
 
                 // chunk ids list the slices in the order they were written
-                // (disk_store_write), so concatenation is the canonical blob
-                try {
-                    state.data.main.clear();
-                    for (uint64_t id : st.chunks) {
-                        std::vector<uint8_t> cell;
-                        if (!disk_store_->get_chunk(id, cell)) {
-                            SRV_ERR("failed to restore chunk %llu for '%s'\n", (unsigned long long) id, best_fname.c_str());
-
-                            return false;
-                        }
-                        state.data.main.insert(state.data.main.end(), cell.begin(), cell.end());
+                // (disk_store_write): main first, then draft. the sidecar's
+                // len_main/len_drft carry the split; a (0,0) pair reads as a
+                // legacy pre-split entry (all main)
+                {
+                    const uint64_t total = (uint64_t) st.chunks.size();
+                    const bool legacy = (len_main == 0 && len_drft == 0);
+                    const uint64_t n_main = legacy ? total : len_main;
+                    const uint64_t n_drft = legacy ? 0 : len_drft;
+                    if (n_main + n_drft != total) {
+                        SRV_ERR("failed to load prompt state from disk ('%s'): split mismatch\n", best_fname.c_str());
+                        return false;
                     }
-                } catch (const std::bad_alloc & e) {
-                    SRV_ERR("failed to allocate memory for prompt state from disk ('%s'): %s\n", best_fname.c_str(), e.what());
-
-                    return false;
+                    try {
+                        state.data.main.clear();
+                        state.data.drft.clear();
+                        for (uint64_t i = 0; i < n_main; ++i) {
+                            std::vector<uint8_t> cell;
+                            if (!disk_store_->get_chunk(st.chunks[i], cell)) {
+                                SRV_ERR("failed to restore chunk %llu for '%s'\n", (unsigned long long) st.chunks[i], best_fname.c_str());
+                                return false;
+                            }
+                            state.data.main.insert(state.data.main.end(), cell.begin(), cell.end());
+                        }
+                        for (uint64_t i = n_main; i < total; ++i) {
+                            std::vector<uint8_t> cell;
+                            if (!disk_store_->get_chunk(st.chunks[i], cell)) {
+                                SRV_ERR("failed to restore draft chunk %llu for '%s'\n", (unsigned long long) st.chunks[i], best_fname.c_str());
+                                return false;
+                            }
+                            state.data.drft.insert(state.data.drft.end(), cell.begin(), cell.end());
+                        }
+                    } catch (const std::bad_alloc & e) {
+                        SRV_ERR("failed to allocate memory for prompt state from disk ('%s'): %s\n", best_fname.c_str(), e.what());
+                        return false;
+                    }
                 }
-
-                state.data.drft.clear();
                 state.prompt.tokens = server_tokens(dts_tokens, false);
             } else {
                 ok = ok && (magic == DPC_MAGIC && (version == DPC_VERSION || version == 2 || version == 1)) && dpc_read_state(f, version, state);
