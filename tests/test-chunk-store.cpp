@@ -5,10 +5,12 @@
 //  and torn tail), compaction, the store_bytes budget metric, the always-append
 //  mode (TURBO_DISK_CHUNK_STORE=0), the flock read-only fence, s9/s10 exercise
 //  the llama_state_seq blob walker: canonical slice tile + byte-exact reassembly
-//  and the exclusive path, and s11 validates a full write-through + reopen
-//  round-trip proving persisted chunks reassemble byte-exactly.
+//  and the exclusive path, s11 validates a full write-through + reopen
+//  round-trip proving persisted chunks reassemble byte-exactly, s12 covers the
+//  batch-evictee path (drop_evicted tombstones + refcount drop), and s13 the
+//  dead/live ratio gate of compact_if_stale.
 //
-//  Scenario filter: pass "s1".."s11" as argv[1] to run that scenario alone.
+//  Scenario filter: pass "s1".."s13" as argv[1] to run that scenario alone.
 
 #include "common.h"
 #include "server-task.h"
@@ -757,6 +759,119 @@ check(back.size() == cell.size() && memcmp(back.data(), cell.data(), cell.size()
             rebuilt.insert(rebuilt.end(), cell.begin(), cell.end());
         }
         check(rebuilt == blob, "s11: reassembly after reopen is byte-exact");
+    }
+
+    //
+    //  scenario 12: drop_evicted removes store states for pool-evicted .dts
+    //  sidecars and leaves their chunks dead for compact to reclaim
+    //
+    if (only.empty() || only == "s12") {
+        fprintf(stderr, "\n== s12: drop_evicted ==\n");
+
+        prompt_cache_chunk_store cs;
+        const fs::path dir = tmp / "s12";
+        check(cs.open(dir.string(), BASE), "s12: open creates the store");
+
+        std::vector<uint8_t> a(256, 0x41), b(256, 0x42);
+        const auto ka = key_of(0, 0, 0, 1, 29);
+        const auto kb = key_of(0, 0, 1, 2, 29);
+        check(cs.begin_commit(), "s12: begin_commit (batch 1)");
+        const int64_t ida = cs.put_chunk(ka, a.data(), a.size());
+        const int64_t idb = cs.put_chunk(kb, b.data(), b.size());
+        std::array<uint8_t, 32> fa{}, fb{};
+        memcpy(fa.data(), "evict-A", 7);
+        memcpy(fb.data(), "keep-B", 6);
+        prompt_cache_chunk_store::state_ref sa, sb;
+        sa.fp = fa; sa.n_tokens = 128; sa.chunks = { (uint64_t) ida, (uint64_t) idb };
+        sb.fp = fb; sb.n_tokens = 128; sb.chunks = { (uint64_t) idb };
+        check(cs.put_state(sa), "s12: put_state A");
+        check(cs.put_state(sb), "s12: put_state B");
+        check(cs.commit(), "s12: commit (batch 1)");
+
+        // A references chunk a and b; B references b only
+        check(cs.refcount((uint64_t) ida) == 1, "s12: chunk a refcount 1");
+        check(cs.refcount((uint64_t) idb) == 2, "s12: chunk b refcount 2");
+
+        // evict A (simulates the pool pruning one .dts sidecar)
+        cs.drop_evicted({ fa });
+        check(!cs.has_state(fa), "s12: evicted state gone from memory");
+        check(cs.has_state(fb), "s12: surviving state kept");
+        check(cs.refcount((uint64_t) ida) == 0, "s12: chunk a now dead after eviction");
+        check(cs.refcount((uint64_t) idb) == 1, "s12: chunk b refcount down to 1");
+        prompt_cache_chunk_store::stats st = cs.get_stats();
+        check(st.n_dead == 1, "s12: one dead chunk awaiting compact");
+
+        // the tombstone must survive a reopen, mirroring drop_state durability
+        std::vector<uint8_t> back;
+        check(cs.get_chunk((uint64_t) idb, back), "s12: live chunk still readable");
+        cs.close();
+        prompt_cache_chunk_store cs2;
+        check(cs2.open(dir.string(), BASE), "s12: reopen");
+        check(!cs2.has_state(fa), "s12: eviction tombstone survives reopen");
+        check(cs2.has_state(fb), "s12: surviving state survives reopen");
+        check(cs2.refcount((uint64_t) ida) == 0, "s12: chunk a stays dead after reopen");
+        cs2.close();
+    }
+
+    //
+    //  scenario 13: compact_if_stale compacts only when dead/live ratio > 0.35
+    //
+    if (only.empty() || only == "s13") {
+        fprintf(stderr, "\n== s13: compact_if_stale threshold ==\n");
+
+        const auto seed = [&](prompt_cache_chunk_store & cs, uint64_t lineage, int n,
+                              std::vector<std::array<uint8_t, 32>> & fps) {
+            check(cs.begin_commit(), "s13: begin_commit");
+            std::vector<int64_t> ids;
+            for (int i = 0; i < n; i++) {
+                std::vector<uint8_t> cell(128, (uint8_t) (0x10 + i));
+                const auto k = key_of(0, 0, (uint32_t) i, (uint32_t) (i + 1), lineage);
+                ids.push_back(cs.put_chunk(k, cell.data(), cell.size()));
+            }
+            // each fp references one distinct chunk
+            for (int i = 0; i < n; i++) {
+                std::array<uint8_t, 32> fp{};
+                memcpy(fp.data(), "s13-fp", 6);
+                fp[29] = (uint8_t) (lineage & 0xff);
+                fp[30] = (uint8_t) i;
+                prompt_cache_chunk_store::state_ref st;
+                st.fp = fp; st.n_tokens = 64; st.chunks = { (uint64_t) ids[(size_t) i] };
+                check(cs.put_state(st), "s13: put_state");
+                fps.push_back(fp);
+            }
+            check(cs.commit(), "s13: commit");
+        };
+
+        // 4 chunks, 3 live states -> dead/live = 1/3 = 33% <= 35%: no compact
+        {
+            prompt_cache_chunk_store cs;
+            const fs::path dir = tmp / "s13a";
+            check(cs.open(dir.string(), BASE), "s13: open a");
+            std::vector<std::array<uint8_t, 32>> fps;
+            seed(cs, 37, 4, fps);
+            cs.drop_evicted({ fps[3] });
+            const uint64_t gen_before = cs.generation();
+            cs.compact_if_stale();
+            check(cs.generation() == gen_before, "s13: no compact below threshold (generation stable)");
+            prompt_cache_chunk_store::stats st = cs.get_stats();
+            check(st.n_chunks == 4, "s13: all chunks kept below threshold");
+            cs.close();
+        }
+
+        // 4 chunks, 1 live state -> dead/live = 3/1 = 300% > 35%: compacts
+        {
+            prompt_cache_chunk_store cs;
+            const fs::path dir = tmp / "s13b";
+            check(cs.open(dir.string(), BASE), "s13: open b");
+            std::vector<std::array<uint8_t, 32>> fps;
+            seed(cs, 41, 4, fps);
+            cs.drop_evicted({ fps[1], fps[2], fps[3] });
+            cs.compact_if_stale();
+            prompt_cache_chunk_store::stats st = cs.get_stats();
+            check(st.n_chunks == 1, "s13: compact above threshold keeps one live chunk");
+            check(st.n_dead == 0, "s13: no dead chunks after compact");
+            cs.close();
+        }
     }
 
     fs::remove_all(tmp, ec_tmp);

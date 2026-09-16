@@ -3024,6 +3024,73 @@ void prompt_cache_chunk_store::drop_state(const std::array<uint8_t, 32> & fp) {
     }
 }
 
+void prompt_cache_chunk_store::drop_evicted(const std::vector<std::array<uint8_t, 32>> & fps) {
+    if (!p_ || fps.empty()) {
+        return;
+    }
+    impl & I = *p_;
+    std::lock_guard<std::mutex> lk(I.io_mtx_);
+    if (!I.writable_ || I.queued_gen_ != 0) {
+        return;
+    }
+    size_t n_dropped = 0;
+    for (const auto & fp : fps) {
+        const std::string fp_s((const char *) fp.data(), 32);
+        if (I.states_.find(fp_s) == I.states_.end()) {
+            continue;
+        }
+        // same tombstone as drop_state: durable so a crash-reload keeps the
+        // eviction, and refcounts drop so compact can reclaim the chunks
+        std::vector<uint8_t> payload(32);
+        memcpy(payload.data(), fp.data(), 32);
+        chunk_key key;
+        uint64_t p_off = 0;
+        if (I.append_record(CHUNK_REC_TOMB, key, I.committed_gen_ + 1, payload.data(), payload.size(), p_off)) {
+            I.set_header_gen(I.committed_gen_ + 1);
+            I.sync_file();
+            I.committed_gen_++;
+            I.dci_valid_ = false;
+            for (uint64_t id : I.states_[fp_s]) {
+                if (id < I.chunks_.size() && I.chunks_[id].refs > 0) {
+                    I.chunks_[id].refs--;
+                }
+            }
+            I.states_.erase(fp_s);
+            I.state_tokens_.erase(fp_s);
+            I.recompute_refs();
+            n_dropped++;
+        }
+    }
+    if (n_dropped > 0) {
+        SRV_INF(" - disk prompt cache: chunk store dropped %zu evicted states\n", n_dropped);
+    }
+}
+
+void prompt_cache_chunk_store::compact_if_stale() {
+    if (!p_) {
+        return;
+    }
+    impl & I = *p_;
+    // read stats without the lock (n_dead/n_chunks are only written under io_mtx_
+    // by compact/drop_state, and stale reads are harmless here)
+    uint64_t n_dead = 0, n_total = 0;
+    {
+        std::lock_guard<std::mutex> lk(I.io_mtx_);
+        n_total = I.chunks_.size();
+        for (const auto & c : I.chunks_) {
+            if (c.refs == 0) {
+                n_dead++;
+            }
+        }
+    }
+    const uint64_t n_live = n_total - n_dead;
+    if (n_live == 0 || n_dead * 100 / n_live <= 35) {
+        return;
+    }
+    // compact() acquires io_mtx_ internally; no lock held here
+    compact();
+}
+
 uint64_t prompt_cache_chunk_store::compact() {
     if (!p_) {
         return 0;
@@ -3814,7 +3881,8 @@ bool server_prompt_cache::save_to_disk(const std::string & dir, const std::strin
         SRV_INF(" - disk prompt cache: fingerprint changed, clearing '%s'\n", dir.c_str());
         for (auto & entry : fs::directory_iterator(dir, ec)) {
             if (entry.path().extension() == ".dpc" || entry.path().extension() == ".dts" ||
-                entry.path().extension() == ".ccn") {
+                entry.path().extension() == ".ccn" ||
+                entry.path().extension() == ".dcp" || entry.path().extension() == ".dci") {
                 fs::remove(entry.path(), ec);
             }
         }
@@ -3907,14 +3975,15 @@ void server_prompt_cache::prune_disk_budget(const std::string & dir) const {
     prune_pool(root.string(), dir, true);
 }
 
-void server_prompt_cache::disk_prune_dpc(const std::string & dir) const {
+void server_prompt_cache::disk_prune_dpc(const std::string & dir, std::vector<std::array<uint8_t, 32>> * evicted) const {
     namespace fs = std::filesystem;
 
     const fs::path root = fs::path(dir).parent_path();
-    prune_pool(root.string(), dir, false);
+    prune_pool(root.string(), dir, false, evicted);
 }
 
-void server_prompt_cache::prune_pool(const std::string & root, const std::string & own_dir, bool include_own_ccn) const {
+void server_prompt_cache::prune_pool(const std::string & root, const std::string & own_dir, bool include_own_ccn,
+                                    std::vector<std::array<uint8_t, 32>> * evicted) const {
     namespace fs = std::filesystem;
 
     if (disk_max_size == 0) {
@@ -3950,9 +4019,6 @@ void server_prompt_cache::prune_pool(const std::string & root, const std::string
         if (!sd.is_directory(ec)) {
             continue;
         }
-        // cross-dir eviction is .dpc/.dts-only: a foreign preset dir's .ccn is
-        // owned by that worker's main thread (live segment offsets), so the
-        // shared pool never selects or counts it
         const bool is_own_dir = sd.path() == own_path;
 
         for (const auto & entry : fs::directory_iterator(sd.path(), ec)) {
@@ -3971,6 +4037,12 @@ void server_prompt_cache::prune_pool(const std::string & root, const std::string
                 }
                 used += (uint64_t) size;
                 files.push_back({ entry.path(), fs::last_write_time(entry.path(), ec), (uint64_t) size });
+            } else if (ext == ".dcp" || ext == ".dci") {
+                // chunk store files count toward the budget but are never evicted
+                const auto size = fs::file_size(entry.path(), ec);
+                if (!ec) {
+                    used += (uint64_t) size;
+                }
             }
         }
     }
@@ -3984,6 +4056,29 @@ void server_prompt_cache::prune_pool(const std::string & root, const std::string
             if (used <= disk_max_size) {
                 break;
             }
+
+            // extract the fingerprint from the .dts sidecar before removing it,
+            // so the caller can drop the stale state from the chunk store
+            if (evicted && file.path.extension() == ".dts") {
+                FILE * f = fopen(file.path.string().c_str(), "rb");
+                if (f) {
+                    uint32_t magic = 0, version = 0, n_tokens = 0;
+                    if (fread(&magic, 4, 1, f) == 1 && magic == DTS_MAGIC &&
+                        fread(&version, 4, 1, f) == 1 && version == DTS_VERSION &&
+                        fread(&n_tokens, 4, 1, f) == 1 && n_tokens > 0 && n_tokens <= 131072) {
+                        // skip len_main(8) + len_drft(8) + n_ckpt(4) = 20 bytes
+                        fseek(f, 20, SEEK_CUR);
+                        std::vector<int32_t> tokens(n_tokens);
+                        if (fread(tokens.data(), sizeof(int32_t), n_tokens, f) == n_tokens) {
+                            std::array<uint8_t, 32> fp;
+                            dpc_sha256_raw((const uint8_t *) tokens.data(), n_tokens * sizeof(int32_t), fp.data());
+                            evicted->push_back(fp);
+                        }
+                    }
+                    fclose(f);
+                }
+            }
+
             std::error_code ec_remove;
             fs::remove(file.path, ec_remove);
             if (ec_remove) {
@@ -4305,6 +4400,17 @@ void server_prompt_cache::disk_run_state_job(disk_write_job & job) {
     // write; a draft model, an unslicable blob, or a failed batch keeps the
     // legacy writer below (its own disk-full guard then decides)
     if (state.data.drft.empty() && disk_store_write(job, tokens)) {
+        // enforce pool budget after a store write; track .dts evictions so the
+        // chunk store can drop the corresponding states
+        std::vector<std::array<uint8_t, 32>> evicted;
+        disk_prune_dpc(dir, &evicted);
+        {
+            std::lock_guard<std::mutex> store_lock(disk_store_mtx_);
+            if (disk_store_) {
+                disk_store_->drop_evicted(evicted);
+                disk_store_->compact_if_stale();
+            }
+        }
         return;
     }
 
@@ -4323,7 +4429,14 @@ void server_prompt_cache::disk_run_state_job(disk_write_job & job) {
         std::error_code ec_space;
         const auto free0 = fs::space(root, ec_space).available;
         if (!ec_space && free0 < need) {
-            disk_prune_dpc(dir);
+            std::vector<std::array<uint8_t, 32>> evicted;
+            disk_prune_dpc(dir, &evicted);
+            if (!evicted.empty()) {
+                std::lock_guard<std::mutex> store_lock(disk_store_mtx_);
+                if (disk_store_) {
+                    disk_store_->drop_evicted(evicted);
+                }
+            }
             const auto free1 = fs::space(root, ec_space).available;
             if (ec_space || free1 < need) {
                 SRV_WRN(" - disk prompt cache: skipping write-through '%s' - %.3f MiB free (need %.3f MiB)\n",
@@ -4366,7 +4479,16 @@ void server_prompt_cache::disk_run_state_job(disk_write_job & job) {
     }
 
     // .dpc-only prune; .ccn files are owned by the main thread and budgeted at exit
-    disk_prune_dpc(dir);
+    {
+        std::vector<std::array<uint8_t, 32>> evicted;
+        disk_prune_dpc(dir, &evicted);
+        if (!evicted.empty()) {
+            std::lock_guard<std::mutex> store_lock(disk_store_mtx_);
+            if (disk_store_) {
+                disk_store_->drop_evicted(evicted);
+            }
+        }
+    }
 
     // keep the in-memory index in sync with any entries the prune removed
     {

@@ -766,7 +766,9 @@ public:
 
     // lifecycle
     void drop_state(const std::array<uint8_t, 32> & fp);
+    void drop_evicted(const std::vector<std::array<uint8_t, 32>> & fps);  // batch tombstone for prune_pool evictions
     uint64_t compact();          // returns bytes freed; keeps all offsets valid
+    void compact_if_stale();     // compact when dead/live chunk ratio > 0.35
     void write_index();          // lazily flush cache.dci (before close/compact)
 
     stats get_stats() const;
@@ -973,13 +975,16 @@ private:
     // filesystem, the in-memory index is synced by the (non-const) callers
     void prune_disk_budget(const std::string & dir) const;
 
-    // prune .dpc files only (writer thread); .ccn are budgeted at exit
-    void disk_prune_dpc(const std::string & dir) const;
+    // prune .dpc files only (writer thread); .ccn are budgeted at exit.
+    // when evicted is non-null, fingerprints of evicted .dts files are appended
+    // so the caller can drop them from the chunk store.
+    void disk_prune_dpc(const std::string & dir, std::vector<std::array<uint8_t, 32>> * evicted = nullptr) const;
 
     // shared pool prune: root is the cache root holding one dir per preset;
     // own_dir is this worker's dir. include_own_ccn lets the exit-time budget
     // still count this worker's own .ccn spill
-    void prune_pool(const std::string & root, const std::string & own_dir, bool include_own_ccn) const;
+    void prune_pool(const std::string & root, const std::string & own_dir, bool include_own_ccn,
+                    std::vector<std::array<uint8_t, 32>> * evicted = nullptr) const;
 
     // background writer thread lifecycle
     void start_disk_thread();

@@ -221,6 +221,47 @@ int main(int argc, char ** argv) {
         check(idx_e == 1, "s3: same-lcp tie broken toward the smaller state");
     }
 
+    //
+    //  scenario 4: chunk-store files (.dcp/.dci) count toward the pool budget
+    //  but are never evicted by the prune; .dpc/.dts are the only candidates
+    //
+    if (only.empty() || only == "s4") {
+        fprintf(stderr, "\n== scenario 4: chunk store files counted, never evicted ==\n");
+
+        fs::remove_all(root / "preset-A");
+        fs::remove_all(root / "preset-B");
+        fs::create_directories(dirA);
+        fs::create_directories(dirB);
+
+        // pool: A has 0.4 MiB of .dpc plus the store writing 0.4 MiB .dcp and
+        // 0.2 MiB .dci. budget is 1 MiB so the store files must be counted or
+        // the prune would think the pool is only 0.6 MiB and evict nothing
+        const auto da4 = dirA / "a.dpc";
+        const auto dcp = dirA / "cache.dcp";
+        const auto dci = dirA / "cache.dci";
+        write_file(da4, 400u * 1024, now - std::chrono::hours(1));
+        write_file(dcp, 400u * 1024, now - std::chrono::hours(1));
+        write_file(dci, 200u * 1024, now - std::chrono::hours(1));
+        write_file(dirB / "b.dpc", 200u * 1024, now - std::chrono::minutes(1));
+
+        write_meta(dirA, fingerprint);
+        write_meta(dirB, fingerprint);
+
+        // A saves -> its exit prune must count the 0.6 MiB of store files
+        // toward the 1 MiB budget and evict A's own .dpc to fit
+        A.save_to_disk(dirA.string(), fingerprint);
+
+        std::error_code ec4;
+        uint64_t store_bytes = 0;
+        if (file_exists(dcp)) store_bytes += (uint64_t) fs::file_size(dcp, ec4);
+        if (file_exists(dci)) store_bytes += (uint64_t) fs::file_size(dci, ec4);
+        check(pool_dpc_bytes(root) + store_bytes <= budget_mib * 1024 * 1024,
+              "s4: pool under budget counting .dcp/.dci");
+        check(file_exists(dcp) && file_exists(dci), "s4: store files never evicted by the prune");
+        check(!file_exists(da4), "s4: A's .dpc evicted first (oldest candidate)");
+        check(file_exists(dirB / "b.dpc"), "s4: B's recent .dpc kept");
+    }
+
     fs::remove_all(tmp, ec_tmp);
 
     if (g_failures) {
