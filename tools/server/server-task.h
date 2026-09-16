@@ -680,6 +680,10 @@ public:
     static constexpr uint32_t DCI_MAGIC   = 0x31494344; // "DCI1"
     static constexpr uint32_t FORMAT_VER  = 1;
 
+    // TURBO_DISK_CHUNK_STORE=0 disables the store entirely (legacy .dpc writer,
+    // one-pass rollback prune of store files at boot). read once per process.
+    static bool store_enabled();
+
     // max payload a chunk record may carry (256 MiB); larger is a corrupt file
     static constexpr uint64_t MAX_REC_LEN = 1ull << 28;
 

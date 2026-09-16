@@ -2197,8 +2197,7 @@ struct prompt_cache_chunk_store::impl {
     std::mutex io_mtx_;
 
     impl() {
-        const char * v = getenv("TURBO_DISK_CHUNK_STORE");
-        want_dedup_ = !(v && strcmp(v, "0") == 0);
+        want_dedup_ = store_enabled();
     }
 
     ~impl() = default;
@@ -2735,6 +2734,11 @@ void prompt_cache_chunk_store::close() {
     }
     I.close_lock();
     p_.reset();
+}
+
+bool prompt_cache_chunk_store::store_enabled() {
+    const char * v = getenv("TURBO_DISK_CHUNK_STORE");
+    return !(v && strcmp(v, "0") == 0);
 }
 
 bool prompt_cache_chunk_store::is_open() const {
@@ -4249,6 +4253,12 @@ bool server_prompt_cache::disk_store_write(disk_write_job & job, const llama_tok
 
     const uint64_t base = fingerprint_lineage(job.fingerprint);
 
+    // store disabled: stick to the legacy .dpc writer without ever touching
+    // cache.dcp/.dci (one-pass rollback) or creating them on disk
+    if (!prompt_cache_chunk_store::store_enabled()) {
+        return false;
+    }
+
     // open lazily (writer thread first, and later any restore on the reader
     // thread); a config change is a different base lineage and resets the store
     // like the .dpc/.ccn wipe
@@ -4650,9 +4660,15 @@ bool server_prompt_cache::load_from_disk_tier(server_prompt & prompt, const serv
 
                 // ensure the chunk store is open; the same pool instance serves
                 // the writer thread, and io_mtx_ guards the concurrent reads
+                // (a .dts index entry with the store disabled is stale - the
+                // boot rollback prune normally removes both, drop it here too)
                 const uint64_t base = fingerprint_lineage(disk_fingerprint_);
                 {
                     std::lock_guard<std::mutex> store_lock(disk_store_mtx_);
+                    if (!prompt_cache_chunk_store::store_enabled()) {
+                        drop_stale();
+                        continue;
+                    }
                     if (!disk_store_) {
                         disk_store_ = std::make_unique<prompt_cache_chunk_store>();
                     }
@@ -4754,6 +4770,21 @@ size_t server_prompt_cache::load_disk_index(const std::string & dir, const std::
     std::error_code ec;
     if (!fs::is_directory(dir, ec)) {
         return 0;
+    }
+
+    // store disabled: one-pass rollback on the next boot. remove the store
+    // artifacts (.dcp/.dci/.dts/cache.lock) so the tree reverts to the legacy
+    // .dpc/.ccn layout; never touch those. idempotent - a store-enabled boot
+    // skips this entirely
+    if (!prompt_cache_chunk_store::store_enabled()) {
+        for (auto & entry : fs::directory_iterator(dir, ec)) {
+            const std::string name = entry.path().filename().string();
+            if (entry.path().extension() == ".dcp" || entry.path().extension() == ".dci" ||
+                entry.path().extension() == ".dts" || name == "cache.lock") {
+                fs::remove(entry.path(), ec);
+            }
+        }
+        SRV_WRN(" - disk prompt cache: chunk store disabled, pruned store files in '%s' (rollback)\n", dir.c_str());
     }
 
     std::string stored;

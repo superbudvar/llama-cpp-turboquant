@@ -105,6 +105,34 @@ turbo4-at-64k production states measured a median ratio of 1.065x at ~150 MiB/s
 (see the measurement log). Adding a compressor here would burn more CPU than
 it would save disk space.
 
+### Chunked state store (`cache.dcp`/`cache.dci`)
+
+Large states write through to one append-only chunk store per cache directory
+instead of one `.dpc` file per state. The state blob is sliced into fixed-cell
+sheets; identical sheets dedup to one stored chunk, so two states sharing a
+token prefix share chunks and the disk usage grows only by the new suffix.
+
+- `cache.dcp` - the record log (chunk payloads + state references + tombstones).
+- `cache.dci` - index snapshot, always rebuildable from a full `cache.dcp` scan.
+- `cache.lock` - advisory single-writer lock (flock).
+- `<fp>.dts` - token-only sidecar per state, lets a fresh boot find a state to
+  restore before reading any chunk bytes.
+
+On a config change the fingerprint mismatch wipes the whole directory
+(`.dpc`/`.dts`/`.ccn`/`.dcp`/`.dci`), matching the legacy pointer-cache
+behavior. The disk pool budget counts `cache.dcp + cache.dci` as payload
+bytes: eviction drops state references and dead (refcount-zero) chunks are
+reclaimed by an on-demand compact (dead/live ratio > 0.35). The store is
+enabled by default; `TURBO_DISK_CHUNK_STORE=0` disables it and falls back to
+the plain per-state `.dpc` writer.
+
+**Rollback to the legacy `.dpc` layout** is a one-pass operation. Set
+`TURBO_DISK_CHUNK_STORE=0` and start the server once: the boot-time index load
+prunes `cache.dcp`, `cache.dci`, `cache.lock`, and any `.dts` sidecars from
+every cache directory, leaving only the .dpc/.ccn tree that older builds read
+unchanged. The store never modifies or removes `.dpc`/`.ccn` files, so a mixed
+tree stays readable on either code path.
+
 ## Fit strategies
 
 `--fit-strategy` selects the fit engine that sizes the model placement and the

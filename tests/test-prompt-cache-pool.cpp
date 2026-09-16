@@ -262,6 +262,89 @@ int main(int argc, char ** argv) {
         check(file_exists(dirB / "b.dpc"), "s4: B's recent .dpc kept");
     }
 
+    //
+    //  scenario 5 (oracle-8): back-compat + rollback. with the store disabled
+    //  (TURBO_DISK_CHUNK_STORE=0) the boot index load prunes the store artifacts
+    //  (.dcp/.dci/.dts/cache.lock) but leaves the legacy .dpc/.ccn tree intact
+    //  and byte-identical - an older build reading the tree sees only what it
+    //  knows, exactly as before the chunk store existed
+    //
+    if (only.empty() || only == "s5") {
+        fprintf(stderr, "\n== scenario 5: rollback prune (store disabled) ==\n");
+
+        const fs::path dirC = root / "preset-C";
+        fs::remove_all(dirC, ec_tmp);
+        fs::create_directories(dirC, ec_tmp);
+
+        // legacy tree: one valid .dpc v3 header with zero tokens (32 bytes:
+        // magic u32, version u32, n_tokens u32, len_main u64, len_drft u64,
+        // n_ckpt u32), plus a .ccn with arbitrary checkpoint bytes
+        uint32_t hdr5[8] = { 0x31435044, 3, 0, 0, 0, 0, 0, 0 };
+        const fs::path dpc5 = dirC / "legacy.dpc";
+        const fs::path ccn5 = dirC / "legacy.ccn";
+        const std::string ccn5_body = "checkpoint-bytes";
+        {
+            std::ofstream out(dpc5, std::ios::binary);
+            out.write((const char *) hdr5, (std::streamsize) sizeof(hdr5));
+        }
+        {
+            std::ofstream out(ccn5, std::ios::binary);
+            out.write(ccn5_body.data(), (std::streamsize) ccn5_body.size());
+        }
+
+        // store artifacts a store-enabled run left behind
+        write_file(dirC / "cache.dcp", 100u * 1024, now - std::chrono::hours(1));
+        write_file(dirC / "cache.dci",  25u * 1024, now - std::chrono::hours(1));
+        write_file(dirC / "stale.dts",  10u * 1024, now - std::chrono::hours(1));
+        write_file(dirC / "cache.lock", 1,          now - std::chrono::hours(1));
+
+        write_meta(dirC, fingerprint);
+
+        // snapshot the legacy tree before the rollback boot
+        const fs::path dpc5_bak = tmp / "legacy.dpc.bak";
+        const fs::path ccn5_bak = tmp / "legacy.ccn.bak";
+        fs::copy_file(dpc5, dpc5_bak, fs::copy_options::overwrite_existing, ec_tmp);
+        fs::copy_file(ccn5, ccn5_bak, fs::copy_options::overwrite_existing, ec_tmp);
+
+        // disable the store for this boot; restore the env slot afterwards
+        char * prev = getenv("TURBO_DISK_CHUNK_STORE");
+        const std::string prev_str = prev ? prev : "";
+        setenv("TURBO_DISK_CHUNK_STORE", "0", 1);
+
+        const size_t n_idx = A.load_disk_index(dirC.string(), fingerprint);
+        check(n_idx == 1, "s5: legacy .dpc still indexed after rollback prune");
+        check(!file_exists(dirC / "cache.dcp"),     "s5: cache.dcp pruned (rollback)");
+        check(!file_exists(dirC / "cache.dci"),     "s5: cache.dci pruned (rollback)");
+        check(!file_exists(dirC / "stale.dts"),     "s5: .dts sidecar pruned (rollback)");
+        check(!file_exists(dirC / "cache.lock"),    "s5: cache.lock pruned (rollback)");
+        check(file_exists(dpc5), "s5: legacy .dpc kept");
+        check(file_exists(ccn5), "s5: legacy .ccn kept");
+
+        // byte-for-byte identical legacy files after the prune
+        {
+            std::ifstream a(dpc5_bak, std::ios::binary);
+            std::ifstream b(dpc5, std::ios::binary);
+            check(std::equal(std::istreambuf_iterator<char>(a), std::istreambuf_iterator<char>(),
+                             std::istreambuf_iterator<char>(b)),
+                  "s5: legacy .dpc bytes unchanged");
+        }
+        {
+            std::ifstream a(ccn5_bak, std::ios::binary);
+            std::ifstream b(ccn5, std::ios::binary);
+            check(std::equal(std::istreambuf_iterator<char>(a), std::istreambuf_iterator<char>(),
+                             std::istreambuf_iterator<char>(b)),
+                  "s5: legacy .ccn bytes unchanged");
+        }
+        fs::remove(dpc5_bak, ec_tmp);
+        fs::remove(ccn5_bak, ec_tmp);
+
+        if (prev) {
+            setenv("TURBO_DISK_CHUNK_STORE", prev_str.c_str(), 1);
+        } else {
+            unsetenv("TURBO_DISK_CHUNK_STORE");
+        }
+    }
+
     fs::remove_all(tmp, ec_tmp);
 
     if (g_failures) {
