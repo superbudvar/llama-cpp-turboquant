@@ -720,6 +720,14 @@ struct server_prompt_cache {
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
+    // pure selection rule shared by the RAM and disk tiers (and unit-tested by
+    // test-prompt-cache-pool). candidates are {stored length, common prefix with
+    // the incoming prompt}. the pick must extend the slot's own prefix and reuse
+    // at least a quarter of the cached prompt; among the eligible the longest
+    // common prefix wins (least reprocessing), ties broken toward the smaller
+    // state. returns the index into cands, or SIZE_MAX when nothing qualifies.
+    static size_t select_cache_candidate(const std::vector<std::pair<size_t, size_t>> & cands, size_t lcp_base);
+
     void update();
 
     // persist/restore the cache to a directory of <sha256-of-tokens>.dpc files.
@@ -763,12 +771,19 @@ private:
 
     bool load_from_disk_tier(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
-    // enforce the disk budget by oldest-mtime eviction; only touches the
+    // enforce the shared pool budget by oldest-mtime eviction; iterates every
+    // preset dir under the cache root. .ccn files of foreign dirs are never
+    // selected nor counted (they belong to the owning worker). only touches the
     // filesystem, the in-memory index is synced by the (non-const) callers
     void prune_disk_budget(const std::string & dir) const;
 
     // prune .dpc files only (writer thread); .ccn are budgeted at exit
     void disk_prune_dpc(const std::string & dir) const;
+
+    // shared pool prune: root is the cache root holding one dir per preset;
+    // own_dir is this worker's dir. include_own_ccn lets the exit-time budget
+    // still count this worker's own .ccn spill
+    void prune_pool(const std::string & root, const std::string & own_dir, bool include_own_ccn) const;
 
     // background writer thread lifecycle
     void start_disk_thread();
@@ -784,6 +799,9 @@ private:
 
     // guards disk_entries and disk_index_valid between the loop thread and the writer
     std::mutex disk_index_mtx_;
+
+    // set once a 0-budget worker sees a non-empty shared root (warn, no assert)
+    mutable bool disk_no_limit_warned_ = false;
 };
 
 // used exclusively by router mode

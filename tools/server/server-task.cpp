@@ -1782,6 +1782,37 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
+size_t server_prompt_cache::select_cache_candidate(const std::vector<std::pair<size_t, size_t>> & cands, size_t lcp_base) {
+    size_t idx_best = SIZE_MAX;
+    size_t lcp_best = 0;
+    size_t len_best = 0;
+
+    for (size_t i = 0; i < cands.size(); ++i) {
+        const size_t len = cands[i].first;
+        const size_t lcp = cands[i].second;
+
+        // don't trash large prompts: keep at least a quarter of the cached state
+        if (len == 0 || float(lcp) / len < 0.25f) {
+            continue;
+        }
+
+        // the pick must strictly extend the slot's own prefix
+        if (lcp <= lcp_base) {
+            continue;
+        }
+
+        // longest common prefix wins (least reprocessing), ties toward the
+        // smaller state (preserves more of its own context)
+        if (lcp > lcp_best || (lcp == lcp_best && len < len_best)) {
+            idx_best = i;
+            lcp_best = lcp;
+            len_best = len;
+        }
+    }
+
+    return idx_best;
+}
+
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
@@ -1790,9 +1821,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
-    auto it_best = states.end();
+    // collect the candidate scores under the decision rule shared with the disk tier
+    std::vector<std::pair<size_t, size_t>> cands;
+    std::vector<std::list<server_prompt_cache_state>::iterator> cands_it;
+    cands.reserve(states.size());
+    cands_it.reserve(states.size());
 
-    // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
 
@@ -1801,21 +1835,18 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
         SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
 
-        // don't trash large prompts
-        if (f_keep_cur < 0.25f) {
-            continue;
-        }
-
-        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
-            f_keep_best = f_keep_cur;
-            f_sim_best  = f_sim_cur;
-
-            it_best = it;
-        }
+        cands.push_back({ it->prompt.tokens.size(), (size_t) lcp_cur });
+        cands_it.push_back(it);
     }
 
-    if (it_best != states.end()) {
-        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+    const auto idx_best = select_cache_candidate(cands, (size_t) lcp_best);
+
+    if (idx_best != SIZE_MAX) {
+        const auto it_best = cands_it[idx_best];
+        const float f_keep_cur = float(cands[idx_best].second) / cands[idx_best].first;
+        const float f_sim_cur  = float(cands[idx_best].second) / tokens_new.size();
+
+        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_cur, f_sim_cur);
 
         if (!restore_state(prompt, *it_best, ctx_tgt, ctx_dft, id_slot)) {
             return false;
@@ -2417,10 +2448,29 @@ bool server_prompt_cache::save_to_disk(const std::string & dir, const std::strin
             continue;
         }
 
+        // disk-full write guard: same rule as the write-through path. evict-first
+        // from the shared pool, then skip the entry if the volume is still tight
         const llama_tokens tokens = state.prompt.tokens.get_text_tokens();
         const std::string fname = dpc_sha256_hex((const uint8_t *) tokens.data(), tokens.size() * sizeof(llama_token)) + ".dpc";
         const std::string path  = (fs::path(dir) / fname).string();
         const std::string tmp   = path + ".tmp";
+
+        {
+            const fs::path root = fs::path(dir).parent_path();
+            const uint64_t need = (uint64_t) state.size() + 64ull * 1024 * 1024;
+
+            std::error_code ec_space;
+            const auto free0 = fs::space(root, ec_space).available;
+            if (!ec_space && free0 < need) {
+                prune_disk_budget(dir);
+                const auto free1 = fs::space(root, ec_space).available;
+                if (ec_space || free1 < need) {
+                    SRV_WRN(" - disk prompt cache: skipping save '%s' - %.3f MiB free (need %.3f MiB)\n",
+                            fname.c_str(), (double) free1 / (1024.0 * 1024.0), (double) need / (1024.0 * 1024.0));
+                    continue;
+                }
+            }
+        }
 
         FILE * f = fopen(tmp.c_str(), "wb");
         if (f == nullptr) {
@@ -2471,82 +2521,81 @@ bool server_prompt_cache::save_to_disk(const std::string & dir, const std::strin
 void server_prompt_cache::prune_disk_budget(const std::string & dir) const {
     namespace fs = std::filesystem;
 
-    if (disk_max_size == 0) {
-        return;
-    }
-
-    struct dpc_file {
-        fs::path path;
-        fs::file_time_type mtime;
-        uint64_t size;
-    };
-
-    std::error_code ec;
-    std::vector<dpc_file> files;
-    uint64_t used = 0;
-
-    for (auto & entry : fs::directory_iterator(dir, ec)) {
-        const auto ext = entry.path().extension();
-        if (ext != ".dpc" && ext != ".ccn") {
-            continue;
-        }
-        const auto size = fs::file_size(entry.path(), ec);
-        if (ec) {
-            continue;
-        }
-        used += (uint64_t) size;
-        files.push_back({ entry.path(), fs::last_write_time(entry.path(), ec), (uint64_t) size });
-    }
-
-    if (used > disk_max_size) {
-        std::sort(files.begin(), files.end(), [](const dpc_file & a, const dpc_file & b) {
-            return a.mtime < b.mtime;
-        });
-
-        for (const auto & file : files) {
-            if (used <= disk_max_size) {
-                break;
-            }
-            fs::remove(file.path, ec);
-            used -= file.size;
-        }
-
-        SRV_INF(" - disk prompt cache: pruned to %.3f MiB (budget %.3f MiB)\n",
-                used / (1024.0 * 1024.0), disk_max_size / (1024.0 * 1024.0));
-    }
+    // the pool root is the parent of the per-preset dir (cache_disk_path/<name>)
+    const fs::path root = fs::path(dir).parent_path();
+    prune_pool(root.string(), dir, true);
 }
 
 void server_prompt_cache::disk_prune_dpc(const std::string & dir) const {
     namespace fs = std::filesystem;
 
+    const fs::path root = fs::path(dir).parent_path();
+    prune_pool(root.string(), dir, false);
+}
+
+void server_prompt_cache::prune_pool(const std::string & root, const std::string & own_dir, bool include_own_ccn) const {
+    namespace fs = std::filesystem;
+
     if (disk_max_size == 0) {
+        // 0 is documented as "no limit" (common.h); on a shared root that silently
+        // unenforces the pool for every preset. warn once instead of asserting,
+        // asserts are compiled out in Release
+        if (!disk_no_limit_warned_ && fs::is_directory(root)) {
+            std::error_code ec_w;
+            for (const auto & sd : fs::directory_iterator(root, ec_w)) {
+                if (sd.is_directory(ec_w)) {
+                    disk_no_limit_warned_ = true;
+                    SRV_WRN(" - disk prompt cache: disk_max_size == 0 (no limit) on a shared root '%s' - pool budget is not enforced\n", root.c_str());
+                    break;
+                }
+            }
+        }
         return;
     }
 
-    struct dpc_file {
+    struct pool_file {
         fs::path path;
         fs::file_time_type mtime;
         uint64_t size;
     };
 
     std::error_code ec;
-    std::vector<dpc_file> files;
+    std::vector<pool_file> files;
     uint64_t used = 0;
 
-    for (auto & entry : fs::directory_iterator(dir, ec)) {
-        if (entry.path().extension() != ".dpc") {
+    const fs::path own_path(own_dir);
+
+    for (const auto & sd : fs::directory_iterator(root, ec)) {
+        if (!sd.is_directory(ec)) {
             continue;
         }
-        const auto size = fs::file_size(entry.path(), ec);
-        if (ec) {
-            continue;
+        // cross-dir eviction is .dpc-only: a foreign preset dir's .ccn is
+        // owned by that worker's main thread (live segment offsets), so the
+        // shared pool never selects or counts it
+        const bool is_own_dir = sd.path() == own_path;
+
+        for (const auto & entry : fs::directory_iterator(sd.path(), ec)) {
+            const auto ext = entry.path().extension();
+            if (ext == ".dpc") {
+                const auto size = fs::file_size(entry.path(), ec);
+                if (ec) {
+                    continue;
+                }
+                used += (uint64_t) size;
+                files.push_back({ entry.path(), fs::last_write_time(entry.path(), ec), (uint64_t) size });
+            } else if (ext == ".ccn" && is_own_dir && include_own_ccn) {
+                const auto size = fs::file_size(entry.path(), ec);
+                if (ec) {
+                    continue;
+                }
+                used += (uint64_t) size;
+                files.push_back({ entry.path(), fs::last_write_time(entry.path(), ec), (uint64_t) size });
+            }
         }
-        used += (uint64_t) size;
-        files.push_back({ entry.path(), fs::last_write_time(entry.path(), ec), (uint64_t) size });
     }
 
     if (used > disk_max_size) {
-        std::sort(files.begin(), files.end(), [](const dpc_file & a, const dpc_file & b) {
+        std::sort(files.begin(), files.end(), [](const pool_file & a, const pool_file & b) {
             return a.mtime < b.mtime;
         });
 
@@ -2554,12 +2603,16 @@ void server_prompt_cache::disk_prune_dpc(const std::string & dir) const {
             if (used <= disk_max_size) {
                 break;
             }
-            fs::remove(file.path, ec);
+            std::error_code ec_remove;
+            fs::remove(file.path, ec_remove);
+            if (ec_remove) {
+                continue; // file still occupied budget, keep its size
+            }
             used -= file.size;
         }
 
-        SRV_INF(" - disk prompt cache: pruned .dpc to %.3f MiB (budget %.3f MiB)\n",
-                used / (1024.0 * 1024.0), disk_max_size / (1024.0 * 1024.0));
+        SRV_INF(" - disk prompt cache: pruned shared pool '%s' to %.3f MiB (budget %.3f MiB)\n",
+                root.c_str(), used / (1024.0 * 1024.0), disk_max_size / (1024.0 * 1024.0));
     }
 }
 
@@ -2688,6 +2741,27 @@ void server_prompt_cache::disk_run_state_job(disk_write_job & job) {
     const std::string path  = (fs::path(dir) / fname).string();
     const std::string tmp   = path + ".tmp";
 
+    // disk-full write guard: never attempt a write into a full volume. the pool
+    // root is the parent of the per-preset dir; when the free space is below the
+    // write need plus a safety margin, evict-first from the shared pool and only
+    // then write; if still insufficient, skip the write entirely
+    {
+        const fs::path root = fs::path(dir).parent_path();
+        const uint64_t need = (uint64_t) state.size() + 64ull * 1024 * 1024; // entry + 64 MiB headroom
+
+        std::error_code ec_space;
+        const auto free0 = fs::space(root, ec_space).available;
+        if (!ec_space && free0 < need) {
+            disk_prune_dpc(dir);
+            const auto free1 = fs::space(root, ec_space).available;
+            if (ec_space || free1 < need) {
+                SRV_WRN(" - disk prompt cache: skipping write-through '%s' - %.3f MiB free (need %.3f MiB)\n",
+                        fname.c_str(), (double) free1 / (1024.0 * 1024.0), (double) need / (1024.0 * 1024.0));
+                return;
+            }
+        }
+    }
+
     FILE * f = fopen(tmp.c_str(), "wb");
     if (f == nullptr) {
         SRV_WRN(" - disk prompt cache: cannot open '%s'\n", tmp.c_str());
@@ -2783,109 +2857,126 @@ void server_prompt_cache::disk_run_sidecar_job(disk_write_job & job) {
 }
 
 bool server_prompt_cache::load_from_disk_tier(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
-    // scan the index under lock; file I/O happens outside the lock so the writer
-    // thread can keep pushing entries while a slow restore runs
-    std::string best_path;
-    std::string best_fname;
-    float f_keep_best = 0.0f;
-    float f_sim_best  = 0.0f;
+    namespace fs = std::filesystem;
 
-    {
-        std::lock_guard<std::mutex> lock(disk_index_mtx_);
-        if (!disk_index_valid || disk_entries.empty()) {
-            return true;
+    // scan the index under lock; file I/O happens outside the lock so the writer
+    // thread can keep pushing entries while a slow restore runs. retry when the
+    // best entry's file went stale so a dead LRU head cannot shadow live ones
+    while (true) {
+        std::string best_path;
+        std::string best_fname;
+        float f_keep_best = 0.0f;
+        float f_sim_best  = 0.0f;
+
+        {
+            std::lock_guard<std::mutex> lock(disk_index_mtx_);
+            if (!disk_index_valid || disk_entries.empty()) {
+                return true;
+            }
+
+            // selection mirrors the in-RAM search in load()
+            const int lcp_base = prompt.tokens.get_common_prefix(tokens_new);
+
+            f_keep_best = prompt.tokens.size() > 0 ? float(lcp_base) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
+            f_sim_best  = float(lcp_base) / tokens_new.size();
+
+            std::vector<std::pair<size_t, size_t>> cands;
+            cands.reserve(disk_entries.size());
+
+            for (size_t i = 0; i < disk_entries.size(); ++i) {
+                const auto & entry = disk_entries[i];
+
+                const int lcp_cur = entry.tokens.get_common_prefix(tokens_new);
+
+                const float f_keep_cur = entry.tokens.size() > 0 ? float(lcp_cur) / entry.tokens.size() : -1.0f;
+                const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
+
+                SRV_TRC(" - disk prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n",
+                        entry.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
+
+                cands.push_back({ entry.tokens.size(), (size_t) lcp_cur });
+            }
+
+            const size_t idx_best = select_cache_candidate(cands, (size_t) lcp_base);
+
+            if (idx_best == SIZE_MAX) {
+                return true;
+            }
+
+            const float f_keep_cur = float(cands[idx_best].second) / cands[idx_best].first;
+            const float f_sim_cur  = float(cands[idx_best].second) / tokens_new.size();
+
+            best_path  = disk_entries[idx_best].path;
+            best_fname = disk_entries[idx_best].fname;
+            f_keep_best = f_keep_cur;
+            f_sim_best  = f_sim_cur;
         }
 
-        // selection mirrors the in-RAM search in load()
-        const int lcp_base = prompt.tokens.get_common_prefix(tokens_new);
+        SRV_TRC(" - disk prompt cache: found entry '%s' with f_keep = %.3f, f_sim = %.3f\n", best_fname.c_str(), f_keep_best, f_sim_best);
 
-        f_keep_best = prompt.tokens.size() > 0 ? float(lcp_base) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
-        f_sim_best  = float(lcp_base) / tokens_new.size();
+        server_prompt_cache_state state;
+        {
+            FILE * f = fopen(best_path.c_str(), "rb");
+            if (f == nullptr) {
+                SRV_WRN(" - disk prompt cache: cannot open '%s', dropping stale entry\n", best_path.c_str());
 
-        size_t idx_best = SIZE_MAX;
+                // prune the dead entry from the in-memory index and re-select
+                std::lock_guard<std::mutex> lock(disk_index_mtx_);
+                disk_entries.erase(
+                    std::remove_if(disk_entries.begin(), disk_entries.end(),
+                        [&](const disk_entry & e) { return e.path == best_path; }),
+                    disk_entries.end());
 
-        for (size_t i = 0; i < disk_entries.size(); ++i) {
-            const auto & entry = disk_entries[i];
-
-            const int lcp_cur = entry.tokens.get_common_prefix(tokens_new);
-
-            const float f_keep_cur = entry.tokens.size() > 0 ? float(lcp_cur) / entry.tokens.size() : -1.0f;
-            const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
-
-            SRV_TRC(" - disk prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n",
-                    entry.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
-
-            // don't trash large prompts
-            if (f_keep_cur < 0.25f) {
                 continue;
             }
 
-            if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
-                f_keep_best = f_keep_cur;
-                f_sim_best  = f_sim_cur;
+            uint32_t magic = 0;
+            uint32_t version = 0;
+            const bool ok = fread(&magic, 4, 1, f) == 1 && fread(&version, 4, 1, f) == 1 &&
+                            magic == DPC_MAGIC && (version == DPC_VERSION || version == 2 || version == 1) && dpc_read_state(f, version, state);
+            fclose(f);
 
-                idx_best = i;
+            if (!ok) {
+                SRV_ERR("failed to load prompt state from disk ('%s')\n", best_fname.c_str());
+
+                return false;
             }
         }
 
-        if (idx_best == SIZE_MAX) {
-            return true;
-        }
+        // promote into the RAM tier when it fits the budget, otherwise restore directly from disk
+        const size_t state_bytes = state.size();
+        const bool can_promote = limit_size == 0 || size() + state_bytes <= limit_size;
 
-        best_path  = disk_entries[idx_best].path;
-        best_fname = disk_entries[idx_best].fname;
-    }
+        if (can_promote) {
+            states.push_back(std::move(state));
 
-    SRV_TRC(" - disk prompt cache: found entry '%s' with f_keep = %.3f, f_sim = %.3f\n", best_fname.c_str(), f_keep_best, f_sim_best);
+            if (!restore_state(prompt, states.back(), ctx_tgt, ctx_dft, id_slot)) {
+                states.pop_back();
 
-    server_prompt_cache_state state;
-    {
-        FILE * f = fopen(best_path.c_str(), "rb");
-        if (f == nullptr) {
-            SRV_WRN(" - disk prompt cache: cannot open '%s'\n", best_path.c_str());
+                return false;
+            }
 
-            return true;
-        }
-
-        uint32_t magic = 0;
-        uint32_t version = 0;
-        const bool ok = fread(&magic, 4, 1, f) == 1 && fread(&version, 4, 1, f) == 1 &&
-                        magic == DPC_MAGIC && (version == DPC_VERSION || version == 2 || version == 1) && dpc_read_state(f, version, state);
-        fclose(f);
-
-        if (!ok) {
-            SRV_ERR("failed to load prompt state from disk ('%s')\n", best_fname.c_str());
-
-            return false;
-        }
-    }
-
-    // promote into the RAM tier when it fits the budget, otherwise restore directly from disk
-    const size_t state_bytes = state.size();
-    const bool can_promote = limit_size == 0 || size() + state_bytes <= limit_size;
-
-    if (can_promote) {
-        states.push_back(std::move(state));
-
-        if (!restore_state(prompt, states.back(), ctx_tgt, ctx_dft, id_slot)) {
+            // consume like a RAM hit: the state now lives in the slot
             states.pop_back();
 
-            return false;
+            SRV_INF(" - disk prompt cache: promoted entry '%s' into RAM (%.3f MiB)\n", best_fname.c_str(), state_bytes / (1024.0 * 1024.0));
+        } else {
+            if (!restore_state(prompt, state, ctx_tgt, ctx_dft, id_slot)) {
+                return false;
+            }
+
+            SRV_INF(" - disk prompt cache: restored entry '%s' directly from disk (%.3f MiB, RAM budget exhausted)\n", best_fname.c_str(), state_bytes / (1024.0 * 1024.0));
         }
 
-        // consume like a RAM hit: the state now lives in the slot
-        states.pop_back();
-
-        SRV_INF(" - disk prompt cache: promoted entry '%s' into RAM (%.3f MiB)\n", best_fname.c_str(), state_bytes / (1024.0 * 1024.0));
-    } else {
-        if (!restore_state(prompt, state, ctx_tgt, ctx_dft, id_slot)) {
-            return false;
+        // successful restore refreshes the LRU order so the prune prefers cold entries
+        std::error_code ec;
+        fs::last_write_time(best_path, fs::file_time_type::clock::now(), ec);
+        if (ec) {
+            SRV_WRN(" - disk prompt cache: cannot touch '%s': %s\n", best_path.c_str(), ec.message().c_str());
         }
 
-        SRV_INF(" - disk prompt cache: restored entry '%s' directly from disk (%.3f MiB, RAM budget exhausted)\n", best_fname.c_str(), state_bytes / (1024.0 * 1024.0));
+        return true;
     }
-
-    return true;
 }
 
 size_t server_prompt_cache::load_disk_index(const std::string & dir, const std::string & fingerprint) {
