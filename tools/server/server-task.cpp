@@ -1958,18 +1958,94 @@ void server_prompt_cache::update() {
 //
 
 
-constexpr uint32_t DPC_MAGIC   = 0x31435044; // "DPC1"
-constexpr uint32_t DPC_VERSION = 3;
+// format constants live in server-task.h (writer, reader and tests share them)
 
-// store-state index: same header shape as DPC but len_main/len_drft are always
-// zero (the KV lives in cache.dcp as lineage-chained cells). v1 was token-only;
-// v2 appends the checkpoint section (mirror of dpc_write_state) so a store
-// restore can jump to its last checkpoint instead of re-processing the prompt.
-// a distinct magic means a legacy reader can never mistake it for a full state.
-constexpr uint32_t DTS_MAGIC   = 0x31535444; // "DTS1"
-constexpr uint32_t DTS_VERSION = 2;
-constexpr uint32_t DPC_MAX_TOKENS = 1u << 24;
-constexpr uint32_t DPC_MAX_CHECKPOINTS = 1024;
+// implement the checkpoint section codec below the format constants; both the
+// .dpc full-state files (v3) and the .dts store sidecars (v2) use it so the
+// layouts cannot drift from each other or from the tests.
+bool disk_write_ckpt_section(FILE * f, const std::list<common_prompt_checkpoint> & checkpoints, uint32_t n_ckpt) {
+    bool ok = true;
+
+    uint32_t i = 0;
+    for (const auto & ckpt : checkpoints) {
+        if (i++ >= n_ckpt) {
+            break;
+        }
+        const int64_t  ck_tokens = ckpt.n_tokens;
+        const int32_t  id_task   = ckpt.id_task;
+        const int32_t  pos_min   = ckpt.pos_min;
+        const int32_t  pos_max   = ckpt.pos_max;
+        const uint64_t len_tgt   = ckpt.data_tgt.size();
+        const uint64_t len_dft   = ckpt.data_dft.size();
+        const uint64_t len_spec  = ckpt.data_spec.size();
+
+        ok = ok && fwrite(&ck_tokens, 8, 1, f) == 1;
+        ok = ok && fwrite(&id_task,   4, 1, f) == 1;
+        ok = ok && fwrite(&pos_min,   4, 1, f) == 1;
+        ok = ok && fwrite(&pos_max,   4, 1, f) == 1;
+        ok = ok && fwrite(&len_tgt,   8, 1, f) == 1;
+        ok = ok && fwrite(&len_dft,   8, 1, f) == 1;
+        ok = ok && fwrite(&len_spec,  8, 1, f) == 1;
+        ok = ok && (len_tgt == 0 || fwrite(ckpt.data_tgt.data(),  1, len_tgt,  f) == len_tgt);
+        ok = ok && (len_dft == 0 || fwrite(ckpt.data_dft.data(),  1, len_dft,  f) == len_dft);
+        ok = ok && (len_spec == 0 || fwrite(ckpt.data_spec.data(), 1, len_spec, f) == len_spec);
+    }
+
+    return ok;
+}
+
+bool disk_read_ckpt_section(FILE * f, uint32_t n_ckpt, std::list<common_prompt_checkpoint> & checkpoints) {
+    auto rd = [&](void * dst, size_t n) { return fread(dst, 1, n, f) == n; };
+
+    bool ok = n_ckpt <= DPC_MAX_CHECKPOINTS;
+
+    // read into a local list and only splice on full success, so a truncated
+    // section never leaves partial records in the caller's state
+    std::list<common_prompt_checkpoint> parsed;
+
+    for (uint32_t i = 0; ok && i < n_ckpt; ++i) {
+        auto & ckpt = parsed.emplace_back();
+
+        uint64_t len_tgt  = 0;
+        uint64_t len_dft  = 0;
+        uint64_t len_spec = 0;
+
+        ok = ok && rd(&ckpt.n_tokens, 8) && rd(&ckpt.id_task, 4) &&
+              rd(&ckpt.pos_min, 4) && rd(&ckpt.pos_max, 4) &&
+              rd(&len_tgt, 8) && rd(&len_dft, 8) && rd(&len_spec, 8);
+
+        ok = ok && len_tgt <= (1ull << 34) && len_dft <= (1ull << 34) && len_spec <= (1ull << 34);
+
+        if (ok) {
+            ckpt.data_tgt.resize(len_tgt);
+            ckpt.data_dft.resize(len_dft);
+            ckpt.data_spec.resize(len_spec);
+            ok = ok && (len_tgt == 0  || fread(ckpt.data_tgt.data(),  1, len_tgt,  f) == len_tgt);
+            ok = ok && (len_dft == 0  || fread(ckpt.data_dft.data(),  1, len_dft,  f) == len_dft);
+            ok = ok && (len_spec == 0 || fread(ckpt.data_spec.data(), 1, len_spec, f) == len_spec);
+        }
+    }
+
+    if (ok) {
+        checkpoints.splice(checkpoints.end(), parsed);
+    }
+
+    return ok;
+}
+
+uint64_t disk_ckpt_section_size(const std::list<common_prompt_checkpoint> & checkpoints, uint32_t n_ckpt) {
+    uint64_t sz = 0;
+
+    uint32_t i = 0;
+    for (const auto & ckpt : checkpoints) {
+        if (i++ >= n_ckpt) {
+            break;
+        }
+        sz += 44 + ckpt.data_tgt.size() + ckpt.data_dft.size() + ckpt.data_spec.size();
+    }
+
+    return sz;
+}
 
 // compact SHA-256 (FIPS 180-4), single-shot. mirrors the core in common/fit-cache.cpp
 uint32_t dpc_sha256_k[64] = {
@@ -3770,26 +3846,7 @@ bool dpc_write_state(FILE * f, const server_prompt_cache_state & state) {
     ok = ok && (len_main == 0 || fwrite(state.data.main.data(), 1, len_main, f) == len_main);
     ok = ok && (len_drft == 0 || fwrite(state.data.drft.data(), 1, len_drft, f) == len_drft);
 
-    for (const auto & ckpt : state.prompt.checkpoints) {
-        const int64_t  n_tokens = ckpt.n_tokens;
-        const int32_t  id_task  = ckpt.id_task;
-        const int32_t  pos_min  = ckpt.pos_min;
-        const int32_t  pos_max  = ckpt.pos_max;
-        const uint64_t n_tgt    = ckpt.data_tgt.size();
-        const uint64_t n_dft    = ckpt.data_dft.size();
-        const uint64_t n_spec   = ckpt.data_spec.size();
-
-        ok = ok && fwrite(&n_tokens, 8, 1, f) == 1;
-        ok = ok && fwrite(&id_task,  4, 1, f) == 1;
-        ok = ok && fwrite(&pos_min,  4, 1, f) == 1;
-        ok = ok && fwrite(&pos_max,  4, 1, f) == 1;
-        ok = ok && fwrite(&n_tgt,    8, 1, f) == 1;
-        ok = ok && fwrite(&n_dft,    8, 1, f) == 1;
-        ok = ok && fwrite(&n_spec,   8, 1, f) == 1;
-        ok = ok && (n_tgt == 0  || fwrite(ckpt.data_tgt.data(),  1, n_tgt,  f) == n_tgt);
-        ok = ok && (n_dft == 0  || fwrite(ckpt.data_dft.data(),  1, n_dft,  f) == n_dft);
-        ok = ok && (n_spec == 0 || fwrite(ckpt.data_spec.data(), 1, n_spec, f) == n_spec);
-    }
+    ok = ok && disk_write_ckpt_section(f, state.prompt.checkpoints, n_ckpt);
 
     return ok;
 }
@@ -3814,28 +3871,7 @@ bool dpc_read_state(FILE * f, uint32_t version, server_prompt_cache_state & stat
     ok = ok && (len_main == 0 || fread(state.data.main.data(), 1, len_main, f) == len_main);
     ok = ok && (len_drft == 0 || fread(state.data.drft.data(), 1, len_drft, f) == len_drft);
 
-    for (uint32_t i = 0; ok && i < n_ckpt; ++i) {
-        auto & ckpt = state.prompt.checkpoints.emplace_back();
-
-        uint64_t n_tgt  = 0;
-        uint64_t n_dft  = 0;
-        uint64_t n_spec = 0;
-
-        ok = ok && rd(&ckpt.n_tokens, 8) && rd(&ckpt.id_task, 4) &&
-              rd(&ckpt.pos_min, 4) && rd(&ckpt.pos_max, 4) &&
-              rd(&n_tgt, 8) && rd(&n_dft, 8) && rd(&n_spec, 8);
-
-        ok = ok && n_tgt <= (1ull << 34) && n_dft <= (1ull << 34) && n_spec <= (1ull << 34);
-
-        if (ok) {
-            ckpt.data_tgt.resize(n_tgt);
-            ckpt.data_dft.resize(n_dft);
-            ckpt.data_spec.resize(n_spec);
-            ok = ok && (n_tgt == 0  || fread(ckpt.data_tgt.data(),  1, n_tgt,  f) == n_tgt);
-            ok = ok && (n_dft == 0  || fread(ckpt.data_dft.data(),  1, n_dft,  f) == n_dft);
-            ok = ok && (n_spec == 0 || fread(ckpt.data_spec.data(), 1, n_spec, f) == n_spec);
-        }
-    }
+    ok = ok && disk_read_ckpt_section(f, n_ckpt, state.prompt.checkpoints);
 
     state.prompt.tokens = server_tokens(tokens, false);
 
@@ -4268,19 +4304,11 @@ static void disk_write_token_index(const std::string & dir, const std::string & 
     uint32_t n_ckpt = (uint32_t) std::min<size_t>(checkpoints.size(), DPC_MAX_CHECKPOINTS);
 
     // never let the checkpoint section push the volume full: measure what the
-    // section needs, and when free space cannot hold it (plus 64 MiB headroom)
-    // write the token-only v1 sidecar instead - restore degrades to a full
-    // re-prefill, the store batch itself is already committed at this point
-    uint64_t ckpt_section = 0;
-    {
-        uint32_t i = 0;
-        for (const auto & ckpt : checkpoints) {
-            if (i++ >= n_ckpt) {
-                break;
-            }
-            ckpt_section += 48 + ckpt.data_tgt.size() + ckpt.data_dft.size() + ckpt.data_spec.size();
-        }
-    }
+    // section needs (via the shared codec, the same bytes the reader expects)
+    // and when free space cannot hold it (plus 64 MiB headroom) write the
+    // token-only v1 sidecar instead - restore degrades to a full re-prefill,
+    // the store batch itself is already committed at this point
+    const uint64_t ckpt_section = disk_ckpt_section_size(checkpoints, n_ckpt);
     uint32_t version = DTS_VERSION;
     if (ckpt_section > 0) {
         std::error_code ecs;
@@ -4304,31 +4332,10 @@ static void disk_write_token_index(const std::string & dir, const std::string & 
     ok = ok && fwrite(&n_ckpt,      4, 1, f) == 1;
     ok = ok && (n_tokens == 0 || fwrite(tokens.data(), sizeof(llama_token), n_tokens, f) == n_tokens);
 
-    // mirror of the dpc_write_state per-checkpoint record; the write-through
+    // v2 only: the checkpoint section (shared codec with .dpc). the write-through
     // copy carries full payloads (rehydrated, then spill-wiped in alloc())
-    uint32_t i = 0;
-    for (const auto & ckpt : checkpoints) {
-        if (version == 1 || i++ >= n_ckpt) {
-            break;
-        }
-        const int64_t  ck_tokens = ckpt.n_tokens;
-        const int32_t  id_task   = ckpt.id_task;
-        const int32_t  pos_min   = ckpt.pos_min;
-        const int32_t  pos_max   = ckpt.pos_max;
-        const uint64_t len_tgt   = ckpt.data_tgt.size();
-        const uint64_t len_dft   = ckpt.data_dft.size();
-        const uint64_t len_spec  = ckpt.data_spec.size();
-
-        ok = ok && fwrite(&ck_tokens, 8, 1, f) == 1;
-        ok = ok && fwrite(&id_task,   4, 1, f) == 1;
-        ok = ok && fwrite(&pos_min,   4, 1, f) == 1;
-        ok = ok && fwrite(&pos_max,   4, 1, f) == 1;
-        ok = ok && fwrite(&len_tgt,   8, 1, f) == 1;
-        ok = ok && fwrite(&len_dft,   8, 1, f) == 1;
-        ok = ok && fwrite(&len_spec,  8, 1, f) == 1;
-        ok = ok && (len_tgt == 0 || fwrite(ckpt.data_tgt.data(),  1, len_tgt,  f) == len_tgt);
-        ok = ok && (len_dft == 0 || fwrite(ckpt.data_dft.data(),  1, len_dft,  f) == len_dft);
-        ok = ok && (len_spec == 0 || fwrite(ckpt.data_spec.data(), 1, len_spec, f) == len_spec);
+    if (version == DTS_VERSION) {
+        ok = ok && disk_write_ckpt_section(f, checkpoints, n_ckpt);
     }
     fclose(f);
 
@@ -4827,32 +4834,7 @@ bool server_prompt_cache::load_from_disk_tier(server_prompt & prompt, const serv
 
                 // v2 carries the checkpoint section right after the tokens
                 if (ok && version == DTS_VERSION) {
-                    for (uint32_t i = 0; ok && i < n_ckpt; ++i) {
-                        auto & ckpt = state.prompt.checkpoints.emplace_back();
-
-                        uint64_t len_tgt  = 0;
-                        uint64_t len_dft  = 0;
-                        uint64_t len_spec = 0;
-
-                        ok = ok && fread(&ckpt.n_tokens, 8, 1, f) == 1 &&
-                              fread(&ckpt.id_task, 4, 1, f) == 1 &&
-                              fread(&ckpt.pos_min, 4, 1, f) == 1 &&
-                              fread(&ckpt.pos_max, 4, 1, f) == 1 &&
-                              fread(&len_tgt, 8, 1, f) == 1 &&
-                              fread(&len_dft, 8, 1, f) == 1 &&
-                              fread(&len_spec, 8, 1, f) == 1;
-
-                        ok = ok && len_tgt <= (1ull << 34) && len_dft <= (1ull << 34) && len_spec <= (1ull << 34);
-
-                        if (ok) {
-                            ckpt.data_tgt.resize(len_tgt);
-                            ckpt.data_dft.resize(len_dft);
-                            ckpt.data_spec.resize(len_spec);
-                            ok = ok && (len_tgt == 0  || fread(ckpt.data_tgt.data(),  1, len_tgt,  f) == len_tgt);
-                            ok = ok && (len_dft == 0  || fread(ckpt.data_dft.data(),  1, len_dft,  f) == len_dft);
-                            ok = ok && (len_spec == 0 || fread(ckpt.data_spec.data(), 1, len_spec, f) == len_spec);
-                        }
-                    }
+                    ok = disk_read_ckpt_section(f, n_ckpt, state.prompt.checkpoints);
                 }
                 fclose(f);
 

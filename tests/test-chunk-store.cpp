@@ -868,6 +868,116 @@ check(back.size() == cell.size() && memcmp(back.data(), cell.data(), cell.size()
         }
     }
 
+    //  scenario 14: DTS v2 checkpoint-section codec. the sidecar writer (v2)
+    //  appends the checkpoint section (mirror of the .dpc records) so a store
+    //  restore can jump to its last checkpoint; v1 sidecars stay token-only.
+    //  exercises the shared codec directly (disk_write/read_ckpt_section) the
+    //  way load_from_disk_tier uses it
+    //
+    if (only.empty() || only == "s14") {
+        fprintf(stderr, "\n== s14: dts v2 checkpoint codec ==\n");
+
+        // two checkpoints with distinct metadata + non-trivial payloads
+        std::list<common_prompt_checkpoint> src;
+        for (int i = 0; i < 2; i++) {
+            auto & c = src.emplace_back();
+            c.n_tokens = 512 + i;
+            c.id_task  = 10 + i;
+            c.pos_min  = 100 + i;
+            c.pos_max  = 900 + i;
+            c.data_tgt.resize(64 + i);
+            c.data_dft.resize(128 + i);
+            c.data_spec.resize(0);
+            for (size_t b = 0; b < c.data_tgt.size(); b++) {
+                c.data_tgt[b] = (uint8_t) (0xa0 + i + b);
+            }
+            for (size_t b = 0; b < c.data_dft.size(); b++) {
+                c.data_dft[b] = (uint8_t) (0x10 + i * b);
+            }
+        }
+
+        // size oracle: record 0 carries 64 @ tgt + 128 @ dft payloads
+        check(disk_ckpt_section_size(src, 1) == 44 + 64 + 128, "s14: size - one record with payloads");
+        check(disk_ckpt_section_size(src, 0) == 0, "s14: size - zero records is zero");
+        check(disk_ckpt_section_size(src, 2) == 44 + (64 + 128) + 44 + (65 + 129),
+              "s14: size - both records with payloads");
+
+        // tmpfile-based round trip: write the section, rewind, read it back
+        FILE * f = tmpfile();
+        check(f != nullptr, "s14: tmpfile opens");
+
+        const uint32_t n_ckpt = (uint32_t) src.size();
+        check(disk_write_ckpt_section(f, src, n_ckpt), "s14: write section");
+        rewind(f);
+
+        std::list<common_prompt_checkpoint> got;
+        check(disk_read_ckpt_section(f, n_ckpt, got), "s14: read section");
+        check(got.size() == src.size(), "s14: same checkpoint count");
+
+        auto it_src = src.begin();
+        auto it_got = got.begin();
+        bool same = it_got != got.end();
+        for (; same && it_src != src.end() && it_got != got.end(); ++it_src, ++it_got) {
+            same = it_got->n_tokens == it_src->n_tokens &&
+                   it_got->id_task  == it_src->id_task &&
+                   it_got->pos_min  == it_src->pos_min &&
+                   it_got->pos_max  == it_src->pos_max &&
+                   it_got->data_tgt.size() == it_src->data_tgt.size() &&
+                   it_got->data_dft.size() == it_src->data_dft.size() &&
+                   it_got->data_spec.size() == it_src->data_spec.size() &&
+                   memcmp(it_got->data_tgt.data(), it_src->data_tgt.data(), it_src->data_tgt.size()) == 0 &&
+                   memcmp(it_got->data_dft.data(), it_src->data_dft.data(), it_src->data_dft.size()) == 0;
+        }
+        check(same, "s14: metadata and payload bytes round-trip intact");
+        fclose(f);
+
+        // n_ckpt over the cap is rejected before any read
+        f = tmpfile();
+        check(f != nullptr, "s14: tmpfile opens (overflow)");
+        {
+            std::list<common_prompt_checkpoint> got2;
+            check(!disk_read_ckpt_section(f, DPC_MAX_CHECKPOINTS + 1, got2), "s14: n_ckpt over cap rejected");
+            check(got2.empty(), "s14: no partial state on overflow");
+        }
+        fclose(f);
+
+        // truncated section: valid first record, then a cut in the second
+        f = tmpfile();
+        check(f != nullptr, "s14: tmpfile opens (truncated)");
+        {
+            const uint32_t n_ckpt2 = (uint32_t) src.size();
+            check(disk_write_ckpt_section(f, src, n_ckpt2), "s14: write section (truncated case)");
+            rewind(f);
+
+            // keep the first full record + 20 bytes of the second record, then cut
+            const long cut     = (long) disk_ckpt_section_size(src, 1) + 20;
+            FILE * g = tmpfile();
+            std::vector<uint8_t> buf((size_t) cut);
+            check(fread(buf.data(), 1, buf.size(), f) == buf.size(), "s14: copy prefix for truncation");
+            fwrite(buf.data(), 1, buf.size(), g);
+            rewind(g);
+
+            std::list<common_prompt_checkpoint> got3;
+            check(!disk_read_ckpt_section(g, n_ckpt2, got3), "s14: truncated section rejected");
+            check(got3.empty(), "s14: no partial state on truncation");
+            fclose(f);
+            fclose(g);
+        }
+
+        // v1 semantics: a token-only sidecar has n_ckpt == 0 -> empty checkpoints
+        f = tmpfile();
+        check(f != nullptr, "s14: tmpfile opens (v1)");
+        {
+            std::list<common_prompt_checkpoint> got4;
+            check(disk_write_ckpt_section(f, src, 0), "s14: v1 writes no section bytes");
+            check(ftell(f) == 0, "s14: v1 section is empty");
+            rewind(f);
+            check(disk_read_ckpt_section(f, 0, got4), "s14: v1 read ok with n_ckpt 0");
+            check(got4.empty(), "s14: v1 sidecar loads with empty checkpoints");
+        }
+        fclose(f);
+    }
+
     fs::remove_all(tmp, ec_tmp);
 
     if (g_failures) {

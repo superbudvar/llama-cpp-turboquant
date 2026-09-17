@@ -3,6 +3,7 @@
 #include "common.h"
 #include "llama.h"
 
+#include <cstdio>
 #include <string>
 #include <unordered_set>
 #include <list>
@@ -842,6 +843,28 @@ namespace cc_io {
         return r;
     }
 }
+
+// disk prompt-cache state file formats (shared by the writer, the reader and
+// the tests so they cannot drift):
+// .dpc  = full state: header (magic/version/n_tokens/len_main/len_drft/n_ckpt),
+//         token ids, main/drft blobs, checkpoint section.
+// .dts  = store index: same header shape as .dpc but len_main/len_drft are
+//         chunk-id splits (always stored), the KV lives in cache.dcp. v1 is
+//         token-only (n_ckpt always 0); v2 appends the checkpoint section so a
+//         store restore can jump to its last checkpoint instead of re-processing.
+constexpr uint32_t DPC_MAGIC   = 0x31435044; // "DPC1"
+constexpr uint32_t DPC_VERSION = 3;
+constexpr uint32_t DTS_MAGIC   = 0x31535444; // "DTS1"
+constexpr uint32_t DTS_VERSION = 2;
+constexpr uint32_t DPC_MAX_TOKENS = 1u << 24;
+constexpr uint32_t DPC_MAX_CHECKPOINTS = 1024;
+
+// checkpoint section: one record is i64 n_tokens, i32 id_task, i32 pos_min,
+// i32 pos_max, u64 tgt/dft/spec lengths, then the three payloads. both the
+// .dpc (v3) and .dts (v2) writers emit it so their readers share one codec.
+bool disk_write_ckpt_section(FILE * f, const std::list<common_prompt_checkpoint> & checkpoints, uint32_t n_ckpt);
+bool disk_read_ckpt_section(FILE * f, uint32_t n_ckpt, std::list<common_prompt_checkpoint> & checkpoints);
+uint64_t disk_ckpt_section_size(const std::list<common_prompt_checkpoint> & checkpoints, uint32_t n_ckpt);
 
 struct server_prompt_cache_state {
     server_prompt prompt;
