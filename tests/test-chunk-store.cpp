@@ -100,6 +100,19 @@ static std::vector<uint8_t> build_record(uint16_t kind, uint16_t region, uint32_
     return rec;
 }
 
+static uint64_t content_tag(const std::vector<uint8_t> & v) {
+    // mirror the write path: REGION_CKPT chunks key on a content tag of the
+    // tile, not on the token chain (checkpoint payloads carry spec/beam state
+    // that is not a pure function of the tokens). identical bytes must produce
+    // the same tag, distinct bytes distinct tags
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (uint8_t b : v) {
+        h ^= b;
+        h *= 0x100000001b3ull;
+    }
+    return h;
+}
+
 static prompt_cache_chunk_store::chunk_key key_of(uint16_t region, uint16_t layer,
                                                   uint32_t lo, uint32_t hi, uint64_t epoch) {
     prompt_cache_chunk_store::chunk_key k;
@@ -976,6 +989,156 @@ check(back.size() == cell.size() && memcmp(back.data(), cell.data(), cell.size()
             check(got4.empty(), "s14: v1 sidecar loads with empty checkpoints");
         }
         fclose(f);
+    }
+
+    //  scenario 15: v3 checkpoint chunks (REGION_CKPT). the store owns the
+    //  checkpoint payloads as keyed chunks (stream/ordinal in layer, token span
+    //  in cell_lo/cell_hi), so consecutive states dedup payloads by key; the
+    //  sidecar keeps only 44-byte meta records. exercises chunk dedup, the meta
+    //  codec round trip, the chunk-count oracle, and compact-renumber with the
+    //  ckpt chunks referenced by a live state
+    //
+    if (only.empty() || only == "s15") {
+        fprintf(stderr, "\n== s15: v3 ckpt chunks and meta codec ==\n");
+
+        // two checkpoints produced by one data-dir beam: the second re-visits
+        // the same token span, so it shares the first's tgt payload bytes
+        std::list<common_prompt_checkpoint> src;
+        for (int i = 0; i < 2; i++) {
+            auto & c = src.emplace_back();
+            c.n_tokens = 512 + i;
+            c.id_task  = 10 + i;
+            c.pos_min  = 100;
+            c.pos_max  = 900;
+            c.data_tgt.resize(128);
+            c.data_dft.resize(64 + i);
+            c.data_spec.resize(0);
+            for (size_t b = 0; b < c.data_tgt.size(); b++) {
+                c.data_tgt[b] = (uint8_t) (0xa0 + i + b);
+            }
+            for (size_t b = 0; b < c.data_dft.size(); b++) {
+                c.data_dft[b] = (uint8_t) ((0x10 + i * b) & 0xff);
+            }
+        }
+        // ckpt 2 reuses ckpt 1's tgt payload (the dedup case)
+        src.back().data_tgt = src.front().data_tgt;
+
+        // meta codec round trip: size oracle + bytes survive
+        check(disk_ckpt_meta_size(0) == 0, "s15: meta size - zero records is zero");
+        check(disk_ckpt_meta_size(2) == 88, "s15: meta size - 44 bytes per record");
+        FILE * f = tmpfile();
+        check(f != nullptr, "s15: tmpfile opens");
+        const uint32_t n_ckpt = (uint32_t) src.size();
+        check(disk_write_ckpt_meta(f, src, n_ckpt), "s15: write meta");
+        check((uint64_t) ftell(f) == disk_ckpt_meta_size(n_ckpt), "s15: meta file is exactly 44*n_ckpt bytes");
+        rewind(f);
+        std::list<common_prompt_checkpoint> got;
+        check(disk_read_ckpt_meta(f, n_ckpt, got), "s15: read meta");
+        auto it_src = src.begin();
+        auto it_got = got.begin();
+        bool meta_same = it_got != got.end();
+        for (; meta_same && it_src != src.end() && it_got != got.end(); ++it_src, ++it_got) {
+            meta_same = it_got->n_tokens == it_src->n_tokens &&
+                        it_got->id_task  == it_src->id_task &&
+                        it_got->pos_min  == it_src->pos_min &&
+                        it_got->pos_max  == it_src->pos_max &&
+                        // the meta reader pre-sizes payloads to the header lengths
+                        it_got->data_tgt.size() == it_src->data_tgt.size() &&
+                        it_got->data_dft.size() == it_src->data_dft.size() &&
+                        it_got->data_spec.size() == it_src->data_spec.size();
+        }
+        check(meta_same, "s15: meta round-trips lengths and metadata");
+        fclose(f);
+
+        // chunk-count oracle: streams tiled at MAX_REC_LEN, empty contributes 0
+        check(disk_ckpt_chunk_count(0, src) == 0, "s15: chunk count - zero records is zero");
+        {
+            auto big = src.front();
+            big.data_tgt.resize(prompt_cache_chunk_store::MAX_REC_LEN + 7);
+            big.data_dft.resize(0);
+            big.data_spec.resize(0);
+            std::list<common_prompt_checkpoint> one = { big };
+            check(disk_ckpt_chunk_count(1, one) == 2, "s15: chunk count - over-MAX_REC_LEN tgt tiles");
+        }
+        check(disk_ckpt_chunk_count(2, src) == 4,
+              "s15: chunk count - 2 ckpts, empty spec stream, no tile boundary hit");
+
+        // register the ckpt payloads as REGION_CKPT chunks in a real store,
+        // then let state refs prove dedup + compact survive. the write path
+        // keys each tile on a content tag (identical bytes -> same key), so a
+        // repeated tgt payload must collapse while a differing dft must not
+        prompt_cache_chunk_store cs;
+        const fs::path dir = tmp / "s15";
+        check(cs.open(dir.string(), BASE), "s15: open creates the store");
+
+        struct ckpt_id { int64_t tgt, dft; };
+        std::vector<ckpt_id> ids;
+        check(cs.begin_commit(), "s15: begin_commit (ckpt chunks)");
+        for (auto & c : src) {
+            const uint16_t ord0 = 0;
+            const auto kt = key_of(prompt_cache_chunk_store::REGION_CKPT, (uint16_t) (0 << 10 | ord0),
+                                   (uint32_t) c.pos_min, (uint32_t) c.pos_max, content_tag(c.data_tgt));
+            const auto kd = key_of(prompt_cache_chunk_store::REGION_CKPT, (uint16_t) (1 << 10 | ord0),
+                                   (uint32_t) c.pos_min, (uint32_t) c.pos_max, content_tag(c.data_dft));
+            ids.push_back({ cs.put_chunk(kt, c.data_tgt.data(), c.data_tgt.size()),
+                            cs.put_chunk(kd, c.data_dft.data(), c.data_dft.size()) });
+        }
+        check(cs.commit(), "s15: commit (ckpt chunks)");
+        // keys: tgt0==tgt1 (same payload -> same content tag), dft0 != dft1
+        check(cs.get_stats().n_chunks == 3,
+              "s15: identical tgt keys collapsed, differing dft keys did not");
+        check(ids[1].tgt == ids[0].tgt, "s15: duplicated payload maps to the same chunk id");
+        check(ids[1].dft != ids[0].dft, "s15: differing dft payload maps to a distinct chunk");
+        check(cs.refcount((uint64_t) ids[1].tgt) == 0, "s15: no state yet, chunk unreferenced");
+
+        // reopen to prove REGION_CKPT chunks are on-disk records like any other
+        cs.close();
+        check(cs.open(dir.string(), BASE), "s15: reopen creates the store");
+
+        for (size_t i = 0; i < src.size(); i++) {
+            auto it = src.begin();
+            std::advance(it, (long) i);
+            std::vector<uint8_t> back;
+            check(cs.get_chunk((uint64_t) ids[i].tgt, back), "s15: tgt chunk read back");
+            check(back.size() == it->data_tgt.size() &&
+                          memcmp(back.data(), it->data_tgt.data(), it->data_tgt.size()) == 0,
+                  "s15: tgt bytes intact across reopen");
+            check(cs.get_chunk((uint64_t) ids[i].dft, back), "s15: dft chunk read back");
+            check(back.size() == it->data_dft.size() &&
+                          memcmp(back.data(), it->data_dft.data(), it->data_dft.size()) == 0,
+                  "s15: dft bytes intact across reopen");
+        }
+
+        // two states like consecutive writes: both share the tgt chunk (the
+        // C8 win), each has its own dft. drop the older state, then compact:
+        // the shared ckpt chunk must survive the renumber and stay readable
+        std::array<uint8_t, 32> fa{}, fb{};
+        memcpy(fa.data(), "ckpt-state-A", 12);
+        memcpy(fb.data(), "ckpt-state-B", 12);
+        prompt_cache_chunk_store::state_ref sa, sb;
+        sa.fp = fa; sa.n_tokens = 1024;
+        sa.chunks = { (uint64_t) ids[0].tgt, (uint64_t) ids[0].dft };
+        sb.fp = fb; sb.n_tokens = 2048;
+        sb.chunks = { (uint64_t) ids[1].tgt, (uint64_t) ids[1].dft };
+        check(cs.begin_commit(), "s15: begin_commit (states)");
+        check(cs.put_state(sa) && cs.put_state(sb), "s15: both states queued");
+        check(cs.commit(), "s15: commit (states)");
+        check(cs.refcount((uint64_t) ids[0].tgt) == 2, "s15: shared tgt refcount 2 across states");
+
+        cs.drop_state(fa);
+        check(cs.refcount((uint64_t) ids[0].tgt) == 1, "s15: shared tgt held by B after dropping A");
+        check(cs.get_stats().n_dead == 1, "s15: only A's dft is dead");
+
+        const uint64_t freed = cs.compact();
+        check(freed > 0, "s15: compact frees dead ckpt bytes");
+
+        prompt_cache_chunk_store::state_ref got_state;
+        check(cs.get_state(fb, got_state), "s15: ckpt-referencing state survives compact");
+        check(got_state.chunks.size() == 2, "s15: state chunks remapped after compact");
+        std::vector<uint8_t> back;
+        check(cs.get_chunk(got_state.chunks[0], back), "s15: remapped ckpt chunk readable");
+        check(!cs.get_state(fa, got_state), "s15: dropped state gone after compact");
+        cs.close();
     }
 
     fs::remove_all(tmp, ec_tmp);

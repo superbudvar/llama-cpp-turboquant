@@ -2047,6 +2047,97 @@ uint64_t disk_ckpt_section_size(const std::list<common_prompt_checkpoint> & chec
     return sz;
 }
 
+// number of REGION_CKPT chunks a checkpoint's payloads split into: each stream
+// is tiled at MAX_REC_LEN, and an empty stream contributes nothing. the writer
+// (to size ids.reserve) and the restore (to validate the trailing chunk count)
+// must agree on this exact accounting.
+uint64_t disk_ckpt_chunk_count(uint32_t n_ckpt, const std::list<common_prompt_checkpoint> & checkpoints) {
+    uint64_t n = 0;
+
+    uint32_t i = 0;
+    for (const auto & ckpt : checkpoints) {
+        if (i++ >= n_ckpt) {
+            break;
+        }
+        n += (ckpt.data_tgt.size()  + (prompt_cache_chunk_store::MAX_REC_LEN - 1)) / prompt_cache_chunk_store::MAX_REC_LEN;
+        n += (ckpt.data_dft.size()  + (prompt_cache_chunk_store::MAX_REC_LEN - 1)) / prompt_cache_chunk_store::MAX_REC_LEN;
+        n += (ckpt.data_spec.size() + (prompt_cache_chunk_store::MAX_REC_LEN - 1)) / prompt_cache_chunk_store::MAX_REC_LEN;
+    }
+
+    return n;
+}
+
+// .dts v3 checkpoint section: metadata headers only, no payload bytes. the
+// payloads live as REGION_CKPT chunks in the store; a token sidecar that never
+// exceeds ~46 KiB per 1024 checkpoints cannot meaningfully threaten disk-full.
+bool disk_write_ckpt_meta(FILE * f, const std::list<common_prompt_checkpoint> & checkpoints, uint32_t n_ckpt) {
+    bool ok = true;
+
+    uint32_t i = 0;
+    for (const auto & ckpt : checkpoints) {
+        if (i++ >= n_ckpt) {
+            break;
+        }
+        const int64_t  ck_tokens = ckpt.n_tokens;
+        const int32_t  id_task   = ckpt.id_task;
+        const int32_t  pos_min   = ckpt.pos_min;
+        const int32_t  pos_max   = ckpt.pos_max;
+        const uint64_t len_tgt   = ckpt.data_tgt.size();
+        const uint64_t len_dft   = ckpt.data_dft.size();
+        const uint64_t len_spec  = ckpt.data_spec.size();
+
+        ok = ok && fwrite(&ck_tokens, 8, 1, f) == 1;
+        ok = ok && fwrite(&id_task,   4, 1, f) == 1;
+        ok = ok && fwrite(&pos_min,   4, 1, f) == 1;
+        ok = ok && fwrite(&pos_max,   4, 1, f) == 1;
+        ok = ok && fwrite(&len_tgt,   8, 1, f) == 1;
+        ok = ok && fwrite(&len_dft,   8, 1, f) == 1;
+        ok = ok && fwrite(&len_spec,  8, 1, f) == 1;
+    }
+
+    return ok;
+}
+
+bool disk_read_ckpt_meta(FILE * f, uint32_t n_ckpt, std::list<common_prompt_checkpoint> & checkpoints) {
+    auto rd = [&](void * dst, size_t n) { return fread(dst, 1, n, f) == n; };
+
+    bool ok = n_ckpt <= DPC_MAX_CHECKPOINTS;
+
+    // sized to the header lengths so the restore knows how many REGION_CKPT
+    // chunks each stream reassembles and can validate the reassembly byte count
+    std::list<common_prompt_checkpoint> parsed;
+
+    for (uint32_t i = 0; ok && i < n_ckpt; ++i) {
+        auto & ckpt = parsed.emplace_back();
+
+        uint64_t len_tgt  = 0;
+        uint64_t len_dft  = 0;
+        uint64_t len_spec = 0;
+
+        ok = ok && rd(&ckpt.n_tokens, 8) && rd(&ckpt.id_task, 4) &&
+              rd(&ckpt.pos_min, 4) && rd(&ckpt.pos_max, 4) &&
+              rd(&len_tgt, 8) && rd(&len_dft, 8) && rd(&len_spec, 8);
+
+        ok = ok && len_tgt <= (1ull << 34) && len_dft <= (1ull << 34) && len_spec <= (1ull << 34);
+
+        if (ok) {
+            ckpt.data_tgt.resize(len_tgt);
+            ckpt.data_dft.resize(len_dft);
+            ckpt.data_spec.resize(len_spec);
+        }
+    }
+
+    if (ok) {
+        checkpoints.splice(checkpoints.end(), parsed);
+    }
+
+    return ok;
+}
+
+uint64_t disk_ckpt_meta_size(uint32_t n_ckpt) {
+    return ((uint64_t) n_ckpt) * 44;
+}
+
 // compact SHA-256 (FIPS 180-4), single-shot. mirrors the core in common/fit-cache.cpp
 uint32_t dpc_sha256_k[64] = {
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -2348,8 +2439,8 @@ struct prompt_cache_chunk_store::impl {
     void set_header_gen(uint64_t gen) {
         uint8_t hdr[24];
         memset(hdr, 0, sizeof(hdr));
-        cc_io::put_u32(hdr,      0x54514331); // "TQC1"
-        cc_io::put_u32(hdr + 4,  1);
+        cc_io::put_u32(hdr,      DCP_MAGIC);
+        cc_io::put_u32(hdr + 4,  FORMAT_VER);
         cc_io::put_u64(hdr + 8,  base_lineage_);
         cc_io::put_u64(hdr + 16, gen);
         append_rewrite_hdr(hdr);
@@ -2432,7 +2523,7 @@ struct prompt_cache_chunk_store::impl {
         if (!pread_at(0, hdr, 24)) {
             return false;
         }
-        if (cc_io::get_u32(hdr)      != 0x54514331 || cc_io::get_u32(hdr + 4) != 1) {
+        if (cc_io::get_u32(hdr) != DCP_MAGIC || cc_io::get_u32(hdr + 4) != FORMAT_VER) {
             return false;
         }
 
@@ -2546,7 +2637,7 @@ struct prompt_cache_chunk_store::impl {
         }
         uint8_t hdr[48];
         in.read((char *) hdr, 48);
-        if (!in || cc_io::get_u32(hdr) != 0x31494344 || cc_io::get_u32(hdr + 4) != 1) {
+        if (!in || cc_io::get_u32(hdr) != DCI_MAGIC || cc_io::get_u32(hdr + 4) != FORMAT_VER) {
             return false;
         }
         if (cc_io::get_u64(hdr + 8)  != base_lineage_ ||
@@ -2621,8 +2712,8 @@ struct prompt_cache_chunk_store::impl {
         }
         uint8_t hdr[48];
         memset(hdr, 0, sizeof(hdr));
-        cc_io::put_u32(hdr,      0x31494344); // "DCI1"
-        cc_io::put_u32(hdr + 4,  1);
+        cc_io::put_u32(hdr,      DCI_MAGIC);
+        cc_io::put_u32(hdr + 4,  FORMAT_VER);
         cc_io::put_u64(hdr + 8,  base_lineage_);
         cc_io::put_u64(hdr + 16, committed_gen_);
         uint64_t dcp_size = 0;
@@ -2759,8 +2850,8 @@ bool prompt_cache_chunk_store::open(const std::string & dir, uint64_t base_linea
     if (exists) {
         uint8_t hdr[24];
         if (I.pread_at(0, hdr, 24)) {
-            base_ok = cc_io::get_u32(hdr)     == 0x54514331 &&
-                      cc_io::get_u32(hdr + 4) == 1 &&
+            base_ok = cc_io::get_u32(hdr) == DCP_MAGIC &&
+                      cc_io::get_u32(hdr + 4) == FORMAT_VER &&
                       cc_io::get_u64(hdr + 8) == base_lineage;
             if (base_ok) {
                 I.committed_gen_ = cc_io::get_u64(hdr + 16);
@@ -3203,8 +3294,8 @@ uint64_t prompt_cache_chunk_store::compact() {
                 return 0;
             }
             uint8_t hdr[24];
-            cc_io::put_u32(hdr,      0x54514331);
-            cc_io::put_u32(hdr + 4,  1);
+            cc_io::put_u32(hdr,      DCP_MAGIC);
+            cc_io::put_u32(hdr + 4,  FORMAT_VER);
             cc_io::put_u64(hdr + 8,  I.base_lineage_);
             cc_io::put_u64(hdr + 16, I.committed_gen_ + 1);
             out.write((const char *) hdr, 24);
@@ -4062,6 +4153,9 @@ void server_prompt_cache::prune_pool(const std::string & root, const std::string
     uint64_t used = 0;
 
     const fs::path own_path(own_dir);
+    // knob B: the own store footprint (.dcp + .dci) and its own .dts sidecars
+    uint64_t own_store = 0;
+    std::vector<pool_file> own_dts;
 
     for (const auto & sd : fs::directory_iterator(root, ec)) {
         if (!sd.is_directory(ec)) {
@@ -4078,6 +4172,9 @@ void server_prompt_cache::prune_pool(const std::string & root, const std::string
                 }
                 used += (uint64_t) size;
                 files.push_back({ entry.path(), fs::last_write_time(entry.path(), ec), (uint64_t) size, false });
+                if (is_own_dir && ext == ".dts") {
+                    own_dts.push_back(files.back());
+                }
             } else if (ext == ".ccn" && is_own_dir && include_own_ccn) {
                 const auto size = fs::file_size(entry.path(), ec);
                 if (ec) {
@@ -4090,6 +4187,9 @@ void server_prompt_cache::prune_pool(const std::string & root, const std::string
                 const auto size = fs::file_size(entry.path(), ec);
                 if (!ec) {
                     used += (uint64_t) size;
+                    if (is_own_dir) {
+                        own_store += (uint64_t) size;
+                    }
                 }
             }
         }
@@ -4111,7 +4211,7 @@ void server_prompt_cache::prune_pool(const std::string & root, const std::string
             if (f) {
                 uint32_t magic = 0, version = 0, n_tokens = 0;
                 if (fread(&magic, 4, 1, f) == 1 && magic == DTS_MAGIC &&
-                    fread(&version, 4, 1, f) == 1 && (version == DTS_VERSION || version == 1) &&
+                    fread(&version, 4, 1, f) == 1 && (version == DTS_VERSION || version == 2 || version == 1) &&
                     fread(&n_tokens, 4, 1, f) == 1 && n_tokens > 0 && n_tokens <= 131072) {
                         // skip len_main(8) + len_drft(8) + n_ckpt(4) = 20 bytes
                         fseek(f, 20, SEEK_CUR);
@@ -4135,6 +4235,38 @@ void server_prompt_cache::prune_pool(const std::string & root, const std::string
     };
 
     eval_oldest();
+
+    // knob B (store cap): a .dcp store may own at most disk_max_store_size
+    // bytes; when it exceeds that, evict its own .dts sidecars first (they are
+    // the store's debt - dropping them lets the caller compact the .dcp) before
+    // the shared-pool pass below evicts foreign entries. the footprint is the
+    // .dcp+.dci plus the remaining own .dts, so the pass converges as the caller
+    // compacts after drop_evicted. only runs when the caller can consume the
+    // evicted fingerprints (else the states would leak in the store).
+    if (disk_max_store_size > 0 && evicted != nullptr && !own_dts.empty()) {
+        uint64_t own_foot = own_store;
+        for (const auto & dt : own_dts) {
+            own_foot += dt.size;
+        }
+        if (own_foot > disk_max_store_size) {
+            std::sort(own_dts.begin(), own_dts.end(), [](const pool_file & a, const pool_file & b) {
+                return a.mtime < b.mtime;
+            });
+            for (auto & dt : own_dts) {
+                if (own_foot <= disk_max_store_size) {
+                    break;
+                }
+                const uint64_t freed = evict_one(dt);
+                if (freed > 0) {
+                    own_foot -= freed;
+                    used     -= freed;
+                }
+            }
+            SRV_INF(" - disk prompt cache: store '%s' over cap (%.3f MiB > %.3f MiB), evicted %zu own .dts sidecars\n",
+                    own_dir.c_str(), own_foot / (1024.0 * 1024.0), disk_max_store_size / (1024.0 * 1024.0),
+                    std::count_if(own_dts.begin(), own_dts.end(), [&](const pool_file & f) { return !fs::exists(f.path); }));
+        }
+    }
 
     if (disk_max_size > 0 && used > disk_max_size) {
         for (auto & file : files) {
@@ -4285,8 +4417,11 @@ static void disk_write_meta_file(const std::string & dir, const std::string & fi
 // write the <fp>.dts store index for a chunk-store state. called after the
 // store batch commits, so a sidecar present always implies a durable state; a
 // failed sidecar only costs the entry at restore time (state stays on disk).
-// v2: the checkpoint section mirrors dpc_write_state so a store restore can
-// resume from the last checkpoint instead of re-processing the whole prompt.
+// v3 (current DTS_VERSION): only the 44-byte checkpoint metadata headers ride
+// in the sidecar - the payloads are REGION_CKPT chunks in the store, so the
+// sidecar stays tiny even for a full checkpoint set and the store batch is the
+// single source of dedup. a restored v3 state reassembles the payloads from
+// the trailing chunk ids.
 static void disk_write_token_index(const std::string & dir, const std::string & fp_hex,
                                    const llama_tokens & tokens, uint64_t len_main, uint64_t len_drft,
                                    const std::list<common_prompt_checkpoint> & checkpoints) {
@@ -4304,17 +4439,16 @@ static void disk_write_token_index(const std::string & dir, const std::string & 
     uint32_t n_ckpt = (uint32_t) std::min<size_t>(checkpoints.size(), DPC_MAX_CHECKPOINTS);
 
     // never let the checkpoint section push the volume full: measure what the
-    // section needs (via the shared codec, the same bytes the reader expects)
-    // and when free space cannot hold it (plus 64 MiB headroom) write the
-    // token-only v1 sidecar instead - restore degrades to a full re-prefill,
-    // the store batch itself is already committed at this point
-    const uint64_t ckpt_section = disk_ckpt_section_size(checkpoints, n_ckpt);
+    // meta-only section needs and when free space cannot hold it (plus 64 MiB
+    // headroom) write a v1 token-only sidecar instead - restore degrades to a
+    // full re-prefill, the store batch itself is already committed at this point
+    const uint64_t ckpt_section = disk_ckpt_meta_size(n_ckpt);
     uint32_t version = DTS_VERSION;
     if (ckpt_section > 0) {
         std::error_code ecs;
         const uint64_t free = fs::space(fs::path(dir), ecs).available;
         if (ecs || free < ckpt_section + 64ull * 1024 * 1024) {
-            SRV_WRN(" - disk prompt cache: %.3f MiB free cannot hold %zu MiB of checkpoints in '%s', writing v1 sidecar (no checkpoints)\n",
+            SRV_WRN(" - disk prompt cache: %.3f MiB free cannot hold %zu MiB of checkpoint metadata in '%s', writing v1 sidecar (no checkpoints)\n",
                     free / (1024.0 * 1024.0), ckpt_section / (1024 * 1024), fp_hex.c_str());
             version = 1;
             n_ckpt  = 0;
@@ -4332,10 +4466,9 @@ static void disk_write_token_index(const std::string & dir, const std::string & 
     ok = ok && fwrite(&n_ckpt,      4, 1, f) == 1;
     ok = ok && (n_tokens == 0 || fwrite(tokens.data(), sizeof(llama_token), n_tokens, f) == n_tokens);
 
-    // v2 only: the checkpoint section (shared codec with .dpc). the write-through
-    // copy carries full payloads (rehydrated, then spill-wiped in alloc())
+    // v3 only: the meta-only checkpoint section (44-byte headers, no payloads)
     if (version == DTS_VERSION) {
-        ok = ok && disk_write_ckpt_section(f, checkpoints, n_ckpt);
+        ok = ok && disk_write_ckpt_meta(f, checkpoints, n_ckpt);
     }
     fclose(f);
 
@@ -4437,7 +4570,8 @@ bool server_prompt_cache::disk_store_write(disk_write_job & job, const llama_tok
             return false;
         }
         std::vector<uint64_t> ids;
-        ids.reserve(slices.size() + drft_slices.size());
+        const uint32_t n_ckpt = (uint32_t) std::min<size_t>(state.prompt.checkpoints.size(), DPC_MAX_CHECKPOINTS);
+        ids.reserve(slices.size() + drft_slices.size() + disk_ckpt_chunk_count(n_ckpt, state.prompt.checkpoints));
         auto put_part = [&](const std::vector<state_blob_slice> & part, const uint8_t * blob) -> bool {
             for (const auto & sl : part) {
                 prompt_cache_chunk_store::chunk_key key;
@@ -4458,6 +4592,55 @@ bool server_prompt_cache::disk_store_write(disk_write_job & job, const llama_tok
             !put_part(drft_slices, state.data.drft.data())) {
             disk_store_->abort_commit();
             return false;
+        }
+
+        // checkpoint payloads dedup across consecutive states: store them as their
+        // own chunks (region REGION_CKPT) right after the draft ids. a checkpoint
+        // identical between consecutive states shares every id. the .dts v3
+        // sidecar then only has to list the metadata. layer packs the stream
+        // (0=tgt,1=dft,2=spec) and the sub-chunk ordinal. the key cannot derive
+        // lineage from the token chain: checkpoint payloads carry spec/beam/decoder
+        // state that is not a pure function of the tokens, so keyed dedup would
+        // alias a changed payload at the same span back to the stale chunk. key
+        // on a content tag of the tile instead: byte-identical tiles dedup,
+        // anything else gets its own chunk
+        uint32_t ckpt_i = 0;
+        for (const auto & ckpt : state.prompt.checkpoints) {
+            if (ckpt_i++ >= n_ckpt) {
+                break;
+            }
+
+            const uint32_t lo = ckpt.pos_min < 0 ? 0       : (uint32_t) ckpt.pos_min;
+            const uint32_t hi = ckpt.pos_max < 0 ? 0       : (uint32_t) ckpt.pos_max;
+
+            auto put_ckpt_stream = [&](uint32_t stream, const std::vector<uint8_t> & payload) -> bool {
+                for (uint64_t off = 0; off < payload.size(); off += prompt_cache_chunk_store::MAX_REC_LEN) {
+                    prompt_cache_chunk_store::chunk_key key;
+                    key.region        = prompt_cache_chunk_store::REGION_CKPT;
+                    key.layer         = (uint16_t) (stream << 10 | (uint32_t) (off / prompt_cache_chunk_store::MAX_REC_LEN));
+                    key.cell_lo       = lo;
+                    key.cell_hi       = hi;
+                    const uint64_t len = std::min<uint64_t>(prompt_cache_chunk_store::MAX_REC_LEN, payload.size() - off);
+                    uint8_t tag[32];
+                    dpc_sha256_raw(payload.data() + off, len, tag);
+                    // fold the whole digest so the epoch is a real content tag;
+                    // collisions are then a 128-bit-equivalent identity decision
+                    key.lineage_epoch = cc_io::get_u64(tag)       ^ cc_io::get_u64(tag + 8) ^
+                                        cc_io::get_u64(tag + 16)  ^ cc_io::get_u64(tag + 24);
+                    const int64_t id = disk_store_->put_chunk(key, payload.data() + off, len);
+                    if (id < 0) {
+                        return false;
+                    }
+                    ids.push_back((uint64_t) id);
+                }
+                return true;
+            };
+            if (!put_ckpt_stream(0, ckpt.data_tgt) ||
+                !put_ckpt_stream(1, ckpt.data_dft) ||
+                !put_ckpt_stream(2, ckpt.data_spec)) {
+                disk_store_->abort_commit();
+                return false;
+            }
         }
 
         // never commit when the appended bytes would push the volume full
@@ -4816,8 +4999,9 @@ bool server_prompt_cache::load_from_disk_tier(server_prompt & prompt, const serv
             // store-backed entry: the KV lives in cache.dcp as lineage-chained
             // cells. reassemble the blob from its chunks; a fresh full restore
             // starts at position 0 and reuses via LCP. v1 sidecars are token-only
-            // (n_ckpt is always 0); v2 appends the checkpoint section so the
-            // restore can resume from the last checkpoint instead of re-processing.
+            // (n_ckpt is always 0); v2 appends the checkpoint payloads; v3 keeps
+            // only the 44-byte checkpoint metadata headers and reassembles the
+            // payloads from the REGION_CKPT chunks trailing the main/draft ids.
             if (ok && magic == DTS_MAGIC) {
                 uint32_t n_tokens = 0;
                 uint64_t len_main = 0;
@@ -4826,14 +5010,16 @@ bool server_prompt_cache::load_from_disk_tier(server_prompt & prompt, const serv
 
                 ok = fread(&n_tokens, 4, 1, f) == 1 && fread(&len_main, 8, 1, f) == 1 &&
                      fread(&len_drft, 8, 1, f) == 1 && fread(&n_ckpt, 4, 1, f) == 1 &&
-                     (version == DTS_VERSION || version == 1) &&
+                     (version == DTS_VERSION || version == 2 || version == 1) &&
                      n_tokens <= DPC_MAX_TOKENS && n_ckpt <= DPC_MAX_CHECKPOINTS;
 
                 llama_tokens dts_tokens(n_tokens);
                 ok = ok && (n_tokens == 0 || fread(dts_tokens.data(), sizeof(llama_token), n_tokens, f) == n_tokens);
 
-                // v2 carries the checkpoint section right after the tokens
+                // v3 = metadata headers only; v2 = full checkpoint payloads
                 if (ok && version == DTS_VERSION) {
+                    ok = disk_read_ckpt_meta(f, n_ckpt, state.prompt.checkpoints);
+                } else if (ok && version == 2) {
                     ok = disk_read_ckpt_section(f, n_ckpt, state.prompt.checkpoints);
                 }
                 fclose(f);
@@ -4879,15 +5065,20 @@ bool server_prompt_cache::load_from_disk_tier(server_prompt & prompt, const serv
                 }
 
                 // chunk ids list the slices in the order they were written
-                // (disk_store_write): main first, then draft. the sidecar's
-                // len_main/len_drft carry the split; a (0,0) pair reads as a
-                // legacy pre-split entry (all main)
+                // (disk_store_write): main, then draft, then (v3 only) the
+                // REGION_CKPT chunks for the checkpoints in sidecar order. the
+                // sidecar's len_main/len_drft carry the main/draft split; a
+                // (0,0) pair reads as a legacy pre-split entry (all main)
                 {
                     const uint64_t total = (uint64_t) st.chunks.size();
                     const bool legacy = (len_main == 0 && len_drft == 0);
                     const uint64_t n_main = legacy ? total : len_main;
                     const uint64_t n_drft = legacy ? 0 : len_drft;
-                    if (n_main + n_drft != total) {
+                    // v3: the trailing chunk ids must match, in sidecar order,
+                    // the expected REGION_CKPT count for the checkpoint payloads
+                    const uint64_t n_ckpt_ids = version == DTS_VERSION
+                        ? disk_ckpt_chunk_count(n_ckpt, state.prompt.checkpoints) : 0;
+                    if (n_main + n_drft + n_ckpt_ids != total) {
                         SRV_ERR("failed to load prompt state from disk ('%s'): split mismatch\n", best_fname.c_str());
                         return false;
                     }
@@ -4902,13 +5093,46 @@ bool server_prompt_cache::load_from_disk_tier(server_prompt & prompt, const serv
                             }
                             state.data.main.insert(state.data.main.end(), cell.begin(), cell.end());
                         }
-                        for (uint64_t i = n_main; i < total; ++i) {
+                        for (uint64_t i = n_main; i < n_main + n_drft; ++i) {
                             std::vector<uint8_t> cell;
                             if (!disk_store_->get_chunk(st.chunks[i], cell)) {
                                 SRV_ERR("failed to restore draft chunk %llu for '%s'\n", (unsigned long long) st.chunks[i], best_fname.c_str());
                                 return false;
                             }
                             state.data.drft.insert(state.data.drft.end(), cell.begin(), cell.end());
+                        }
+                        // v3: reassemble each checkpoint stream from its
+                        // REGION_CKPT chunks (written in stream order 0,1,2,
+                        // each tiled at MAX_REC_LEN). the meta reader sized the
+                        // payload vectors, so a full pass must reproduce them
+                        // byte-for-byte; append into the resized buffers via a
+                        // write cursor rather than re-inserting
+                        if (version == DTS_VERSION && n_ckpt_ids > 0) {
+                            uint64_t id_i = n_main + n_drft;
+                            for (auto & ckpt : state.prompt.checkpoints) {
+                                std::vector<uint8_t> * streams[3] = { &ckpt.data_tgt, &ckpt.data_dft, &ckpt.data_spec };
+                                for (auto * stream : streams) {
+                                    uint64_t off = 0;
+                                    while (off < stream->size() && id_i < total) {
+                                        std::vector<uint8_t> cell;
+                                        if (!disk_store_->get_chunk(st.chunks[id_i++], cell)) {
+                                            SRV_ERR("failed to restore checkpoint chunk %llu for '%s'\n",
+                                                    (unsigned long long) st.chunks[0], best_fname.c_str());
+                                            return false;
+                                        }
+                                        memcpy(stream->data() + off, cell.data(), cell.size());
+                                        off += cell.size();
+                                    }
+                                    if (off != stream->size()) {
+                                        SRV_ERR("failed to restore prompt state from disk ('%s'): checkpoint stream underfilled\n", best_fname.c_str());
+                                        return false;
+                                    }
+                                }
+                            }
+                            if (id_i != total) {
+                                SRV_ERR("failed to restore prompt state from disk ('%s'): checkpoint chunks overrun\n", best_fname.c_str());
+                                return false;
+                            }
                         }
                     } catch (const std::bad_alloc & e) {
                         SRV_ERR("failed to allocate memory for prompt state from disk ('%s'): %s\n", best_fname.c_str(), e.what());
@@ -5102,7 +5326,7 @@ size_t server_prompt_cache::load_disk_index(const std::string & dir, const std::
             fread(&n_tokens, 4, 1, f) == 1 && fread(&len_main, 8, 1, f) == 1 &&
             fread(&len_drft, 8, 1, f) == 1 && fread(&n_ckpt, 4, 1, f) == 1 &&
             (magic == DPC_MAGIC ? (version == DPC_VERSION || version == 2 || version == 1)
-                                : (magic == DTS_MAGIC && version == DTS_VERSION)) &&
+                                : (magic == DTS_MAGIC && (version == DTS_VERSION || version == 2 || version == 1))) &&
             n_tokens <= DPC_MAX_TOKENS && n_ckpt <= DPC_MAX_CHECKPOINTS;
 
         llama_tokens tokens(n_tokens);

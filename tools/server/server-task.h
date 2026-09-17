@@ -679,7 +679,7 @@ class prompt_cache_chunk_store {
 public:
     static constexpr uint32_t DCP_MAGIC   = 0x54514331; // "TQC1"
     static constexpr uint32_t DCI_MAGIC   = 0x31494344; // "DCI1"
-    static constexpr uint32_t FORMAT_VER  = 1;
+    static constexpr uint32_t FORMAT_VER  = 2;
 
     // TURBO_DISK_CHUNK_STORE=0 disables the store entirely (legacy .dpc writer,
     // one-pass rollback prune of store files at boot). read once per process.
@@ -697,6 +697,19 @@ public:
         REGION_HEADER   = 3,
         REGION_TAIL     = 4,
         REGION_DRAFT    = 5,
+
+        // draft regions live at [draft_base + main_region]; must not collide
+        REGION_DRAFT_BASE = 6,
+
+        // checkpoint payload chunks (C8). stored like draft slices but with
+        // their own region so the dedup oracle sees a distinct key space.
+        // layer packs stream (0=tgt,1=dft,2=spec) into bits [12:10] and the
+        // sub-chunk ordinal (up to 64 chunks for a MAX_REC_LEN max payload)
+        // into bits [9:0]; cell_lo/cell_hi carry pos_min/pos_max and the
+        // lineage is the cell containing pos_max.
+        REGION_CKPT     = 10,
+
+        REGION_COUNT,
     };
 
     // identity of a chunk sheet; the dedup oracle matches on all fields
@@ -850,12 +863,15 @@ namespace cc_io {
 //         token ids, main/drft blobs, checkpoint section.
 // .dts  = store index: same header shape as .dpc but len_main/len_drft are
 //         chunk-id splits (always stored), the KV lives in cache.dcp. v1 is
-//         token-only (n_ckpt always 0); v2 appends the checkpoint section so a
-//         store restore can jump to its last checkpoint instead of re-processing.
+//         token-only (n_ckpt always 0); v2 appends the checkpoint section
+//         payloads so a store restore can jump to its last checkpoint. v3
+//         writes only the 44-byte checkpoint metadata headers (the payloads
+//         live as REGION_CKPT chunks in the store, one chunk sheet per
+//         stream), which is what dedups them across consecutive states.
 constexpr uint32_t DPC_MAGIC   = 0x31435044; // "DPC1"
 constexpr uint32_t DPC_VERSION = 3;
 constexpr uint32_t DTS_MAGIC   = 0x31535444; // "DTS1"
-constexpr uint32_t DTS_VERSION = 2;
+constexpr uint32_t DTS_VERSION = 3;
 constexpr uint32_t DPC_MAX_TOKENS = 1u << 24;
 constexpr uint32_t DPC_MAX_CHECKPOINTS = 1024;
 
@@ -865,6 +881,19 @@ constexpr uint32_t DPC_MAX_CHECKPOINTS = 1024;
 bool disk_write_ckpt_section(FILE * f, const std::list<common_prompt_checkpoint> & checkpoints, uint32_t n_ckpt);
 bool disk_read_ckpt_section(FILE * f, uint32_t n_ckpt, std::list<common_prompt_checkpoint> & checkpoints);
 uint64_t disk_ckpt_section_size(const std::list<common_prompt_checkpoint> & checkpoints, uint32_t n_ckpt);
+
+// metadata-only checkpoint section (.dts v3): the record headers without the
+// payload bytes. the reader restores the payloads from REGION_CKPT chunks in
+// the store, so it derives the expected lengths from these headers. sizes are
+// exactly 44 bytes per checkpoint regardless of payload size.
+bool disk_write_ckpt_meta(FILE * f, const std::list<common_prompt_checkpoint> & checkpoints, uint32_t n_ckpt);
+bool disk_read_ckpt_meta(FILE * f, uint32_t n_ckpt, std::list<common_prompt_checkpoint> & checkpoints);
+uint64_t disk_ckpt_meta_size(uint32_t n_ckpt);
+
+// number of REGION_CKPT chunks the first n_ckpt checkpoints split into (each
+// stream tiled at MAX_REC_LEN). the writer sizes its batch reserve with this
+// and the restore validates the trailing chunk count against it.
+uint64_t disk_ckpt_chunk_count(uint32_t n_ckpt, const std::list<common_prompt_checkpoint> & checkpoints);
 
 struct server_prompt_cache_state {
     server_prompt prompt;
@@ -882,10 +911,15 @@ struct server_prompt_cache_state {
 };
 
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, size_t disk_max_mib = 0) {
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, size_t disk_max_mib = 0, size_t disk_store_mib = 0) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
         this->disk_max_size = 1024ull*1024ull*disk_max_mib;
+        // knob B: a .dcp store may use at most this many bytes before prune_pool
+        // evicts its own .dts sidecars first. defaults to 60% of the pool budget;
+        // 0 disables the store-cap pass (only the shared-pool budget applies).
+        this->disk_max_store_size = disk_store_mib > 0 ? 1024ull*1024ull*disk_store_mib
+                                                       : (this->disk_max_size * 6) / 10;
     }
 
     std::list<server_prompt_cache_state> states;
@@ -911,6 +945,10 @@ struct server_prompt_cache {
 
     // in bytes, 0 = no limit
     size_t disk_max_size = 0;
+
+    // knob B: bytes a .dcp store may use before prune_pool evicts its own
+    // .dts sidecars first (defaults to 60% of disk_max_size); 0 = no store-cap
+    size_t disk_max_store_size = 0;
 
     std::vector<disk_entry> disk_entries;
     bool disk_index_valid = false;

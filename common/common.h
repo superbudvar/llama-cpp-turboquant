@@ -677,6 +677,7 @@ struct common_params {
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     std::string cache_disk_path = "";    // persist the prompt cache to disk (requires cache_ram_mib != 0)
     int32_t cache_disk_max_mib  = 16384; // max size of the disk prompt cache in MiB, 0 = no limit (independent of cache_ram_mib)
+    int32_t cache_disk_max_store_mib = 0; // .dcp chunk store cap in MiB, 0 = default 60% of cache_disk_max_mib
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT

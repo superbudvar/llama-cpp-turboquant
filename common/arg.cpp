@@ -1705,6 +1705,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_MAX").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--cache-disk-max-store"}, "N",
+        string_format("set the maximum .dcp chunk-store size in MiB (default: 0 = 60%% of --cache-disk-max, 0 - no limit).\n"
+            "when the store exceeds the cap, prune_pool evicts its own .dts sidecars first\n"
+            "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_disk_max_store_mib),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("cache-disk-max-store must be non-negative");
+            }
+            params.cache_disk_max_store_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_MAX_STORE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",
