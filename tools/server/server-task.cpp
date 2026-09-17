@@ -1961,13 +1961,13 @@ void server_prompt_cache::update() {
 constexpr uint32_t DPC_MAGIC   = 0x31435044; // "DPC1"
 constexpr uint32_t DPC_VERSION = 3;
 
-// token-only state index: same header shape as DPC but len_main/len_drft/n_ckpt
-// are always zero. the KV lives in cache.dcp as lineage-chained cells; the .dts
-// sidecar exists only so boot-time load_disk_index can build a restore candidate
-// without scanning the store log. a distinct magic means a legacy reader can
-// never mistake it for a full state.
+// store-state index: same header shape as DPC but len_main/len_drft are always
+// zero (the KV lives in cache.dcp as lineage-chained cells). v1 was token-only;
+// v2 appends the checkpoint section (mirror of dpc_write_state) so a store
+// restore can jump to its last checkpoint instead of re-processing the prompt.
+// a distinct magic means a legacy reader can never mistake it for a full state.
 constexpr uint32_t DTS_MAGIC   = 0x31535444; // "DTS1"
-constexpr uint32_t DTS_VERSION = 1;
+constexpr uint32_t DTS_VERSION = 2;
 constexpr uint32_t DPC_MAX_TOKENS = 1u << 24;
 constexpr uint32_t DPC_MAX_CHECKPOINTS = 1024;
 
@@ -4075,7 +4075,7 @@ void server_prompt_cache::prune_pool(const std::string & root, const std::string
             if (f) {
                 uint32_t magic = 0, version = 0, n_tokens = 0;
                 if (fread(&magic, 4, 1, f) == 1 && magic == DTS_MAGIC &&
-                    fread(&version, 4, 1, f) == 1 && version == DTS_VERSION &&
+                    fread(&version, 4, 1, f) == 1 && (version == DTS_VERSION || version == 1) &&
                     fread(&n_tokens, 4, 1, f) == 1 && n_tokens > 0 && n_tokens <= 131072) {
                         // skip len_main(8) + len_drft(8) + n_ckpt(4) = 20 bytes
                         fseek(f, 20, SEEK_CUR);
@@ -4246,11 +4246,14 @@ static void disk_write_meta_file(const std::string & dir, const std::string & fi
     }
 }
 
-// write the <fp>.dts token-only index for a chunk-store state. called after the
+// write the <fp>.dts store index for a chunk-store state. called after the
 // store batch commits, so a sidecar present always implies a durable state; a
 // failed sidecar only costs the entry at restore time (state stays on disk).
+// v2: the checkpoint section mirrors dpc_write_state so a store restore can
+// resume from the last checkpoint instead of re-processing the whole prompt.
 static void disk_write_token_index(const std::string & dir, const std::string & fp_hex,
-                                   const llama_tokens & tokens, uint64_t len_main, uint64_t len_drft) {
+                                   const llama_tokens & tokens, uint64_t len_main, uint64_t len_drft,
+                                   const std::list<common_prompt_checkpoint> & checkpoints) {
     namespace fs = std::filesystem;
     const std::string dts_path = (fs::path(dir) / (fp_hex + ".dts")).string();
     const std::string dts_tmp  = dts_path + ".tmp";
@@ -4262,18 +4265,71 @@ static void disk_write_token_index(const std::string & dir, const std::string & 
     }
 
     const uint32_t n_tokens = (uint32_t) tokens.size();
-    const uint32_t n_ckpt   = 0;
+    uint32_t n_ckpt = (uint32_t) std::min<size_t>(checkpoints.size(), DPC_MAX_CHECKPOINTS);
+
+    // never let the checkpoint section push the volume full: measure what the
+    // section needs, and when free space cannot hold it (plus 64 MiB headroom)
+    // write the token-only v1 sidecar instead - restore degrades to a full
+    // re-prefill, the store batch itself is already committed at this point
+    uint64_t ckpt_section = 0;
+    {
+        uint32_t i = 0;
+        for (const auto & ckpt : checkpoints) {
+            if (i++ >= n_ckpt) {
+                break;
+            }
+            ckpt_section += 48 + ckpt.data_tgt.size() + ckpt.data_dft.size() + ckpt.data_spec.size();
+        }
+    }
+    uint32_t version = DTS_VERSION;
+    if (ckpt_section > 0) {
+        std::error_code ecs;
+        const uint64_t free = fs::space(fs::path(dir), ecs).available;
+        if (ecs || free < ckpt_section + 64ull * 1024 * 1024) {
+            SRV_WRN(" - disk prompt cache: %.3f MiB free cannot hold %zu MiB of checkpoints in '%s', writing v1 sidecar (no checkpoints)\n",
+                    free / (1024.0 * 1024.0), ckpt_section / (1024 * 1024), fp_hex.c_str());
+            version = 1;
+            n_ckpt  = 0;
+        }
+    }
 
     // len_* fields carry the chunk-id split in store order: the first len_main
     // ids reassemble the main blob, the following len_drft reassemble the draft
     // blob. a (0,0) pair reads as a legacy pre-split entry (all main chunks)
     bool ok = fwrite(&DTS_MAGIC,   4, 1, f) == 1;
-    ok = ok && fwrite(&DTS_VERSION, 4, 1, f) == 1;
+    ok = ok && fwrite(&version,     4, 1, f) == 1;
     ok = ok && fwrite(&n_tokens,    4, 1, f) == 1;
     ok = ok && fwrite(&len_main,    8, 1, f) == 1;
     ok = ok && fwrite(&len_drft,    8, 1, f) == 1;
     ok = ok && fwrite(&n_ckpt,      4, 1, f) == 1;
     ok = ok && (n_tokens == 0 || fwrite(tokens.data(), sizeof(llama_token), n_tokens, f) == n_tokens);
+
+    // mirror of the dpc_write_state per-checkpoint record; the write-through
+    // copy carries full payloads (rehydrated, then spill-wiped in alloc())
+    uint32_t i = 0;
+    for (const auto & ckpt : checkpoints) {
+        if (version == 1 || i++ >= n_ckpt) {
+            break;
+        }
+        const int64_t  ck_tokens = ckpt.n_tokens;
+        const int32_t  id_task   = ckpt.id_task;
+        const int32_t  pos_min   = ckpt.pos_min;
+        const int32_t  pos_max   = ckpt.pos_max;
+        const uint64_t len_tgt   = ckpt.data_tgt.size();
+        const uint64_t len_dft   = ckpt.data_dft.size();
+        const uint64_t len_spec  = ckpt.data_spec.size();
+
+        ok = ok && fwrite(&ck_tokens, 8, 1, f) == 1;
+        ok = ok && fwrite(&id_task,   4, 1, f) == 1;
+        ok = ok && fwrite(&pos_min,   4, 1, f) == 1;
+        ok = ok && fwrite(&pos_max,   4, 1, f) == 1;
+        ok = ok && fwrite(&len_tgt,   8, 1, f) == 1;
+        ok = ok && fwrite(&len_dft,   8, 1, f) == 1;
+        ok = ok && fwrite(&len_spec,  8, 1, f) == 1;
+        ok = ok && (len_tgt == 0 || fwrite(ckpt.data_tgt.data(),  1, len_tgt,  f) == len_tgt);
+        ok = ok && (len_dft == 0 || fwrite(ckpt.data_dft.data(),  1, len_dft,  f) == len_dft);
+        ok = ok && (len_spec == 0 || fwrite(ckpt.data_spec.data(), 1, len_spec, f) == len_spec);
+    }
     fclose(f);
 
     if (!ok) {
@@ -4439,12 +4495,13 @@ bool server_prompt_cache::disk_store_write(disk_write_job & job, const llama_tok
 
     disk_write_meta_file(job.dir, job.fingerprint);
 
-    // token-only index so a later boot can build a restore candidate for this
+    // store index so a later boot can build a restore candidate for this
     // state without scanning the store log. the split (main vs draft chunk ids)
     // rides in the sidecar's len_* fields: a (0,0) pair means a legacy pre-split
-    // entry whose chunks are all main
+    // entry whose chunks are all main. v2 appends the checkpoints so a store
+    // restore can resume instead of re-processing the whole prompt.
     disk_write_token_index(job.dir, dpc_sha256_hex((const uint8_t *) tokens.data(), tokens.size() * sizeof(llama_token)),
-                           tokens, slices.size(), drft_slices.size());
+                           tokens, slices.size(), drft_slices.size(), state.prompt.checkpoints);
 
     const size_t state_bytes = state.size();
     SRV_INF(" - disk prompt cache: wrote through state '%zu' tokens to chunk store (%.3f MiB, %zu + %zu slices)\n",
@@ -4499,6 +4556,21 @@ void server_prompt_cache::disk_run_state_job(disk_write_job & job) {
     // write; an unslicable blob or a failed batch keeps the legacy writer below
     // (its own disk-full guard then decides)
     if (disk_store_write(job, tokens)) {
+        // register the new .dts sidecar so load_from_disk_tier can match it
+        // without waiting for a restart (load_disk_index only runs at boot)
+        {
+            const std::string fp_hex = dpc_sha256_hex((const uint8_t *) tokens.data(), tokens.size() * sizeof(llama_token));
+            const std::string fname  = fp_hex + ".dts";
+            const std::string fpath  = (fs::path(dir) / fname).string();
+            std::error_code ec_size;
+            const auto sz = fs::file_size(fpath, ec_size);
+            if (!ec_size) {
+                std::lock_guard<std::mutex> lock(disk_index_mtx_);
+                disk_entries.push_back({ fname, fpath, server_tokens(tokens, false), (size_t) sz });
+                disk_index_valid = true;
+            }
+        }
+
         // enforce pool budget after a store write; track .dts evictions so the
         // chunk store can drop the corresponding states
         std::vector<std::array<uint8_t, 32>> evicted;
@@ -4510,6 +4582,17 @@ void server_prompt_cache::disk_run_state_job(disk_write_job & job) {
                 disk_store_->compact_if_stale();
             }
         }
+
+        // keep the in-memory index in sync after prune
+        {
+            std::error_code ec_x;
+            std::lock_guard<std::mutex> lock(disk_index_mtx_);
+            disk_entries.erase(
+                std::remove_if(disk_entries.begin(), disk_entries.end(),
+                    [&](const disk_entry & e) { return !fs::exists(e.path, ec_x); }),
+                disk_entries.end());
+        }
+
         return;
     }
 
@@ -4645,6 +4728,7 @@ bool server_prompt_cache::load_from_disk_tier(server_prompt & prompt, const serv
     while (true) {
         std::string best_path;
         std::string best_fname;
+        bool restored_from_store = false; // set when reassembled from cache.dcp chunks
         float f_keep_best = 0.0f;
         float f_sim_best  = 0.0f;
 
@@ -4724,8 +4808,9 @@ bool server_prompt_cache::load_from_disk_tier(server_prompt & prompt, const serv
 
             // store-backed entry: the KV lives in cache.dcp as lineage-chained
             // cells. reassemble the blob from its chunks; a fresh full restore
-            // starts at position 0 and reuses via LCP, so the token-only sidecar
-            // needs no checkpoints
+            // starts at position 0 and reuses via LCP. v1 sidecars are token-only
+            // (n_ckpt is always 0); v2 appends the checkpoint section so the
+            // restore can resume from the last checkpoint instead of re-processing.
             if (ok && magic == DTS_MAGIC) {
                 uint32_t n_tokens = 0;
                 uint64_t len_main = 0;
@@ -4734,10 +4819,41 @@ bool server_prompt_cache::load_from_disk_tier(server_prompt & prompt, const serv
 
                 ok = fread(&n_tokens, 4, 1, f) == 1 && fread(&len_main, 8, 1, f) == 1 &&
                      fread(&len_drft, 8, 1, f) == 1 && fread(&n_ckpt, 4, 1, f) == 1 &&
-                     version == DTS_VERSION && n_tokens <= DPC_MAX_TOKENS && n_ckpt == 0;
+                     (version == DTS_VERSION || version == 1) &&
+                     n_tokens <= DPC_MAX_TOKENS && n_ckpt <= DPC_MAX_CHECKPOINTS;
 
                 llama_tokens dts_tokens(n_tokens);
                 ok = ok && (n_tokens == 0 || fread(dts_tokens.data(), sizeof(llama_token), n_tokens, f) == n_tokens);
+
+                // v2 carries the checkpoint section right after the tokens
+                if (ok && version == DTS_VERSION) {
+                    for (uint32_t i = 0; ok && i < n_ckpt; ++i) {
+                        auto & ckpt = state.prompt.checkpoints.emplace_back();
+
+                        uint64_t len_tgt  = 0;
+                        uint64_t len_dft  = 0;
+                        uint64_t len_spec = 0;
+
+                        ok = ok && fread(&ckpt.n_tokens, 8, 1, f) == 1 &&
+                              fread(&ckpt.id_task, 4, 1, f) == 1 &&
+                              fread(&ckpt.pos_min, 4, 1, f) == 1 &&
+                              fread(&ckpt.pos_max, 4, 1, f) == 1 &&
+                              fread(&len_tgt, 8, 1, f) == 1 &&
+                              fread(&len_dft, 8, 1, f) == 1 &&
+                              fread(&len_spec, 8, 1, f) == 1;
+
+                        ok = ok && len_tgt <= (1ull << 34) && len_dft <= (1ull << 34) && len_spec <= (1ull << 34);
+
+                        if (ok) {
+                            ckpt.data_tgt.resize(len_tgt);
+                            ckpt.data_dft.resize(len_dft);
+                            ckpt.data_spec.resize(len_spec);
+                            ok = ok && (len_tgt == 0  || fread(ckpt.data_tgt.data(),  1, len_tgt,  f) == len_tgt);
+                            ok = ok && (len_dft == 0  || fread(ckpt.data_dft.data(),  1, len_dft,  f) == len_dft);
+                            ok = ok && (len_spec == 0 || fread(ckpt.data_spec.data(), 1, len_spec, f) == len_spec);
+                        }
+                    }
+                }
                 fclose(f);
 
                 if (!ok) {
@@ -4816,8 +4932,56 @@ bool server_prompt_cache::load_from_disk_tier(server_prompt & prompt, const serv
                         SRV_ERR("failed to allocate memory for prompt state from disk ('%s'): %s\n", best_fname.c_str(), e.what());
                         return false;
                     }
+
+                    // a compact can renumber chunk ids while the get_chunk loops
+                    // above ran; the captured list would then reassemble a
+                    // wrong-but-valid blob. re-fetch the state and confirm the id
+                    // list is unchanged, then re-walk both blobs with the same
+                    // strict pos==i contract the writer used before restore_state
+                    // feeds them to the memory
+                    {
+                        prompt_cache_chunk_store::state_ref st_now;
+                        const bool present = disk_store_->get_state(fp, st_now);
+                        bool same_ids = present && st_now.n_tokens == st.n_tokens &&
+                                        st_now.chunks.size() == st.chunks.size();
+                        if (same_ids) {
+                            for (size_t i = 0; i < st.chunks.size() && same_ids; ++i) {
+                                same_ids = st.chunks[i] == st_now.chunks[i];
+                            }
+                        }
+
+                        std::vector<state_blob_slice> chk;
+                        const bool main_ok = slice_state_blob(state.data.main.data(), state.data.main.size(),
+                                                              (size_t) dts_tokens.size(), chk);
+                        bool drft_ok = true;
+                        if (!legacy && n_drft > 0) {
+                            const uint32_t drft_cells = state.data.drft.size() >= 16
+                                ? cc_io::get_u32(state.data.drft.data() + 12) : 0;
+                            std::vector<state_blob_slice> chk_d;
+                            drft_ok = drft_cells > 0 && drft_cells <= (uint32_t) dts_tokens.size() &&
+                                      slice_state_blob(state.data.drft.data(), state.data.drft.size(), drft_cells, chk_d,
+                                                       (uint8_t) prompt_cache_chunk_store::REGION_DRAFT);
+                        }
+
+                        if (present && !same_ids) {
+                            // ids remapped while restoring: retry against the
+                            // fresh id list instead of dropping a live entry
+                            SRV_WRN(" - disk prompt cache: entry '%s' churn detected during restore (gen %llu, %zu -> %zu ids), retrying\n",
+                                    best_fname.c_str(), (unsigned long long) disk_store_->generation(),
+                                    st.chunks.size(), st_now.chunks.size());
+                            continue;
+                        }
+                        if (!main_ok || !drft_ok) {
+                            SRV_ERR(" - disk prompt cache: entry '%s' failed blob self-check (gen %llu, main_ok=%d, drft_ok=%d), dropping stale entry\n",
+                                    best_fname.c_str(), (unsigned long long) disk_store_->generation(),
+                                    (int) main_ok, (int) drft_ok);
+                            drop_stale();
+                            continue;
+                        }
+                    }
                 }
                 state.prompt.tokens = server_tokens(dts_tokens, false);
+                restored_from_store = true;
             } else {
                 ok = ok && (magic == DPC_MAGIC && (version == DPC_VERSION || version == 2 || version == 1)) && dpc_read_state(f, version, state);
                 fclose(f);
@@ -4853,6 +5017,16 @@ bool server_prompt_cache::load_from_disk_tier(server_prompt & prompt, const serv
             }
 
             SRV_INF(" - disk prompt cache: restored entry '%s' directly from disk (%.3f MiB, RAM budget exhausted)\n", best_fname.c_str(), state_bytes / (1024.0 * 1024.0));
+        }
+
+        if (restored_from_store) {
+            // probe the memory right after a chunk-store restore: a pos_min at
+            // the threshold suggests the reassembled blob carried wrong cells,
+            // while a healthy pos_min points at post-restore corruption
+            const llama_pos p_attn = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), id_slot);
+            const llama_pos p_drft = ctx_dft ? llama_memory_seq_pos_min(llama_get_memory(ctx_dft), id_slot) : -1;
+            SRV_TRC(" - disk prompt cache: store-restored '%s' attn pos_min = %d, drft pos_min = %d\n",
+                    best_fname.c_str(), (int) p_attn, (int) p_drft);
         }
 
         // successful restore refreshes the LRU order so the prune prefers cold entries
