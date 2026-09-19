@@ -397,7 +397,9 @@ static common_fit_analysis fit_analyze(
     // n_layer_all + 1 slots regardless of load_mtp, and a skipped in-file MTP
     // block still occupies its layer slot. count nextn unconditionally here.
     // memory-side accounting (the probe) derives its own gated count.
-    hp_ngl = llama_model_n_layer(model.get()) + llama_model_n_layer_nextn(model.get());
+    const uint32_t loader_ngl = llama_model_n_layer(model.get()) + llama_model_n_layer_nextn(model.get());
+    analysis.loader_ngl = loader_ngl;
+    hp_ngl = loader_ngl;
 
     return analysis;
 }
@@ -414,7 +416,7 @@ struct fit_candidate_spec {
 static common_fit_plan fit_plan_from_spec(
         const common_fit_analysis & analysis,
         const fit_candidate_spec & spec,
-        uint32_t hp_ngl,
+        uint32_t loader_ngl,
         int32_t n_ctx,
         float rpc_frac_override = -1.0f,
         int32_t ngl_override = -1) {
@@ -447,7 +449,7 @@ static common_fit_plan fit_plan_from_spec(
         }
     }
 
-    plan.n_gpu_layers = (ngl_override >= 0) ? ngl_override : (int32_t) (hp_ngl + 1);
+    plan.n_gpu_layers = (ngl_override >= 0) ? ngl_override : (int32_t) (loader_ngl + 1);
     plan.n_ctx = n_ctx;
 
     // tensor_split: distribute the FULL model across split devices, proportional
@@ -529,7 +531,7 @@ static int32_t fit_grow_context(
         const common_fit_probe & decode_probe,
         const fit_candidate_spec & spec,
         float rpc_frac_override,
-        uint32_t hp_ngl,
+        uint32_t loader_ngl,
         const std::string & path_model,
         common_fit_plan & out_plan,
         fit_measure_result & out_measure,
@@ -554,7 +556,7 @@ static int32_t fit_grow_context(
     };
 
     // the floor (minimum context) must fit, otherwise this placement is infeasible
-    common_fit_plan plan_lo = fit_plan_from_spec(analysis, spec, hp_ngl, target_ctx, rpc_frac_override, ngl_override);
+    common_fit_plan plan_lo = fit_plan_from_spec(analysis, spec, loader_ngl, target_ctx, rpc_frac_override, ngl_override);
     fit_measure_result m_lo;
     if (!fits(plan_lo, m_lo)) {
         return -1;
@@ -570,7 +572,7 @@ static int32_t fit_grow_context(
     }
 
     // if the upper bound already fits there is nothing to search
-    common_fit_plan plan_hi = fit_plan_from_spec(analysis, spec, hp_ngl, hi, rpc_frac_override, ngl_override);
+    common_fit_plan plan_hi = fit_plan_from_spec(analysis, spec, loader_ngl, hi, rpc_frac_override, ngl_override);
     fit_measure_result m_hi;
     if (fits(plan_hi, m_hi)) {
         out_plan = plan_hi;
@@ -587,7 +589,7 @@ static int32_t fit_grow_context(
         int32_t mid = lo + (hi - lo) / 2;
         mid -= mid % 256;
         if (mid <= lo) mid = lo + 256;
-        common_fit_plan pm = fit_plan_from_spec(analysis, spec, hp_ngl, mid, rpc_frac_override, ngl_override);
+        common_fit_plan pm = fit_plan_from_spec(analysis, spec, loader_ngl, mid, rpc_frac_override, ngl_override);
         fit_measure_result mm;
         if (fits(pm, mm)) {
             lo = mid;
@@ -620,7 +622,7 @@ static int32_t fit_spill_split_at_ngl(
         llama_context_params * cparams,
         const common_fit_probe & probe,
         const fit_candidate_spec & spec,
-        uint32_t hp_ngl,
+        uint32_t loader_ngl,
         const std::string & path_model,
         int32_t ngl,
         float scan_hi,
@@ -645,7 +647,7 @@ static int32_t fit_spill_split_at_ngl(
     // overflows RPC.
     for (float f = scan_hi; f >= -step * 0.5f; f -= step) {
         if (f < 0.0f) { f = 0.0f; }
-        common_fit_plan plan = fit_plan_from_spec(analysis, spec, hp_ngl, min_ctx, f, ngl);
+        common_fit_plan plan = fit_plan_from_spec(analysis, spec, loader_ngl, min_ctx, f, ngl);
         fit_measure_result m;
         const bool ok_measure = fit_measure_plan(probe, plan, mparams, cparams, path_model, m);
         const bool ok_devs    = ok_measure && fit_same_devices(m.devs, analysis);
@@ -682,7 +684,7 @@ static int32_t fit_spill_split_at_ngl(
         if (have_lo && have_hi) {
             for (int it = 0; it < 13 && f_hi - f_lo > 1e-4f; it++) {
                 const float fm = (f_lo + f_hi) * 0.5f;
-                common_fit_plan plan = fit_plan_from_spec(analysis, spec, hp_ngl, min_ctx, fm, ngl);
+                common_fit_plan plan = fit_plan_from_spec(analysis, spec, loader_ngl, min_ctx, fm, ngl);
                 fit_measure_result m;
                 const bool ok_measure = fit_measure_plan(probe, plan, mparams, cparams, path_model, m);
                 const bool ok_devs    = ok_measure && fit_same_devices(m.devs, analysis);
@@ -714,7 +716,7 @@ static int32_t fit_spill_split_at_ngl(
         common_fit_plan plan;
         fit_measure_result m;
         const int32_t ctx = fit_grow_context(analysis, margins, params, mparams, cparams,
-                probe, spec, f, hp_ngl, path_model, plan, m, ngl);
+                probe, spec, f, loader_ngl, path_model, plan, m, ngl);
         if (ctx < 0) { continue; }
         if (best_ctx < 0 || ctx > best_ctx) {
             best_ctx = ctx;
@@ -813,7 +815,7 @@ static bool fit_solve_rpc_aware(
         llama_context_params * cparams,
         const common_fit_probe & probe,
         const std::string & path_model,
-        uint32_t hp_ngl,
+        uint32_t loader_ngl,
         common_fit_plan & out_plan,
         fit_measure_result & out_measure) {
     const int effective_main = fit_effective_main_gpu(analysis, params.main_gpu);
@@ -919,7 +921,7 @@ static bool fit_solve_rpc_aware(
                 common_fit_plan plan;
                 fit_measure_result m;
                 const int32_t ctx = fit_grow_context(analysis, margins, params, mparams, cparams,
-                        probe, cand, -1.0f, hp_ngl, path_model, plan, m);
+                        probe, cand, -1.0f, loader_ngl, path_model, plan, m);
                 if (ctx >= 0) {
                     out_plan = plan;
                     out_measure = m;
@@ -943,7 +945,7 @@ static bool fit_solve_rpc_aware(
             // coarse floor scan (step 0.05) to find feasible rpc_frac values
             std::vector<float> feas;
             for (float f = hi; f >= 0.0f; f -= 0.05f) {
-                common_fit_plan plan = fit_plan_from_spec(analysis, cand, hp_ngl, (int32_t) params.fit_strategy_min_ctx, f);
+                common_fit_plan plan = fit_plan_from_spec(analysis, cand, loader_ngl, (int32_t) params.fit_strategy_min_ctx, f);
                 fit_measure_result m;
                 const bool ok_measure = fit_measure_plan(probe, plan, mparams, cparams, path_model, m);
                 const bool ok_devs    = ok_measure && fit_same_devices(m.devs, analysis);
@@ -987,7 +989,7 @@ static bool fit_solve_rpc_aware(
                 common_fit_plan plan;
                 fit_measure_result m;
                 const int32_t ctx = fit_grow_context(analysis, margins, params, mparams, cparams,
-                        probe, cand, ftry, hp_ngl, path_model, plan, m);
+                        probe, cand, ftry, loader_ngl, path_model, plan, m);
                 if (ctx < 0) continue;
                 if (best_ctx < 0 || ctx > best_ctx) {
                     best_ctx = ctx;
@@ -1028,7 +1030,7 @@ static bool fit_solve_rpc_aware(
             // RPC-maximizing split would overflow nothing and fill RPC first.
             const float scan_hi = spec_is_rpc_split ? fit_rpc_scan_hi(analysis, spill_spec.split_devices) : 0.0f;
             int32_t lo_ngl = 0;            // all layers on CPU -> max context
-            int32_t hi_ngl = (int32_t) hp_ngl + 1; // full offload incl. output layer (failed min_ctx)
+            int32_t hi_ngl = (int32_t) loader_ngl + 1; // full offload incl. output layer (failed min_ctx)
             int32_t best_ngl = -1;
             common_fit_plan best_plan;
             fit_measure_result best_m;
@@ -1041,11 +1043,11 @@ static bool fit_solve_rpc_aware(
                 float frac = -1.0f;
                 if (spec_is_rpc_split) {
                     ctx = fit_spill_split_at_ngl(analysis, margins, params, mparams, cparams,
-                            probe, spill_spec, hp_ngl, path_model, mid_ngl, scan_hi,
+                            probe, spill_spec, loader_ngl, path_model, mid_ngl, scan_hi,
                             plan, m, frac);
                 } else {
                     ctx = fit_grow_context(analysis, margins, params, mparams, cparams,
-                            probe, spill_spec, -1.0f, hp_ngl, path_model, plan, m, mid_ngl);
+                            probe, spill_spec, -1.0f, loader_ngl, path_model, plan, m, mid_ngl);
                 }
                 if (ctx >= min_ctx) {
                     best_ngl = mid_ngl;
@@ -1063,10 +1065,10 @@ static bool fit_solve_rpc_aware(
                 out_plan.shed_reserves = shed_tags;
                 if (best_frac >= 0.0f) {
                     LOG_WRN("%s: spilling %u layers to CPU to reach min-ctx %d (n_gpu_layers=%d of %u, rpc_frac=%.4f)\n",
-                            __func__, (uint32_t) (hp_ngl + 1 - best_ngl), min_ctx, best_ngl, hp_ngl + 1, best_frac);
+                            __func__, (uint32_t) (loader_ngl + 1 - best_ngl), min_ctx, best_ngl, loader_ngl + 1, best_frac);
                 } else {
                     LOG_WRN("%s: spilling %u layers to CPU to reach min-ctx %d (n_gpu_layers=%d of %u)\n",
-                            __func__, (uint32_t) (hp_ngl + 1 - best_ngl), min_ctx, best_ngl, hp_ngl + 1);
+                            __func__, (uint32_t) (loader_ngl + 1 - best_ngl), min_ctx, best_ngl, loader_ngl + 1);
                 }
                 return true;
             }
@@ -1087,7 +1089,7 @@ static common_fit_plan fit_solve_maxctx(
         llama_context_params * cparams,
         const common_fit_probe & probe,
         const std::string & path_model,
-        uint32_t hp_ngl,
+        uint32_t loader_ngl,
         fit_measure_result & out_measure) {
     if (params.fit_strategy_min_ctx <= 0) {
         throw common_params_fit_exception("maxctx strategy requires --fit-strategy-min-ctx");
@@ -1118,7 +1120,7 @@ static common_fit_plan fit_solve_maxctx(
             common_fit_plan plan;
             fit_measure_result m;
             const int32_t ctx = fit_grow_context(analysis, margins, params, mparams, cparams,
-                    probe, placement, -1.0f, hp_ngl, path_model, plan, m);
+                    probe, placement, -1.0f, loader_ngl, path_model, plan, m);
             if (ctx < 0) {
                 LOG_DBG("%s: placement %s cannot fit even the minimum context, skipping\n",
                         __func__, placement.label.c_str());
@@ -1241,7 +1243,7 @@ static void fit_validate(
         const common_fit_plan & plan,
         const common_fit_analysis & analysis,
         const std::vector<int64_t> & margins,
-        const uint32_t hp_ngl,
+        uint32_t loader_ngl,
         llama_model_params * mparams,
         llama_context_params * cparams,
         const common_fit_probe & probe,
@@ -1325,10 +1327,10 @@ static void fit_validate(
         llama_model_get_tensor_devices(model.get(), tensor_infos.data(), n_tensors);
     }
     // Layers the plan keeps off the GPU (n_gpu_layers below full offload,
-    // which is hp_ngl + 1) load on the host: the loader assigns the lowest
+    // which is loader_ngl + 1) load on the host: the loader assigns the lowest
     // block indices to the CPU buffer. Expert tensors in those layers may
     // legitimately land on CPU.
-    const int spill_layers = std::max((int) hp_ngl + 1 - plan.n_gpu_layers, 0);
+    const int spill_layers = std::max((int) loader_ngl + 1 - plan.n_gpu_layers, 0);
     for (const auto & info : tensor_infos) {
         const common_fit_role role = fit_classify_role(info.name);
         const bool is_expert = role == COMMON_FIT_ROLE_EXPERT_UP ||
@@ -1438,7 +1440,7 @@ common_params_fit_status common_fit_strategy_apply_impl(
                 if (params.fit_strategy == COMMON_FIT_STRATEGY_RPC_AWARE) {
                     have_plan = fit_solve_rpc_aware(
                             analysis, margins, params.fit_params_reserves, params, mparams, cparams, probe,
-                            params.model.path, hp_ngl, final_plan, win_measure);
+                            params.model.path, analysis.loader_ngl, final_plan, win_measure);
                     if (!have_plan) {
                         // exhaust: fall back to the stock solver. it cannot shed
                         // reservations, so its margins fold every one of them in
@@ -1459,7 +1461,7 @@ common_params_fit_status common_fit_strategy_apply_impl(
                 } else {
                     final_plan = fit_solve_maxctx(
                             analysis, margins, params.fit_params_reserves, params, mparams, cparams, probe,
-                            params.model.path, hp_ngl, win_measure);
+                            params.model.path, analysis.loader_ngl, win_measure);
                     have_plan = true;
                 }
             }
@@ -1494,7 +1496,7 @@ common_params_fit_status common_fit_strategy_apply_impl(
             fit_effective_margins(margins, params.fit_params_reserves, final_plan.shed_reserves);
 
         fit_serialize(final_plan, params, mparams, cparams, analysis, win_measure, final_margins);
-        fit_validate(final_plan, analysis, final_margins, hp_ngl, mparams, cparams, probe, params.model.path);
+        fit_validate(final_plan, analysis, final_margins, analysis.loader_ngl, mparams, cparams, probe, params.model.path);
 
         // publish the shed state so callers can move companions off VRAM
         params.fit_params_shed_tags = final_plan.shed_reserves;

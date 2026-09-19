@@ -56,6 +56,7 @@ struct common_fit_analysis {
     bool rpc_available;   // an RPC device was enumerated and responsive
     bool rpc_hosts_set;   // params.rpc_hosts was non-empty at parse (cold-start signal)
     std::string model_id;
+    uint32_t loader_ngl = 0; // n_layer_all: unconditional loader slot count (nextn included)
 };
 
 struct common_fit_plan {
