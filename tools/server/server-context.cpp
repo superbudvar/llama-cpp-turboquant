@@ -1485,8 +1485,24 @@ private:
 
                         // MTP runs a separate predictor context that reuses the target
                         // model's mmap'd weights. its incremental VRAM (the predictor's
-                        // own KV cache and compute buffers) is already captured by the
-                        // spec measurement above (data[i].context + data[i].compute).
+                        // own KV cache and compute buffers) is the delta vs the target's
+                        // compute pool. compute a parent baseline (target ctx created
+                        // with the same cparams) and subtract it so we don't over-reserve.
+                        if (!measure_model_bytes) {
+                            std::vector<ggml_backend_dev_t> baseline_devs;
+                            uint32_t baseline_ngl = 0;
+                            uint32_t baseline_nct = 0;
+                            uint32_t baseline_nex = 0;
+                            auto baseline = common_get_device_memory_data_with_parent(
+                                params_base.model.path.c_str(), &mparams_parent, &cparams_tgt,
+                                params_base.model.path.c_str(), &mparams_parent, &cparams_tgt,
+                                baseline_devs, baseline_ngl, baseline_nct, baseline_nex, GGML_LOG_LEVEL_ERROR);
+                            for (size_t i = 0; i < data.size() && i < baseline.size(); i++) {
+                                data[i].context = std::max<int64_t>(0, data[i].context - baseline[i].context);
+                                data[i].compute = std::max<int64_t>(0, data[i].compute - baseline[i].compute);
+                            }
+                        }
+
                         // the target model's compute is reserved separately by the fit's
                         // own main-model measurement, so do NOT add it here: that would
                         // double-count the target's compute buffers and over-reserve VRAM,
@@ -1503,8 +1519,14 @@ private:
                                                 const std::vector<ggml_backend_dev_t> & devices) {
                         GGML_ASSERT(data.size() >= devices.size());
                         for (size_t i = 0; i < devices.size(); i++) {
-                            const size_t bytes = (measure_model_bytes ? data[i].model : 0) +
-                                                 data[i].context + data[i].compute;
+                            size_t bytes;
+                            if (spec_mtp) {
+                                bytes = (size_t) std::max<int64_t>(0, data[i].context) +
+                                        (size_t) std::max<int64_t>(0, data[i].compute);
+                            } else {
+                                bytes = (measure_model_bytes ? data[i].model : 0) +
+                                        data[i].context + data[i].compute;
+                            }
                             auto found = std::find_if(reservations.begin(), reservations.end(), [&](const auto & entry) {
                                 return entry.first == devices[i];
                             });

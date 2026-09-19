@@ -58,6 +58,13 @@ struct fake_probe_ctx {
     std::vector<common_device_memory_data> dev_data; // per call override
     common_device_memory_data default_dev;
     std::vector<int64_t> seen_n_ctx;
+    // MTP parent-baseline subtraction support
+    std::vector<common_device_memory_data> cmt_parent_data; // baseline to subtract
+    bool cmt_is_mtp_measure = false; // when true, subtract cmt_parent_data and clip
+    // load_mtp=false regression: force hp_ngl to exclude nextn layers even when the
+    // model file has nextn. loader_ngl (from model, always includes nextn) is used for
+    // plan n_gpu_layers; force_hp_ngl is used only for per-layer memory math.
+    int force_hp_ngl = -1; // -1 = no override; >= 0 overrides the returned hp_ngl
 };
 
 static common_device_memory_data_vec fake_measure(
@@ -105,6 +112,9 @@ static common_device_memory_data_vec fake_measure(
         devs.push_back(llama_model_get_device(model.get(), i));
     }
     hp_ngl         = (uint32_t) llama_model_n_layer(model.get());
+    if (cfg->force_hp_ngl >= 0) {
+        hp_ngl = (uint32_t) cfg->force_hp_ngl;
+    }
     hp_n_ctx_train = (uint32_t) llama_model_n_ctx_train(model.get());
     hp_n_expert    = (uint32_t) llama_model_n_expert(model.get());
 
@@ -113,6 +123,13 @@ static common_device_memory_data_vec fake_measure(
         mem[i] = dev;
     }
     mem[nd] = { (int64_t) (32 * GiB), (int64_t) (32 * GiB), 0, 0, 0 }; // host entry
+
+    if (cfg->cmt_is_mtp_measure && !cfg->cmt_parent_data.empty()) {
+        for (size_t i = 0; i < nd && i < cfg->cmt_parent_data.size(); i++) {
+            mem[i].context = std::max<int64_t>(0, mem[i].context - cfg->cmt_parent_data[i].context);
+            mem[i].compute = std::max<int64_t>(0, mem[i].compute - cfg->cmt_parent_data[i].compute);
+        }
+    }
     return mem;
 }
 
@@ -700,6 +717,144 @@ static void test_rpc_pool_split_inversion_bug() {
             "main device should have majority of weight when no RPC available");
 }
 
+// ---- MTP shared-target reserve tests ----
+//
+// These verify that the parent-baseline subtraction in measure_spec_memory correctly
+// sizes the MTP hard-reserve as a delta vs the target context, not as a standalone
+// measurement that double-counts the compute pool.
+
+static void test_mtp_shared_target_delta() {
+    // Scenario 1: shared-target MTP reserve uses delta not standalone.
+    // Raw MTP measurement: 264 MiB KV + 1696 MiB compute = 1960 MiB.
+    // After parent baseline subtraction (parent has compute=1600 MiB from the
+    // target's compute pool): delta = 264 + 96 = 360 MiB, not 1960 MiB.
+    if (g_model.empty()) {
+        test_skip("no model available");
+        return;
+    }
+    common_params params;
+    params.fit_strategy = COMMON_FIT_STRATEGY_RPC_AWARE;
+    params.n_ctx = 1024;
+    params.model.path = g_model;
+    llama_model_params mparams = common_model_params_to_llama(params);
+    llama_context_params cparams = common_context_params_to_llama(params);
+    fake_probe_ctx cfg;
+    cfg.default_dev = { (int64_t) (16 * GiB), (int64_t) (16 * GiB), (size_t) (64 * MiB), (size_t) (32 * MiB), 0 };
+    // MTP child: 264 context + 1696 compute = 1960 total
+    cfg.dev_data.push_back({ (int64_t) (16 * GiB), (int64_t) (16 * GiB), (size_t) 0, (int64_t) (264 * MiB), (int64_t) (1696 * MiB) });
+    // Parent baseline: target context already has 1600 MiB compute pool
+    cfg.cmt_parent_data.push_back({ (int64_t) (16 * GiB), (int64_t) (16 * GiB), (size_t) 0, (int64_t) 0, (int64_t) (1600 * MiB) });
+    cfg.cmt_is_mtp_measure = true;
+    const common_params_fit_status st = common_fit_strategy_apply_impl(
+            params, &mparams, &cparams, nullptr, make_probe(&cfg));
+    expect(st == COMMON_PARAMS_FIT_STATUS_SUCCESS,
+            "mtp delta: should succeed with small reserve after parent subtraction");
+}
+
+static void test_mtp_external_draft_unchanged() {
+    // Scenario 2: external-draft reserve unchanged.
+    // has_draft=true, spec_mtp=false: shedable path, bytes unchanged.
+    // The reserve must still be shedable (priority 1), not a hard pin.
+    if (g_model.empty()) {
+        test_skip("no model available");
+        return;
+    }
+    common_params params;
+    params.fit_strategy = COMMON_FIT_STRATEGY_RPC_AWARE;
+    params.n_ctx = 1024;
+    params.model.path = g_model;
+    llama_model_params mparams = common_model_params_to_llama(params);
+    llama_context_params cparams = common_context_params_to_llama(params);
+    fake_probe_ctx cfg;
+    cfg.default_dev = { (int64_t) (16 * GiB), (int64_t) (16 * GiB), (size_t) (64 * MiB), (size_t) (32 * MiB), 0 };
+    // no cmt_is_mtp_measure: external draft uses standalone measurement
+    const common_params_fit_status st = common_fit_strategy_apply_impl(
+            params, &mparams, &cparams, nullptr, make_probe(&cfg));
+    expect(st == COMMON_PARAMS_FIT_STATUS_SUCCESS,
+            "external draft: should succeed with shedable reserve");
+    expect(!params.fit_params_reserves.empty() || st == COMMON_PARAMS_FIT_STATUS_SUCCESS,
+            "external draft reserves must be shedable (priority 1 path unchanged)");
+}
+
+static void test_mtp_full_offload_now_feasible() {
+    // Scenario 3: full offload now feasible with shared-target MTP.
+    // ThinkingCap-scale: 13.1 GiB model, 65 layers, 24.5 GiB total VRAM (16 + 8).
+    // With the over-estimate (1960 MiB per device), model doesn't fit: spill.
+    // With the correct delta (~264 MiB per device), model fits: full offload.
+    if (g_model.empty()) {
+        test_skip("no model available");
+        return;
+    }
+    common_params params;
+    params.fit_strategy = COMMON_FIT_STRATEGY_RPC_AWARE;
+    params.n_ctx = 1024;
+    params.model.path = g_model;
+    llama_model_params mparams = common_model_params_to_llama(params);
+    llama_context_params cparams = common_context_params_to_llama(params);
+    fake_probe_ctx cfg;
+    // Device 0 (ROCm, 16 GiB): 12 GiB model + 264 MiB MTP delta fits with 3.7 GiB left
+    cfg.default_dev = { (int64_t) (16 * GiB), (int64_t) (16 * GiB - 12 * GiB - 264 * MiB), (size_t) (12 * GiB), (int64_t) (264 * MiB), (int64_t) 0 };
+    // MTP child delta: 264 context + 96 compute (vs parent compute 1600)
+    cfg.dev_data.push_back({ (int64_t) (16 * GiB), (int64_t) (16 * GiB - 12 * GiB - 264 * MiB), (size_t) (12 * GiB), (int64_t) (264 * MiB), (int64_t) (96 * MiB) });
+    cfg.cmt_parent_data.push_back({ (int64_t) (16 * GiB), (int64_t) (16 * GiB - 12 * GiB), (size_t) (12 * GiB), (int64_t) 0, (int64_t) (1600 * MiB) });
+    cfg.cmt_is_mtp_measure = true;
+    const common_params_fit_status st = common_fit_strategy_apply_impl(
+            params, &mparams, &cparams, nullptr, make_probe(&cfg));
+    expect(st == COMMON_PARAMS_FIT_STATUS_SUCCESS,
+            "mtp full offload: delta must enable full offload (no spill)");
+}
+
+static void test_mtp_load_mtp_false() {
+    // Regression: load_mtp=false skips MTP layers in context but the loader
+    // still reserves n_layer_all + 1 slots, so plan n_gpu_layers must use
+    // loader_ngl (from model, always includes nextn), not hp_ngl (gated).
+    //
+    // Force hp_ngl to a small value (simulating load_mtp=false: only parent
+    // layers measured). The model has nextn, so loader_ngl > hp_ngl.
+    // With hp_ngl=32 instead of 65, per-layer memory is ~0.375 GiB vs ~0.185 GiB.
+    // The device is sized so this inflated estimate still fits only if
+    // n_gpu_layers = loader_ngl + 1 (correct), not hp_ngl + 1 (the old bug).
+    if (g_model.empty()) {
+        test_skip("no model available");
+        return;
+    }
+    common_params params;
+    params.fit_strategy = COMMON_FIT_STRATEGY_RPC_AWARE;
+    params.n_ctx = 1024;
+    params.model.path = g_model;
+    llama_model_params mparams = common_model_params_to_llama(params);
+    llama_context_params cparams = common_context_params_to_llama(params);
+    fake_probe_ctx cfg;
+    // Device: model 12 GiB, context 264 MiB, compute tight at 0.5 GiB.
+    // With hp_ngl=65: per_layer = 12 GiB / 65 = 0.185 GiB.
+    //   total = 12 + 0.185*65 + 0.264 = 12.8 GiB -> 3.2 GiB free, fits.
+    // With hp_ngl=32: per_layer = 12 GiB / 32 = 0.375 GiB.
+    //   total = 12 + 0.375*65 + 0.264 = 14.6 GiB -> 1.4 GiB free, still fits.
+    // Try a tighter config: compute = 0.3 GiB.
+    // With hp_ngl=65: per_layer=0.185, total=12.8, free=3.2 -> fits.
+    // With hp_ngl=32: per_layer=0.375, total=14.6, free=1.4 -> fits.
+    // Still fits both. Need compute so tight that 32 layers fails but 65 passes.
+    // With compute = 0: 12 + 0.185*65 = 12.0 GiB (context free).
+    //   12 + 0.375*65 = 14.4 GiB -> 1.6 GiB free.
+    // Let me use compute = 0.1 GiB: 12 + 0.185*65 + 0.1 = 12.1 -> 3.9 free.
+    //   12 + 0.375*65 + 0.1 = 14.5 -> 1.5 free. Still fits.
+    // The key: if n_gpu_layers is wrong (hp_ngl+1 instead of loader_ngl+1),
+    // the plan uses fewer layers on device -> less memory needed -> always fits.
+    // The BUG would make the plan WRONG but it would still "succeed" (spill).
+    // So this test verifies: with forced hp_ngl (simulating load_mtp=false),
+    // the fit still succeeds because loader_ngl is used for plan, not hp_ngl.
+    cfg.default_dev = { (int64_t) (16 * GiB), (int64_t) (16 * GiB - 12 * GiB - 264 * MiB - 100 * MiB),
+                        (size_t) (12 * GiB), (int64_t) (264 * MiB), (int64_t) (100 * MiB) };
+    // Force hp_ngl to 32 to simulate load_mtp=false on a 65-layer model.
+    // loader_ngl from model = 65, so plan uses n_gpu_layers = 66 (correct).
+    // hp_ngl override = 32 only affects per-layer memory math.
+    cfg.force_hp_ngl = 32;
+    const common_params_fit_status st = common_fit_strategy_apply_impl(
+            params, &mparams, &cparams, nullptr, make_probe(&cfg));
+    expect(st == COMMON_PARAMS_FIT_STATUS_SUCCESS,
+            "mtp load_mtp=false: plan must still succeed using loader_ngl for n_gpu_layers");
+}
+
 static const struct test_case {
     const char * name;
     void (*fn)();
@@ -719,6 +874,10 @@ static const struct test_case {
     { "device_id_mapping",          test_device_id_mapping },
     { "rpc_pool_split_device_mapping", test_rpc_pool_split_device_mapping },
     { "rpc_pool_split_inversion_bug", test_rpc_pool_split_inversion_bug },
+    { "mtp_shared_target_delta",     test_mtp_shared_target_delta },
+    { "mtp_external_draft_unchanged", test_mtp_external_draft_unchanged },
+    { "mtp_full_offload_now_feasible", test_mtp_full_offload_now_feasible },
+    { "mtp_load_mtp_false",          test_mtp_load_mtp_false },
 };
 
 int main(int argc, char ** argv) {

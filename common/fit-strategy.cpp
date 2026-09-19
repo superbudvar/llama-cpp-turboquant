@@ -600,6 +600,30 @@ static int32_t fit_grow_context(
             hi = mid;
         }
     }
+
+    // fill headroom: after binary search finds the first-fit ctx, probe upward in
+    // FILL_STEP increments to fill the margin headroom before committing. binary search
+    // stopped at hi-lo <= 256, so hi is the smallest non-fitting ctx; the gap can be
+    // ~50k tokens in typical cases (hi=262144, best_ctx=210688). bounded: at most
+    // (hi - best_ctx) / 4096 + 1 extra probes, ~13 for the typical gap above.
+    constexpr int32_t FILL_STEP = 4096;
+    int32_t fill = best_ctx;
+    while (fill + FILL_STEP <= hi) {
+        int32_t trial = fill + FILL_STEP;
+        trial -= trial % 256;
+        if (trial <= fill) break;
+        common_fit_plan pm = fit_plan_from_spec(analysis, spec, loader_ngl, trial, rpc_frac_override, ngl_override);
+        fit_measure_result mm;
+        if (fits(pm, mm)) {
+            fill = trial;
+            best_ctx = trial;
+            best_plan = pm;
+            best_m = mm;
+        } else {
+            break;
+        }
+    }
+
     out_plan = best_plan;
     out_measure = best_m;
     return best_ctx;
@@ -634,6 +658,18 @@ static int32_t fit_spill_split_at_ngl(
     const float step = 0.05f;
     const size_t nd = analysis.devices.size();
 
+    // NOTE: fit_solve_rpc_aware is single-threaded; rpc_frac_cache_entry is safe.
+    static struct { uint64_t key; float lo_frac; float hi_frac; bool valid; } rpc_frac_cache_entry[4] = {};
+
+    // cache key: combine spec label hash, ngl, and margins hash
+    uint64_t margins_hash = 1469598103934665603ull; // FNV offset basis
+    for (int64_t m : margins) {
+        margins_hash ^= (uint64_t)m;
+        margins_hash *= 1099511628211ull; // FNV prime
+    }
+    uint64_t spec_hash = std::hash<std::string>{}(spec.label);
+    uint64_t cache_key = spec_hash ^ ((uint64_t)ngl << 32) ^ margins_hash;
+
     struct row_t {
         float f;
         bool ok;
@@ -641,6 +677,27 @@ static int32_t fit_spill_split_at_ngl(
     };
     std::vector<row_t> rows;
     std::vector<float> feas;
+    bool cache_hit = false;
+
+    // check cache before running the coarse scan
+    for (int i = 0; i < 4; i++) {
+        if (rpc_frac_cache_entry[i].valid && rpc_frac_cache_entry[i].key == cache_key) {
+            LOG_DBG("%s: rpc_frac cache hit candidate=%s ngl=%d [%.4f, %.4f]\n",
+                    __func__, spec.label.c_str(), ngl,
+                    rpc_frac_cache_entry[i].lo_frac, rpc_frac_cache_entry[i].hi_frac);
+            // reconstruct feas from cached bounds at step granularity; the binary search
+            // below runs over these values so we skip ~20 coarse probes on cache hit.
+            // false positives (non-feasible values in a contiguous interval) are benign:
+            // the binary search tests each and discards infeasible ones, still arriving
+            // at the correct best fraction.
+            for (float f = rpc_frac_cache_entry[i].hi_frac; f >= rpc_frac_cache_entry[i].lo_frac - 1e-6f; f -= step) {
+                if (f < 0.0f) break;
+                feas.push_back(f);
+            }
+            cache_hit = true;
+            break;
+        }
+    }
 
     // coarse scan top-down, mirroring the full-offload bracket. rpc_frac
     // feasibility is an interval: low f overflows the local device, high f
@@ -703,6 +760,27 @@ static int32_t fit_spill_split_at_ngl(
                 }
             }
         }
+    }
+
+    // populate the cache with the feasible interval for this (candidate, ngl, margins) key
+    if (!cache_hit) {
+        float lo_frac = 0.0f;
+        float hi_frac = 0.0f;
+        bool have_feas = !feas.empty();
+        if (have_feas) {
+            lo_frac = feas.back();
+            hi_frac = feas.front();
+        }
+        // LRU eviction: find first invalid slot or oldest (index 0)
+        int slot = 0;
+        for (int i = 0; i < 4; i++) {
+            if (!rpc_frac_cache_entry[i].valid) { slot = i; break; }
+            if (i == 3) slot = 0; // all valid: evict oldest (slot 0)
+        }
+        rpc_frac_cache_entry[slot] = { cache_key, lo_frac, hi_frac, have_feas };
+        LOG_DBG("%s: rpc_frac cache populate candidate=%s ngl=%d [%.4f, %.4f]%s\n",
+                __func__, spec.label.c_str(), ngl, lo_frac, hi_frac,
+                have_feas ? "" : " (empty)");
     }
 
     // grow the context from each feasible split and keep the one at the largest
@@ -817,7 +895,8 @@ static bool fit_solve_rpc_aware(
         const std::string & path_model,
         uint32_t loader_ngl,
         common_fit_plan & out_plan,
-        fit_measure_result & out_measure) {
+        fit_measure_result & out_measure,
+        int32_t ngl_hint = -1) {
     const int effective_main = fit_effective_main_gpu(analysis, params.main_gpu);
     if (params.main_gpu >= 0 && params.main_gpu < (int) analysis.devices.size() &&
         analysis.devices[params.main_gpu].is_rpc) {
@@ -921,7 +1000,7 @@ static bool fit_solve_rpc_aware(
                 common_fit_plan plan;
                 fit_measure_result m;
                 const int32_t ctx = fit_grow_context(analysis, margins, params, mparams, cparams,
-                        probe, cand, -1.0f, loader_ngl, path_model, plan, m);
+                        probe, cand, -1.0f, loader_ngl, path_model, plan, m, ngl_hint);
                 if (ctx >= 0) {
                     out_plan = plan;
                     out_measure = m;
@@ -1030,7 +1109,11 @@ static bool fit_solve_rpc_aware(
             // RPC-maximizing split would overflow nothing and fill RPC first.
             const float scan_hi = spec_is_rpc_split ? fit_rpc_scan_hi(analysis, spill_spec.split_devices) : 0.0f;
             int32_t lo_ngl = 0;            // all layers on CPU -> max context
-            int32_t hi_ngl = (int32_t) loader_ngl + 1; // full offload incl. output layer (failed min_ctx)
+            // warm-start: if ngl_hint is available, bound hi_ngl to it to reduce binary
+            // search iterations when the cached placement's layer count is still feasible
+            const int32_t hi_ngl_bound = (ngl_hint >= 0 && ngl_hint <= (int32_t) loader_ngl)
+                ? ngl_hint + 1 : (int32_t) loader_ngl + 1;
+            int32_t hi_ngl = hi_ngl_bound; // full offload incl. output layer (failed min_ctx)
             int32_t best_ngl = -1;
             common_fit_plan best_plan;
             fit_measure_result best_m;
@@ -1438,9 +1521,14 @@ common_params_fit_status common_fit_strategy_apply_impl(
             }
             if (!cache_ok) {
                 if (params.fit_strategy == COMMON_FIT_STRATEGY_RPC_AWARE) {
+                    const int32_t ngl_hint = cache_plan.n_gpu_layers >= 0 ? cache_plan.n_gpu_layers : -1;
+                    if (ngl_hint >= 0) {
+                        LOG_INF("%s: cache soft-miss, using n_gpu_layers=%d as ngl_hint to anchor binary search\n",
+                                __func__, ngl_hint);
+                    }
                     have_plan = fit_solve_rpc_aware(
                             analysis, margins, params.fit_params_reserves, params, mparams, cparams, probe,
-                            params.model.path, analysis.loader_ngl, final_plan, win_measure);
+                            params.model.path, analysis.loader_ngl, final_plan, win_measure, ngl_hint);
                     if (!have_plan) {
                         // exhaust: fall back to the stock solver. it cannot shed
                         // reservations, so its margins fold every one of them in

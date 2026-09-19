@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Parse a llama.cpp (rpc-aware fit) server log and emit a per-run table: model,
-fit params, context, layer spill, served n_ctx, and device memory at MODEL READY.
+fit params, context, layer spill, served n_ctx, offload ratio, KV/RS per device,
+device memory at MODEL READY, eval timing, spec/MoE status.
 
 Handles both router-mode runs (delimited by "spawning server instance") and direct
 single-model loads (delimited by the first model-load / fit line). Multiple runs in
@@ -28,6 +29,16 @@ RE_HOST = re.compile(r"\|\s*-\s*(.+?)\s*\|\s*(\d+)\s*=\s*(\d+)\s*\+\s*(\d+)\s*\+
 RE_SYSFS = re.compile(r"ggml_rocm_sysfs_memory:\s*device (\d+) matched.*?vram_used=(\d+) MiB vram_total=(\d+) MiB vram_free=(\d+) MiB")
 RE_TIMING = re.compile(r"print_timing:.*?\|\s*task \d+\s*\|\s*(\w[^,]*),\s*n_tokens\s*=\s*(\d+).*?/\s*([\d.]+) tokens per second")
 RE_FITSTART = re.compile(r"fit_solve_rpc_aware:")
+RE_OFFLOAD_NEW = re.compile(r"load_tensors: offloading (\d+) layers to GPU \((\d+) transformer \+ (\d+) output\)")
+RE_OFFLOAD_OLD = re.compile(r"load_tensors: offloading (\d+) layers to GPU(?!.*\()")
+RE_OFFLOAD_SIMPLE = re.compile(r"load_tensors: (not offloading any layers|offloading output layer) to GPU")
+RE_OFFLOAD_DONE = re.compile(r"load_tensors: offloaded (\d+)/(\d+) layers to GPU")
+RE_TRAINCTX = re.compile(r"print_info: n_ctx_train\s*=\s*(\d+)")
+RE_KV = re.compile(r"llama_kv_cache:\s*(.+?) KV buffer size\s*=\s*([\d.]+) MiB")
+RE_RS = re.compile(r"llama_memory_recurrent:\s*(.+?) RS buffer size\s*=\s*([\d.]+) MiB")
+RE_MOE = re.compile(r"sched_reserve: MoE cache requested=(\w+) resolved=(\w+)")
+RE_SPEC = re.compile(r"common_speculative_init_result: (loading draft model|creating MTP draft context) '?([^'\n]+)")
+RE_EVAL_TIMING = re.compile(r"slot print_timing:.*?task \d+\s*\|\s*(prompt eval|eval) time\s*=\s*([\d.]+)\s*ms\s*/\s*(\d+) tokens\s*\(\s*[\d.]+ ms per token,\s*([\d.]+) tokens per second\)")
 
 runs = []
 cur = None
@@ -43,8 +54,11 @@ def new_run(name="run", port="?"):
         "name": name, "port": port,
         "model": None, "cache_k": None, "cache_v": None, "ctx_size": None,
         "min_ctx": None, "fit_strategy": None, "fit_target": None,
+        "offload": None, "offload_transformer": None, "offload_output": None,
         "spill": None, "n_gpu_layers": None, "n_layers": None,
-        "served_n_ctx": None, "nctxs": [], "model_ready": {}, "sysfs": {}, "timing": [],
+        "served_n_ctx": None, "nctxs": [], "n_ctx_train": None,
+        "kv": {}, "rs": {}, "moe_requested": None, "moe_resolved": None,
+        "spec": None, "model_ready": {}, "sysfs": {}, "timing": [],
     }
     return cur
 
@@ -109,6 +123,61 @@ for line in open(LOG, encoding="utf-8", errors="replace"):
         cur["n_layers"] = int(m.group(4))
         continue
 
+    m = RE_OFFLOAD_NEW.search(line)
+    if m:
+        # m.group(1)=offloading N, group(2)=transformer, group(3)=output
+        # the RE_OFFLOAD_DONE line sets cur["offload"]; here we just capture breakdown
+        cur["offload_transformer"] = int(m.group(2))
+        cur["offload_output"] = int(m.group(3))
+        continue
+
+    m = RE_OFFLOAD_OLD.search(line)
+    if m:
+        cur["offload"] = "%s/%s" % (m.group(1), m.group(2))
+        continue
+
+    m = RE_OFFLOAD_SIMPLE.search(line)
+    if m:
+        cur["offload"] = "0/%s" % (cur.get("n_layers", "?"))
+        continue
+
+    m = RE_OFFLOAD_DONE.search(line)
+    if m:
+        cur["offload"] = "%s/%s" % (m.group(1), m.group(2))
+        continue
+
+    m = RE_TRAINCTX.search(line)
+    if m:
+        cur["n_ctx_train"] = int(m.group(1))
+        continue
+
+    m = RE_KV.search(line)
+    if m:
+        cur["kv"][m.group(1).strip()] = float(m.group(2))
+        continue
+
+    m = RE_RS.search(line)
+    if m:
+        cur["rs"][m.group(1).strip()] = float(m.group(2))
+        continue
+
+    m = RE_MOE.search(line)
+    if m:
+        cur["moe_requested"] = m.group(1)
+        cur["moe_resolved"] = m.group(2)
+        continue
+
+    m = RE_SPEC.search(line)
+    if m:
+        cur["spec"] = m.group(2).split("/")[-1]
+        continue
+
+    m = RE_EVAL_TIMING.search(line)
+    if m:
+        phase, ms, ntok, tps = m.groups()
+        cur["timing"].append(("%s eval" % phase, int(ntok), float(tps)))
+        continue
+
     m = RE_NCTX.search(line)
     if m:
         last_n_ctx = int(m.group(1))
@@ -134,7 +203,14 @@ for line in open(LOG, encoding="utf-8", errors="replace"):
                 "total": _total, "free": free, "model": model, "context": ctx, "compute": comp,
             }
             continue
-        if RE_HOST.search(line):
+        mh = RE_HOST.search(line)
+        if mh:
+            name = mh.group(1).strip()
+            # host layout: total = free + model + compute  (no context column)
+            _total, free, model, comp = (int(mh.group(i)) for i in range(2, 6))
+            cur["model_ready"][capture_breakdown_for][name] = {
+                "total": _total, "free": free, "model": model, "context": 0, "compute": comp,
+            }
             continue
         capture_breakdown_for = None
 
@@ -164,7 +240,20 @@ for r in runs:
     print(f"  ctx-size  : {r['ctx_size']}   min-ctx: {r['min_ctx']}")
     if r["spill"] is not None:
         print(f"  spill     : {r['spill']} layers to CPU  (n_gpu_layers={r['n_gpu_layers']} of {r['n_layers']})")
+    offload_str = r['offload'] if r['offload'] is not None else "?"
+    if r.get("offload_transformer") is not None and r.get("offload_output") is not None:
+        offload_str += f" ({r['offload_transformer']} trans + {r['offload_output']} out)"
+    print(f"  offload   : {offload_str} layers to GPU")
+    print(f"  train ctx : {r['n_ctx_train']}")
     print(f"  served ctx: {r['served_n_ctx']}")
+    if r["kv"] or r["rs"]:
+        print(f"  KV buffer : {', '.join(f'{d}={v:.0f}' for d, v in sorted(r['kv'].items()))}")
+    if r["rs"]:
+        print(f"  RS buffer : {', '.join(f'{d}={v:.0f}' for d, v in sorted(r['rs'].items()))}")
+    if r["moe_requested"]:
+        print(f"  MoE cache : requested={r['moe_requested']} resolved={r['moe_resolved']}")
+    if r["spec"]:
+        print(f"  spec draft: {r['spec']}")
     if r["model_ready"]:
         for mp, devs in r["model_ready"].items():
             print(f"  MODEL READY memory [{mp.split('/')[-1]}]:")
@@ -176,8 +265,19 @@ for r in runs:
         for dev, (used, total, free) in sorted(r["sysfs"].items()):
             print(f"    card{dev}: used={used:6d}/{total:6d}  free={free:6d} MiB")
     if r["timing"]:
+        seen = {}
         for phase, ntok, tps in r["timing"]:
-            print(f"  timing    : {phase:20s} n_tokens={ntok:6d}  {tps:.2f} tok/s")
+            seen.setdefault(phase, []).append((ntok, tps))
+        for phase in sorted(seen):
+            entries = seen[phase]
+            if phase == "prompt processing":
+                keep = [e for e in entries if e[0] > 0]
+                if not keep:
+                    continue
+                ntok, tps = max(keep, key=lambda e: e[0])
+                print(f"  timing    : {phase:20s} n_tokens={ntok:6d}  {tps:.2f} tok/s  (best of {len(entries)})")
+            else:
+                print(f"  timing    : {phase:20s} n_tokens={entries[-1][0]:6d}  {entries[-1][1]:.2f} tok/s")
     print("-" * 100)
 
 print("=" * 100)

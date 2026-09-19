@@ -1776,16 +1776,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (llama_supports_gpu_offload()) {
         const int n_gpu = std::min(n_gpu_layers, n_layer_all);
 
-        int n_repeating = n_gpu;
-        if (n_repeating > 0) {
-            LLAMA_LOG_INFO("%s: offloading output layer to GPU\n", __func__);
-            n_repeating--;
-        }
-        LLAMA_LOG_INFO("%s: offloading %d repeating layers to GPU\n", __func__, n_repeating);
-
+        const int n_repeating = n_gpu - 1; // -1 for output layer
+        const int n_output    = n_gpu > 0 ? 1 : 0;
         const int max_backend_supported_layers = n_layer_all + 1;
         const int max_offloadable_layers       = n_layer_all + 1;
 
+        if (n_gpu == 0) {
+            LLAMA_LOG_INFO("%s: not offloading any layers to GPU\n", __func__);
+        } else if (n_repeating == 0) {
+            LLAMA_LOG_INFO("%s: offloading output layer to GPU\n", __func__);
+        } else {
+            LLAMA_LOG_INFO("%s: offloading %d layers to GPU (%d transformer + %d output)\n",
+                    __func__, n_gpu, n_repeating, n_output);
+        }
         LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU\n", __func__, std::min(n_gpu_layers, max_offloadable_layers), max_backend_supported_layers);
     }
 
