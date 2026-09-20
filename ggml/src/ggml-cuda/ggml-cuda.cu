@@ -761,11 +761,24 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     for (const auto & r : moe_tables_retired) {
         free_buf(r.ptr, r.dev);
     }
+    for (const auto & s : moe_slabs) {
+        free_buf((char *) s.slab,        s.dev);
+        free_buf((char *) s.slot_expert, s.dev);
+        free_buf((char *) s.claim,       s.dev);
+        free_buf((char *) s.hit,         s.dev);
+        free_buf((char *) s.won,         s.dev);
+        free_buf((char *) s.miss_expert, s.dev);
+        free_buf((char *) s.miss_slot,   s.dev);
+        free_buf((char *) s.n_miss,      s.dev);
+    }
 
     q8_cache.ptr = nullptr;
     q8_cache.retired.clear();
     tq_rot_cache.ptr = nullptr;
     tq_rot_cache.retired.clear();
+    moe_tables.clear();
+    moe_tables_retired.clear();
+    moe_slabs.clear();
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
@@ -4755,11 +4768,6 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     bool cuda_graph_update_required = false;
     uint64_t graph_key = 0;
 
-    // [TAG_FA_F16_CUDA_GRAPHS] default: no graph will be captured for this cgraph, so HIP flash-
-    // attention keeps its raw (release-after-use) f16 temp path. Set true below only when the graph
-    // is enabled and compatible, i.e. it will actually be captured.
-    cuda_ctx->fa_f16_use_pool = false;
-
 #ifdef USE_CUDA_GRAPH
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
@@ -4768,9 +4776,6 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
-        // [TAG_FA_F16_CUDA_GRAPHS] this graph will be captured -> HIP flash-attention must use the
-        // capture-safe pool for its f16 KV-dequant temp buffers instead of raw cudaMalloc/cudaFree.
-        cuda_ctx->fa_f16_use_pool = graph_compatible;
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 

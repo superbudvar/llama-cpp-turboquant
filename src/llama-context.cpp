@@ -166,7 +166,7 @@ llama_context::llama_context(
         cparams.ctx_other = params.ctx_other;
     }
 
-    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH) {
+    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH || model.arch == LLM_ARCH_QWEN4EXP) {
         if (model.tok_embd == nullptr || model.output == nullptr) {
             if (params.ctx_other == nullptr) {
                 throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
@@ -662,14 +662,18 @@ static bool llama_model_has_cacheable_moe_weights(
         return false;
     }
 
+    size_t largest_expert_bytes = 0;
     for (const auto & entry : model.tensors_by_name) {
         const std::string & name = entry.first;
         const ggml_tensor * tensor = entry.second;
         if (!tensor || (name.find("_exps") == std::string::npos &&
                         name.find("_chexps") == std::string::npos) ||
             ggml_n_dims(tensor) != 3 || tensor->ne[0] <= 0 ||
-            tensor->ne[1] <= 0 || tensor->ne[2] <= 0 ||
-            tensor->nb[2] < min_expert_bytes) {
+            tensor->ne[1] <= 0 || tensor->ne[2] <= 0) {
+            continue;
+        }
+        largest_expert_bytes = std::max(largest_expert_bytes, tensor->nb[2]);
+        if (tensor->nb[2] < min_expert_bytes) {
             continue;
         }
 
@@ -694,7 +698,8 @@ static bool llama_model_has_cacheable_moe_weights(
             return true;
         }
     }
-    LLAMA_LOG_INFO("%s: MoE cache disabled (no cacheable expert tensors found)\n", __func__);
+    LLAMA_LOG_INFO("%s: MoE cache disabled (no cacheable expert tensors found; largest expert slab=%zu KiB, minimum=%zu KiB)\n",
+            __func__, largest_expert_bytes >> 10, min_expert_bytes >> 10);
     return false;
 }
 
@@ -2642,6 +2647,12 @@ void llama_context::output_reorder() {
 //
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+    if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
+        // DFlash2's convolutions and selector are shape work rather than matmuls,
+        // so they cost about 8.6 nodes per tensor against 5.9 for plain DFlash.
+        return std::max<uint32_t>(1024u, 12u * model.n_tensors());
+    }
+
     if (model.arch == LLM_ARCH_QWEN3NEXT ||
         model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_QWEN35 ||
@@ -2651,7 +2662,6 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_DFLASH ||
         model.arch == LLM_ARCH_NANBEIGE ||
         model.arch == LLM_ARCH_MINIMAX_M3) {
-
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     }
     uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
