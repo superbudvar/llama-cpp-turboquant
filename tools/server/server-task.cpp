@@ -3275,7 +3275,7 @@ void prompt_cache_chunk_store::compact_if_stale() {
         }
     }
     const uint64_t n_live = n_total - n_dead;
-    if (n_live == 0 || n_dead * 100 / n_live <= 35) {
+    if (n_dead == 0 || (n_live > 0 && n_dead * 100 / n_live <= 35)) {
         return;
     }
     // compact() acquires io_mtx_ internally; no lock held here
@@ -4756,23 +4756,17 @@ bool server_prompt_cache::load_from_disk_tier(server_prompt & prompt, const serv
                     disk_entries.end());
             };
 
-            uint32_t magic   = 0;
-            uint32_t version = 0;
-            bool ok = fread(&magic, 4, 1, f) == 1 && fread(&version, 4, 1, f) == 1;
-
             // store-backed entry: the KV lives in cache.dcp as lineage-chained
             // cells. reassemble the blob from its chunks; a fresh full restore
-            // starts at position 0 and reuses via LCP. v1 sidecars are token-only
-            // (n_ckpt is always 0); v2 appends the checkpoint payloads; v4 keeps
-            // only the 44-byte checkpoint metadata headers and reassembles the
-            // payloads from the REGION_CKPT chunks trailing the main/draft ids.
-            if (ok && magic == DTS_MAGIC) {
-                dts_header hdr;
-                if (!disk_parse_dts_header(f, hdr)) {
-                    SRV_ERR("load_from_disk_tier: disk_parse_dts_header failed for '%s'\n", best_fname.c_str());
-                    fclose(f);
-                    return false;
-                }
+            // starts at position 0 and reuses via LCP. v4 keeps only the 44-byte
+            // checkpoint metadata headers and reassembles the payloads from the
+            // REGION_CKPT chunks trailing the main/draft ids.
+            dts_header hdr;
+            if (!disk_parse_dts_header(f, hdr)) {
+                SRV_ERR("load_from_disk_tier: disk_parse_dts_header failed for '%s'\n", best_fname.c_str());
+                fclose(f);
+                return false;
+            }
 
                 llama_tokens dts_tokens(hdr.n_tokens);
                 if (hdr.n_tokens > 0 && fread(dts_tokens.data(), sizeof(llama_token), hdr.n_tokens, f) != hdr.n_tokens) {
@@ -4951,13 +4945,7 @@ bool server_prompt_cache::load_from_disk_tier(server_prompt & prompt, const serv
                 }
                 state.prompt.tokens = server_tokens(dts_tokens, false);
                 restored_from_store = true;
-            } else {
-                // v4 only: non-DTS files are unsupported
-                SRV_ERR("load_from_disk_tier: unsupported file format '%s' (not .dts v4)\n", best_fname.c_str());
-                fclose(f);
-                return false;
             }
-        }
 
         // promote into the RAM tier when it fits the budget, otherwise restore directly from disk
         const size_t state_bytes = state.size();
