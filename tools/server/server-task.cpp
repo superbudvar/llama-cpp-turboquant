@@ -2067,6 +2067,28 @@ uint64_t disk_ckpt_chunk_count(uint32_t n_ckpt, const std::list<common_prompt_ch
     return n;
 }
 
+// shared .dts v4 header parse: reads magic(4)+version(4)+n_tokens(4)+len_main(8)+
+// len_drft(8)+n_ckpt(4)+last_access(8) from the current file position.
+// both load_from_disk_tier and disk_read_token_index must use this — they cannot
+// drift because they call the same function.
+bool disk_parse_dts_header(FILE * f, dts_header & h) {
+    h = dts_header{};
+    h.ok = fread(&h.magic,    4, 1, f) == 1 &&
+           fread(&h.version,  4, 1, f) == 1 &&
+           fread(&h.n_tokens, 4, 1, f) == 1 &&
+           fread(&h.len_main, 8, 1, f) == 1 &&
+           fread(&h.len_drft, 8, 1, f) == 1 &&
+           fread(&h.n_ckpt,  4, 1, f) == 1 &&
+           h.magic == DTS_MAGIC && h.version == DTS_VERSION &&
+           h.n_tokens <= DPC_MAX_TOKENS && h.n_ckpt <= DPC_MAX_CHECKPOINTS;
+
+    // v4: last_access_unix (8 bytes) — must be consumed before token data
+    if (h.ok) {
+        h.ok = fread(&h.last_access, 8, 1, f) == 1;
+    }
+    return h.ok;
+}
+
 // .dts v3 checkpoint section: metadata headers only, no payload bytes. the
 // payloads live as REGION_CKPT chunks in the store; a token sidecar that never
 // exceeds ~46 KiB per 1024 checkpoints cannot meaningfully threaten disk-full.
@@ -4422,9 +4444,10 @@ static void disk_write_meta_file(const std::string & dir, const std::string & fi
 // sidecar stays tiny even for a full checkpoint set and the store batch is the
 // single source of dedup. a restored v3 state reassembles the payloads from
 // the trailing chunk ids.
-static void disk_write_token_index(const std::string & dir, const std::string & fp_hex,
+void disk_write_token_index(const std::string & dir, const std::string & fp_hex,
                                    const llama_tokens & tokens, uint64_t len_main, uint64_t len_drft,
-                                   const std::list<common_prompt_checkpoint> & checkpoints) {
+                                   const std::list<common_prompt_checkpoint> & checkpoints,
+                                   uint64_t last_access) {
     namespace fs = std::filesystem;
     const std::string dts_path = (fs::path(dir) / (fp_hex + ".dts")).string();
     const std::string dts_tmp  = dts_path + ".tmp";
@@ -4464,9 +4487,13 @@ static void disk_write_token_index(const std::string & dir, const std::string & 
     ok = ok && fwrite(&len_main,    8, 1, f) == 1;
     ok = ok && fwrite(&len_drft,    8, 1, f) == 1;
     ok = ok && fwrite(&n_ckpt,      4, 1, f) == 1;
+    // v4: last_access_unix (8 bytes) — must be written before tokens
+    if (version == 4) {
+        ok = ok && fwrite(&last_access, 8, 1, f) == 1;
+    }
     ok = ok && (n_tokens == 0 || fwrite(tokens.data(), sizeof(llama_token), n_tokens, f) == n_tokens);
 
-    // v3 only: the meta-only checkpoint section (44-byte headers, no payloads)
+    // v4: the meta-only checkpoint section (44-byte headers, no payloads)
     if (version == DTS_VERSION) {
         ok = ok && disk_write_ckpt_meta(f, checkpoints, n_ckpt);
     }
@@ -4484,6 +4511,35 @@ static void disk_write_token_index(const std::string & dir, const std::string & 
     if (ec) {
         SRV_WRN(" - disk prompt cache: failed to finalize token index '%s': %s\n", dts_path.c_str(), ec.message().c_str());
     }
+}
+
+disk_token_index_result disk_read_token_index(const std::string & path) {
+    disk_token_index_result r;
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) {
+        return r;
+    }
+
+    if (!disk_parse_dts_header(f, r.hdr)) {
+        fclose(f);
+        return r;
+    }
+
+    if (r.hdr.n_tokens > 0) {
+        r.tokens.resize(r.hdr.n_tokens);
+        if (fread(r.tokens.data(), sizeof(llama_token), r.hdr.n_tokens, f) != r.hdr.n_tokens) {
+            fclose(f);
+            return r;
+        }
+    }
+
+    if (!disk_read_ckpt_meta(f, r.hdr.n_ckpt, r.checkpoints)) {
+        fclose(f);
+        return r;
+    }
+
+    fclose(f);
+    return r;
 }
 
 bool server_prompt_cache::disk_store_write(disk_write_job & job, const llama_tokens & tokens) {
@@ -4999,28 +5055,21 @@ bool server_prompt_cache::load_from_disk_tier(server_prompt & prompt, const serv
             // store-backed entry: the KV lives in cache.dcp as lineage-chained
             // cells. reassemble the blob from its chunks; a fresh full restore
             // starts at position 0 and reuses via LCP. v1 sidecars are token-only
-            // (n_ckpt is always 0); v2 appends the checkpoint payloads; v3 keeps
+            // (n_ckpt is always 0); v2 appends the checkpoint payloads; v4 keeps
             // only the 44-byte checkpoint metadata headers and reassembles the
             // payloads from the REGION_CKPT chunks trailing the main/draft ids.
             if (ok && magic == DTS_MAGIC) {
-                uint32_t n_tokens = 0;
-                uint64_t len_main = 0;
-                uint64_t len_drft = 0;
-                uint32_t n_ckpt   = 0;
+                dts_header hdr;
+                ok = disk_parse_dts_header(f, hdr);
 
-                ok = fread(&n_tokens, 4, 1, f) == 1 && fread(&len_main, 8, 1, f) == 1 &&
-                     fread(&len_drft, 8, 1, f) == 1 && fread(&n_ckpt, 4, 1, f) == 1 &&
-                     (version == DTS_VERSION || version == 2 || version == 1) &&
-                     n_tokens <= DPC_MAX_TOKENS && n_ckpt <= DPC_MAX_CHECKPOINTS;
+                llama_tokens dts_tokens(hdr.n_tokens);
+                ok = ok && (hdr.n_tokens == 0 || fread(dts_tokens.data(), sizeof(llama_token), hdr.n_tokens, f) == hdr.n_tokens);
 
-                llama_tokens dts_tokens(n_tokens);
-                ok = ok && (n_tokens == 0 || fread(dts_tokens.data(), sizeof(llama_token), n_tokens, f) == n_tokens);
-
-                // v3 = metadata headers only; v2 = full checkpoint payloads
-                if (ok && version == DTS_VERSION) {
-                    ok = disk_read_ckpt_meta(f, n_ckpt, state.prompt.checkpoints);
-                } else if (ok && version == 2) {
-                    ok = disk_read_ckpt_section(f, n_ckpt, state.prompt.checkpoints);
+                // v4 = metadata headers only; v2 = full checkpoint payloads
+                if (ok && hdr.version == DTS_VERSION) {
+                    ok = disk_read_ckpt_meta(f, hdr.n_ckpt, state.prompt.checkpoints);
+                } else if (ok && hdr.version == 2) {
+                    ok = disk_read_ckpt_section(f, hdr.n_ckpt, state.prompt.checkpoints);
                 }
                 fclose(f);
 
@@ -5071,13 +5120,13 @@ bool server_prompt_cache::load_from_disk_tier(server_prompt & prompt, const serv
                 // (0,0) pair reads as a legacy pre-split entry (all main)
                 {
                     const uint64_t total = (uint64_t) st.chunks.size();
-                    const bool legacy = (len_main == 0 && len_drft == 0);
-                    const uint64_t n_main = legacy ? total : len_main;
-                    const uint64_t n_drft = legacy ? 0 : len_drft;
+                    const bool legacy = (hdr.len_main == 0 && hdr.len_drft == 0);
+                    const uint64_t n_main = legacy ? total : hdr.len_main;
+                    const uint64_t n_drft = legacy ? 0 : hdr.len_drft;
                     // v3: the trailing chunk ids must match, in sidecar order,
                     // the expected REGION_CKPT count for the checkpoint payloads
-                    const uint64_t n_ckpt_ids = version == DTS_VERSION
-                        ? disk_ckpt_chunk_count(n_ckpt, state.prompt.checkpoints) : 0;
+                    const uint64_t n_ckpt_ids = hdr.version == DTS_VERSION
+                        ? disk_ckpt_chunk_count(hdr.n_ckpt, state.prompt.checkpoints) : 0;
                     if (n_main + n_drft + n_ckpt_ids != total) {
                         SRV_ERR("failed to load prompt state from disk ('%s'): split mismatch\n", best_fname.c_str());
                         return false;
@@ -5107,7 +5156,7 @@ bool server_prompt_cache::load_from_disk_tier(server_prompt & prompt, const serv
                         // payload vectors, so a full pass must reproduce them
                         // byte-for-byte; append into the resized buffers via a
                         // write cursor rather than re-inserting
-                        if (version == DTS_VERSION && n_ckpt_ids > 0) {
+                        if (hdr.version == DTS_VERSION && n_ckpt_ids > 0) {
                             uint64_t id_i = n_main + n_drft;
                             for (auto & ckpt : state.prompt.checkpoints) {
                                 std::vector<uint8_t> * streams[3] = { &ckpt.data_tgt, &ckpt.data_dft, &ckpt.data_spec };

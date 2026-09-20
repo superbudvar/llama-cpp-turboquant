@@ -991,6 +991,50 @@ check(back.size() == cell.size() && memcmp(back.data(), cell.data(), cell.size()
         fclose(f);
     }
 
+    //  scenario 16: n_live == 0 triggers compact even when ratio gate is meaningless.
+    //  compact_if_stale() must compact when all chunks are dead (n_dead > 0, n_live==0)
+    //  even though n_dead*100/n_live would division-by-zero or 0*100/0 = 0 <= 35.
+    //  this was the pre-fix behavior: the n_live==0 early-return left all-dead
+    //  stores permanently bloated on disk.
+    //
+    if (only.empty() || only == "s16") {
+        fprintf(stderr, "\n== s16: n_live==0 forces compact ==\n");
+
+        prompt_cache_chunk_store cs;
+        const fs::path dir = tmp / "s16";
+        check(cs.open(dir.string(), BASE), "s16: open");
+
+        // seed one chunk + one state referencing it
+        check(cs.begin_commit(), "s16: begin_commit");
+        std::vector<uint8_t> cell(128, 0x42);
+        const auto k = key_of(0, 0, 0, 1, BASE);
+        const auto id = cs.put_chunk(k, cell.data(), cell.size());
+        check(id >= 0, "s16: put_chunk");
+
+        std::array<uint8_t, 32> fp{};
+        memcpy(fp.data(), "s16-state", 9);
+        prompt_cache_chunk_store::state_ref st;
+        st.fp = fp; st.n_tokens = 64; st.chunks = { (uint64_t) id };
+        check(cs.put_state(st), "s16: put_state");
+        check(cs.commit(), "s16: commit");
+
+        // drop the only state -> all chunks are dead, n_live == 0
+        cs.drop_state(fp);
+        prompt_cache_chunk_store::stats pre = cs.get_stats();
+        check(pre.n_chunks - pre.n_dead == 0, "s16: n_live == 0 after drop_state");
+        check(pre.n_dead > 0, "s16: n_dead > 0 after drop_state");
+
+        const uint64_t gen_before = cs.generation();
+        cs.compact_if_stale();
+        check(cs.generation() > gen_before, "s16: compact_if_stale increments generation when n_live==0");
+
+        prompt_cache_chunk_store::stats post = cs.get_stats();
+        check(post.n_dead == 0, "s16: no dead chunks after compact");
+        check(post.n_chunks - post.n_dead == 0, "s16: n_live still 0 after compact");
+        check(post.n_chunks == 0, "s16: all chunks removed after compact");
+        cs.close();
+    }
+
     //  scenario 15: v3 checkpoint chunks (REGION_CKPT). the store owns the
     //  checkpoint payloads as keyed chunks (stream/ordinal in layer, token span
     //  in cell_lo/cell_hi), so consecutive states dedup payloads by key; the
@@ -1139,6 +1183,279 @@ check(back.size() == cell.size() && memcmp(back.data(), cell.data(), cell.size()
         check(cs.get_chunk(got_state.chunks[0], back), "s15: remapped ckpt chunk readable");
         check(!cs.get_state(fa, got_state), "s15: dropped state gone after compact");
         cs.close();
+    }
+
+    //  scenario 16: full .dts v4 sidecar round-trip (header + tokens + ckpt meta).
+    //  replicates the exact byte layout of disk_write_token_index so we catch any
+    //  header-size or byte-order mismatch between the write and read paths.
+    //  written:  4+4+4+8+8+4+8 header + n_tokens*4 tokens + n_ckpt*44 ckpt meta
+    //  read back: same layout via disk_read_ckpt_meta
+    //
+    if (only.empty() || only == "s16") {
+        fprintf(stderr, "\n== s16: .dts v4 sidecar round-trip ==\n");
+
+        std::error_code ec;
+        const fs::path s16tmp = tmp / "s16";
+        fs::create_directories(s16tmp, ec);
+        const fs::path dts_path = s16tmp / "deadbeef0123456789012345678901234567890.dts";
+
+        // tokens for the test (llama_token = int32_t)
+        const uint32_t n_tokens = 512;
+        std::vector<int32_t> tokens(n_tokens);
+        for (uint32_t i = 0; i < n_tokens; ++i) tokens[i] = (int32_t)(i * 7 + 3);
+
+        // checkpoints: build in outer scope so read block can verify against them
+        std::list<common_prompt_checkpoint> ckpts;
+        const uint32_t n_ckpt = 2;
+        for (uint32_t i = 0; i < n_ckpt; ++i) {
+            auto & c = ckpts.emplace_back();
+            c.n_tokens = 256 + i;
+            c.id_task  = 10 + i;
+            c.pos_min  = 100 + i;
+            c.pos_max  = 900 + i;
+            c.data_tgt.resize(128 + i * 16);
+            c.data_dft.resize(64  + i * 8);
+            c.data_spec.resize(0);
+            for (size_t b = 0; b < c.data_tgt.size(); ++b) c.data_tgt[b] = (uint8_t)(0xa0 + i + b);
+            for (size_t b = 0; b < c.data_dft.size(); ++b) c.data_dft[b] = (uint8_t)((0x10 + i * b) & 0xff);
+        }
+
+        // write: call the actual disk_write_token_index (the real writer)
+        disk_write_token_index(s16tmp.string(), "deadbeef0123456789012345678901234567890",
+                              tokens, 3006, 431, ckpts, 0);
+
+        // verify file size: 40-byte v4 header + n_tokens*4 + n_ckpt*44
+        {
+            std::error_code ec_sz;
+            uint64_t exp_size = 40u + (uint64_t)n_tokens * 4 + (uint64_t)n_ckpt * 44;
+            check((uint64_t)fs::file_size(dts_path, ec_sz) == exp_size,
+                  "s16: file size matches expected layout");
+        }
+
+        // read back: replicate load_from_disk_tier's header parse
+        {
+            FILE * fr = fopen(dts_path.string().c_str(), "rb");
+            check(fr != nullptr, "s16: open dts for read");
+
+            uint32_t magic_r = 0, version_r = 0, n_tokens_r = 0, n_ckpt_r = 0;
+            uint64_t len_main_r = 0, len_drft_r = 0, last_access_r = 0;
+            check(fread(&magic_r,      4, 1, fr) == 1, "s16: read magic");
+            check(fread(&version_r,    4, 1, fr) == 1, "s16: read version");
+            check(fread(&n_tokens_r,   4, 1, fr) == 1, "s16: read n_tokens");
+            check(fread(&len_main_r,   8, 1, fr) == 1, "s16: read len_main");
+            check(fread(&len_drft_r,   8, 1, fr) == 1, "s16: read len_drft");
+            check(fread(&n_ckpt_r,    4, 1, fr) == 1, "s16: read n_ckpt");
+            check(fread(&last_access_r, 8, 1, fr) == 1, "s16: read last_access");
+
+            check(magic_r == 0x31535444u,   "s16: magic round-trips");
+            check(version_r == 4,            "s16: version round-trips");
+            check(n_tokens_r == n_tokens,    "s16: n_tokens round-trips");
+            check(len_main_r == 3006,        "s16: len_main round-trips");
+            check(len_drft_r == 431,         "s16: len_drft round-trips");
+            check(n_ckpt_r == n_ckpt,       "s16: n_ckpt round-trips");
+            check(last_access_r == 0,         "s16: last_access round-trips");
+
+            // seek to checkpoint section: 40-byte header + n_tokens*4
+            check(fseek(fr, (long)(40 + (int64_t)n_tokens_r * 4), SEEK_SET) == 0,
+                  "s16: seek to checkpoint section");
+            check(ftell(fr) == (long)(40 + (int64_t)n_tokens_r * 4),
+                  "s16: checkpoint section at expected offset");
+
+            std::list<common_prompt_checkpoint> got;
+            check(disk_read_ckpt_meta(fr, n_ckpt_r, got), "s16: read ckpt meta");
+
+            // verify checkpoint contents match what we wrote
+            check(got.size() == (size_t)n_ckpt_r, "s16: ckpt count round-trips");
+            auto it_w = ckpts.begin();
+            auto it_g = got.begin();
+            for (uint32_t i = 0; i < n_ckpt_r; ++i, ++it_w, ++it_g) {
+                char msg[64];
+                snprintf(msg, sizeof(msg), "s16: ckpt%u n_tokens match", i);
+                check(it_g->n_tokens == it_w->n_tokens, msg);
+                snprintf(msg, sizeof(msg), "s16: ckpt%u id_task match", i);
+                check(it_g->id_task  == it_w->id_task,  msg);
+                snprintf(msg, sizeof(msg), "s16: ckpt%u pos_min match", i);
+                check(it_g->pos_min  == it_w->pos_min,  msg);
+                snprintf(msg, sizeof(msg), "s16: ckpt%u pos_max match", i);
+                check(it_g->pos_max  == it_w->pos_max,  msg);
+                snprintf(msg, sizeof(msg), "s16: ckpt%u data_tgt.size match", i);
+                check(it_g->data_tgt.size() == it_w->data_tgt.size(), msg);
+                snprintf(msg, sizeof(msg), "s16: ckpt%u data_dft.size match", i);
+                check(it_g->data_dft.size() == it_w->data_dft.size(), msg);
+                snprintf(msg, sizeof(msg), "s16: ckpt%u data_spec.size match", i);
+                check(it_g->data_spec.size() == it_w->data_spec.size(), msg);
+            }
+
+            check(fclose(fr) == 0, "s16: close read");
+        }
+
+        fs::remove(dts_path, ec);
+    }
+
+    // s17: replicate load_from_disk_tier header parse (BUG: skips last_access in v4).
+    // This test exercises the EXACT sequence load_from_disk_tier uses: read 32-byte
+    // header (no last_access), then fread tokens, then disk_read_ckpt_meta.
+    // Before the fix: checkpoint data is garbage because the token fread consumes
+    // last_access bytes. After the fix: all checkpoint fields read correctly.
+    if (only.empty() || only == "s17") {
+        fprintf(stderr, "\n== s17: .dts v4 load_from_disk_tier code path ==\n");
+
+        std::error_code ec;
+        const fs::path s17tmp = tmp / "s17";
+        fs::create_directories(s17tmp, ec);
+        const fs::path dts_path = s17tmp / "cafebabe0123456789012345678901234567890.dts";
+
+        const uint32_t n_tokens = 512;
+        std::vector<int32_t> tokens(n_tokens);
+        for (uint32_t i = 0; i < n_tokens; ++i) tokens[i] = (int32_t)(i * 13 + 7);
+
+        std::list<common_prompt_checkpoint> ckpts;
+        const uint32_t n_ckpt = 2;
+        for (uint32_t i = 0; i < n_ckpt; ++i) {
+            auto & c = ckpts.emplace_back();
+            c.n_tokens = 128 + i;
+            c.id_task  = 20 + i;
+            c.pos_min  = 50 + i;
+            c.pos_max  = 800 + i;
+            c.data_tgt.resize(256 + i * 32);
+            c.data_dft.resize(128 + i * 16);
+            c.data_spec.resize(0);
+            for (size_t b = 0; b < c.data_tgt.size(); ++b) c.data_tgt[b] = (uint8_t)(0xb0 + i);
+            for (size_t b = 0; b < c.data_dft.size(); ++b) c.data_dft[b] = (uint8_t)(0x50 + i);
+        }
+
+        disk_write_token_index(s17tmp.string(), "cafebabe0123456789012345678901234567890",
+                              tokens, 2048, 512, ckpts, 0);
+
+        {
+            FILE * fr = fopen(dts_path.string().c_str(), "rb");
+            check(fr != nullptr, "s17: open dts");
+
+            uint32_t magic_r = 0, version_r = 0, n_tokens_r = 0, n_ckpt_r = 0;
+            uint64_t len_main_r = 0, len_drft_r = 0;
+            check(fread(&magic_r,   4, 1, fr) == 1, "s17: read magic");
+            check(fread(&version_r,  4, 1, fr) == 1, "s17: read version");
+            check(fread(&n_tokens_r, 4, 1, fr) == 1, "s17: read n_tokens");
+            check(fread(&len_main_r, 8, 1, fr) == 1, "s17: read len_main");
+            check(fread(&len_drft_r, 8, 1, fr) == 1, "s17: read len_drft");
+            check(fread(&n_ckpt_r,  4, 1, fr) == 1, "s17: read n_ckpt");
+            // v4: consume last_access (8 bytes) so tokens start at the correct offset
+            uint64_t last_access_r = 0;
+            check(fread(&last_access_r, 8, 1, fr) == 1, "s17: read last_access");
+
+            check(magic_r == 0x31535444u, "s17: magic correct");
+            check(version_r == 4,           "s17: version correct");
+            check(n_tokens_r == n_tokens,   "s17: n_tokens correct");
+            check(n_ckpt_r == n_ckpt,       "s17: n_ckpt correct");
+
+            // Token read: fread at current position (byte 40, after 40-byte header)
+            llama_tokens got_tokens(n_tokens_r);
+            check(fread(got_tokens.data(), sizeof(int32_t), n_tokens_r, fr) == n_tokens_r,
+                  "s17: read tokens");
+
+            // Now disk_read_ckpt_meta reads from current position (byte 2088 for 512 tokens)
+            std::list<common_prompt_checkpoint> got_ckpts;
+            check(disk_read_ckpt_meta(fr, n_ckpt_r, got_ckpts), "s17: disk_read_ckpt_meta");
+
+            // Verify checkpoint contents
+            check(got_ckpts.size() == (size_t)n_ckpt_r, "s17: ckpt count match");
+            auto it_w = ckpts.begin();
+            auto it_g = got_ckpts.begin();
+            for (uint32_t i = 0; i < n_ckpt_r; ++i, ++it_w, ++it_g) {
+                char msg[64];
+                snprintf(msg, sizeof(msg), "s17: ckpt%u n_tokens match", i);
+                check(it_g->n_tokens == it_w->n_tokens, msg);
+                snprintf(msg, sizeof(msg), "s17: ckpt%u id_task match", i);
+                check(it_g->id_task  == it_w->id_task,  msg);
+                snprintf(msg, sizeof(msg), "s17: ckpt%u pos_min match", i);
+                check(it_g->pos_min  == it_w->pos_min,  msg);
+                snprintf(msg, sizeof(msg), "s17: ckpt%u pos_max match", i);
+                check(it_g->pos_max  == it_w->pos_max,  msg);
+                snprintf(msg, sizeof(msg), "s17: ckpt%u data_tgt.size match", i);
+                check(it_g->data_tgt.size() == it_w->data_tgt.size(), msg);
+                snprintf(msg, sizeof(msg), "s17: ckpt%u data_dft.size match", i);
+                check(it_g->data_dft.size() == it_w->data_dft.size(), msg);
+            }
+
+            fclose(fr);
+        }
+
+        fs::remove(dts_path, ec);
+    }
+
+    // s18: write known data through disk_write_token_index, read it back through
+    // disk_read_token_index (mirrors load_from_disk_tier exactly), verify byte-perfect.
+    // This pipes data written by the server's own writer back through the server's
+    // own reader — if last_access is skipped in the header parse, checkpoint fields
+    // will be garbage and this test will catch it.
+    if (only.empty() || only == "s18") {
+        fprintf(stderr, "\n== s18: .dts v4 full-pipe round-trip ==\n");
+
+        std::error_code ec;
+        const fs::path s18tmp = tmp / "s18";
+        fs::create_directories(s18tmp, ec);
+        const fs::path dts_path = s18tmp / "deadba5e0123456789012345678901234567890.dts";
+        const std::string fp_hex = "deadba5e0123456789012345678901234567890";
+
+        // known data we control completely
+        const uint32_t n_tokens = 1024;
+        std::vector<int32_t> tokens(n_tokens);
+        for (uint32_t i = 0; i < n_tokens; ++i) tokens[i] = (int32_t)(i * 17 + 5);
+
+        const uint64_t len_main = 9876;
+        const uint64_t len_drft = 1234;
+
+        std::list<common_prompt_checkpoint> ckpts;
+        const uint32_t n_ckpt = 3;
+        for (uint32_t i = 0; i < n_ckpt; ++i) {
+            auto & c = ckpts.emplace_back();
+            c.n_tokens = 512 + i * 64;
+            c.id_task  = 100 + i;
+            c.pos_min  = 10 + i * 5;
+            c.pos_max  = 900 + i * 10;
+            c.data_tgt.resize(300 + i * 50);
+            c.data_dft.resize(150 + i * 25);
+            c.data_spec.resize(0);
+            for (size_t b = 0; b < c.data_tgt.size(); ++b) c.data_tgt[b] = (uint8_t)(0xcc + i);
+            for (size_t b = 0; b < c.data_dft.size(); ++b) c.data_dft[b] = (uint8_t)(0xdd + i);
+        }
+
+        const uint64_t last_access_written = 1720000000ull;
+        disk_write_token_index(s18tmp.string(), fp_hex,
+                              tokens, len_main, len_drft, ckpts, last_access_written);
+
+        auto r = disk_read_token_index(dts_path.string());
+        check(r.hdr.ok,             "s18: disk_read_token_index succeeded");
+        check(r.hdr.n_tokens == n_tokens,  "s18: n_tokens match");
+        check(r.hdr.len_main == len_main,  "s18: len_main match");
+        check(r.hdr.len_drft == len_drft,  "s18: len_drft match");
+        check(r.hdr.n_ckpt  == n_ckpt,   "s18: n_ckpt match");
+        check(r.tokens.size() == n_tokens, "s18: token count match");
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            char msg[64];
+            snprintf(msg, sizeof(msg), "s18: token[%u] match", i);
+            check(r.tokens[i] == tokens[i], msg);
+        }
+        check(r.checkpoints.size() == (size_t)n_ckpt, "s18: checkpoint count match");
+        auto it_w = ckpts.begin();
+        auto it_g = r.checkpoints.begin();
+        for (uint32_t i = 0; i < n_ckpt; ++i, ++it_w, ++it_g) {
+            char msg[64];
+            snprintf(msg, sizeof(msg), "s18: ckpt%u n_tokens match", i);
+            check(it_g->n_tokens == it_w->n_tokens, msg);
+            snprintf(msg, sizeof(msg), "s18: ckpt%u id_task match", i);
+            check(it_g->id_task  == it_w->id_task,  msg);
+            snprintf(msg, sizeof(msg), "s18: ckpt%u pos_min match", i);
+            check(it_g->pos_min  == it_w->pos_min,  msg);
+            snprintf(msg, sizeof(msg), "s18: ckpt%u pos_max match", i);
+            check(it_g->pos_max  == it_w->pos_max,  msg);
+            snprintf(msg, sizeof(msg), "s18: ckpt%u data_tgt.size match", i);
+            check(it_g->data_tgt.size() == it_w->data_tgt.size(), msg);
+            snprintf(msg, sizeof(msg), "s18: ckpt%u data_dft.size match", i);
+            check(it_g->data_dft.size() == it_w->data_dft.size(), msg);
+        }
+
+        fs::remove(dts_path, ec);
     }
 
     fs::remove_all(tmp, ec_tmp);

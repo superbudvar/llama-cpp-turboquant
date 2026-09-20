@@ -871,9 +871,23 @@ namespace cc_io {
 constexpr uint32_t DPC_MAGIC   = 0x31435044; // "DPC1"
 constexpr uint32_t DPC_VERSION = 3;
 constexpr uint32_t DTS_MAGIC   = 0x31535444; // "DTS1"
-constexpr uint32_t DTS_VERSION = 3;
+constexpr uint32_t DTS_VERSION = 4; // v4: adds last_access_unix(8) after n_ckpt
 constexpr uint32_t DPC_MAX_TOKENS = 1u << 24;
 constexpr uint32_t DPC_MAX_CHECKPOINTS = 1024;
+
+// .dts v4 header fields parsed from disk. both load_from_disk_tier and
+// disk_read_token_index must use disk_parse_dts_header so they cannot drift.
+struct dts_header {
+    uint32_t magic    = 0;
+    uint32_t version  = 0;
+    uint32_t n_tokens = 0;
+    uint64_t len_main = 0;
+    uint64_t len_drft = 0;
+    uint32_t n_ckpt  = 0;
+    uint64_t last_access = 0; // v4 only; 0 for v1/v2/v3
+    bool ok = false;
+};
+bool disk_parse_dts_header(FILE * f, dts_header & h);
 
 // checkpoint section: one record is i64 n_tokens, i32 id_task, i32 pos_min,
 // i32 pos_max, u64 tgt/dft/spec lengths, then the three payloads. both the
@@ -894,6 +908,25 @@ uint64_t disk_ckpt_meta_size(uint32_t n_ckpt);
 // stream tiled at MAX_REC_LEN). the writer sizes its batch reserve with this
 // and the restore validates the trailing chunk count against it.
 uint64_t disk_ckpt_chunk_count(uint32_t n_ckpt, const std::list<common_prompt_checkpoint> & checkpoints);
+
+// result of reading a .dts v4 sidecar back through the load_from_disk_tier path.
+// backed by disk_parse_dts_header so it uses identical code to load_from_disk_tier.
+struct disk_token_index_result {
+    dts_header hdr;
+    llama_tokens tokens;
+    std::list<common_prompt_checkpoint> checkpoints;
+};
+
+// full .dts v4 sidecar writer: header(40B) + tokens + ckpt_meta.
+// exposed for round-trip testing via test-chunk-store s16/s17/s18.
+void disk_write_token_index(const std::string & dir, const std::string & fp_hex,
+                           const llama_tokens & tokens, uint64_t len_main, uint64_t len_drft,
+                           const std::list<common_prompt_checkpoint> & checkpoints,
+                           uint64_t last_access = 0);
+
+// full .dts v4 sidecar reader: mirrors load_from_disk_tier exactly via disk_parse_dts_header.
+// reads header(40B) + tokens + ckpt_meta; returns all fields for verification.
+disk_token_index_result disk_read_token_index(const std::string & path);
 
 struct server_prompt_cache_state {
     server_prompt prompt;
