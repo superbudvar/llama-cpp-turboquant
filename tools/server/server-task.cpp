@@ -1994,59 +1994,6 @@ bool disk_write_ckpt_section(FILE * f, const std::list<common_prompt_checkpoint>
     return ok;
 }
 
-bool disk_read_ckpt_section(FILE * f, uint32_t n_ckpt, std::list<common_prompt_checkpoint> & checkpoints) {
-    auto rd = [&](void * dst, size_t n) { return fread(dst, 1, n, f) == n; };
-
-    bool ok = n_ckpt <= DPC_MAX_CHECKPOINTS;
-
-    // read into a local list and only splice on full success, so a truncated
-    // section never leaves partial records in the caller's state
-    std::list<common_prompt_checkpoint> parsed;
-
-    for (uint32_t i = 0; ok && i < n_ckpt; ++i) {
-        auto & ckpt = parsed.emplace_back();
-
-        uint64_t len_tgt  = 0;
-        uint64_t len_dft  = 0;
-        uint64_t len_spec = 0;
-
-        ok = ok && rd(&ckpt.n_tokens, 8) && rd(&ckpt.id_task, 4) &&
-              rd(&ckpt.pos_min, 4) && rd(&ckpt.pos_max, 4) &&
-              rd(&len_tgt, 8) && rd(&len_dft, 8) && rd(&len_spec, 8);
-
-        ok = ok && len_tgt <= (1ull << 34) && len_dft <= (1ull << 34) && len_spec <= (1ull << 34);
-
-        if (ok) {
-            ckpt.data_tgt.resize(len_tgt);
-            ckpt.data_dft.resize(len_dft);
-            ckpt.data_spec.resize(len_spec);
-            ok = ok && (len_tgt == 0  || fread(ckpt.data_tgt.data(),  1, len_tgt,  f) == len_tgt);
-            ok = ok && (len_dft == 0  || fread(ckpt.data_dft.data(),  1, len_dft,  f) == len_dft);
-            ok = ok && (len_spec == 0 || fread(ckpt.data_spec.data(), 1, len_spec, f) == len_spec);
-        }
-    }
-
-    if (ok) {
-        checkpoints.splice(checkpoints.end(), parsed);
-    }
-
-    return ok;
-}
-
-uint64_t disk_ckpt_section_size(const std::list<common_prompt_checkpoint> & checkpoints, uint32_t n_ckpt) {
-    uint64_t sz = 0;
-
-    uint32_t i = 0;
-    for (const auto & ckpt : checkpoints) {
-        if (i++ >= n_ckpt) {
-            break;
-        }
-        sz += 44 + ckpt.data_tgt.size() + ckpt.data_dft.size() + ckpt.data_spec.size();
-    }
-
-    return sz;
-}
-
 // number of REGION_CKPT chunks a checkpoint's payloads split into: each stream
 // is tiled at MAX_REC_LEN, and an empty stream contributes nothing. the writer
 // (to size ids.reserve) and the restore (to validate the trailing chunk count)
@@ -2158,6 +2105,57 @@ bool disk_read_ckpt_meta(FILE * f, uint32_t n_ckpt, std::list<common_prompt_chec
 
 uint64_t disk_ckpt_meta_size(uint32_t n_ckpt) {
     return ((uint64_t) n_ckpt) * 44;
+}
+
+bool disk_read_ckpt_section(FILE * f, uint32_t n_ckpt, std::list<common_prompt_checkpoint> & checkpoints) {
+    auto rd = [&](void * dst, size_t n) { return fread(dst, 1, n, f) == n; };
+
+    bool ok = n_ckpt <= DPC_MAX_CHECKPOINTS;
+
+    std::list<common_prompt_checkpoint> parsed;
+
+    for (uint32_t i = 0; ok && i < n_ckpt; ++i) {
+        auto & ckpt = parsed.emplace_back();
+
+        uint64_t len_tgt  = 0;
+        uint64_t len_dft  = 0;
+        uint64_t len_spec = 0;
+
+        ok = ok && rd(&ckpt.n_tokens, 8) && rd(&ckpt.id_task, 4) &&
+              rd(&ckpt.pos_min, 4) && rd(&ckpt.pos_max, 4) &&
+              rd(&len_tgt, 8) && rd(&len_dft, 8) && rd(&len_spec, 8);
+
+        ok = ok && len_tgt <= (1ull << 34) && len_dft <= (1ull << 34) && len_spec <= (1ull << 34);
+
+        if (ok) {
+            ckpt.data_tgt.resize(len_tgt);
+            ckpt.data_dft.resize(len_dft);
+            ckpt.data_spec.resize(len_spec);
+            ok = ok && (len_tgt == 0  || fread(ckpt.data_tgt.data(),  1, len_tgt,  f) == len_tgt);
+            ok = ok && (len_dft == 0  || fread(ckpt.data_dft.data(),  1, len_dft,  f) == len_dft);
+            ok = ok && (len_spec == 0 || fread(ckpt.data_spec.data(), 1, len_spec, f) == len_spec);
+        }
+    }
+
+    if (ok) {
+        checkpoints.splice(checkpoints.end(), parsed);
+    }
+
+    return ok;
+}
+
+uint64_t disk_ckpt_section_size(const std::list<common_prompt_checkpoint> & checkpoints, uint32_t n_ckpt) {
+    uint64_t sz = 0;
+
+    uint32_t i = 0;
+    for (const auto & ckpt : checkpoints) {
+        if (i++ >= n_ckpt) {
+            break;
+        }
+        sz += 44 + ckpt.data_tgt.size() + ckpt.data_dft.size() + ckpt.data_spec.size();
+    }
+
+    return sz;
 }
 
 // compact SHA-256 (FIPS 180-4), single-shot. mirrors the core in common/fit-cache.cpp
@@ -3934,82 +3932,7 @@ void server_prompt_checkpoints_wipe(server_prompt & prompt) {
     prompt.checkpoint_spill_path.clear();
 }
 
-// entry layout (all little-endian):
-//   u32 magic, u32 version, u32 n_tokens,
-//   u64 len_main, u64 len_drft, u32 n_checkpoints,
-//   tokens[n_tokens], main[len_main], drft[len_drft],
-//   per checkpoint: i64 n_tokens, i32 id_task, i32 pos_min, i32 pos_max,
-//                   u64 n_tgt, u64 n_dft, u64 n_spec, tgt[n_tgt], dft[n_dft], spec[n_spec]
-namespace {
-bool dpc_write_state(FILE * f, const server_prompt_cache_state & state) {
-    const llama_tokens tokens = state.prompt.tokens.get_text_tokens();
-
-    bool ok = true;
-
-    const uint32_t n_tokens = (uint32_t) tokens.size();
-    const uint64_t len_main = state.data.main.size();
-    const uint64_t len_drft = state.data.drft.size();
-    const uint32_t n_ckpt   = (uint32_t) state.prompt.checkpoints.size();
-
-    ok = ok && fwrite(&n_tokens,     4, 1, f) == 1;
-    ok = ok && fwrite(&len_main,     8, 1, f) == 1;
-    ok = ok && fwrite(&len_drft,     8, 1, f) == 1;
-    ok = ok && fwrite(&n_ckpt,       4, 1, f) == 1;
-    ok = ok && (n_tokens == 0 || fwrite(tokens.data(), sizeof(llama_token), n_tokens, f) == n_tokens);
-    ok = ok && (len_main == 0 || fwrite(state.data.main.data(), 1, len_main, f) == len_main);
-    ok = ok && (len_drft == 0 || fwrite(state.data.drft.data(), 1, len_drft, f) == len_drft);
-
-    ok = ok && disk_write_ckpt_section(f, state.prompt.checkpoints, n_ckpt);
-
-    return ok;
-}
-
-bool dpc_read_state(FILE * f, uint32_t version, server_prompt_cache_state & state) {
-    auto rd = [&](void * dst, size_t n) { return fread(dst, 1, n, f) == n; };
-
-    uint32_t n_tokens = 0;
-    uint64_t len_main = 0;
-    uint64_t len_drft = 0;
-    uint32_t n_ckpt   = 0;
-
-    bool ok = rd(&n_tokens, 4) && rd(&len_main, 8) && rd(&len_drft, 8) && rd(&n_ckpt, 4) &&
-              n_tokens <= DPC_MAX_TOKENS && n_ckpt <= DPC_MAX_CHECKPOINTS &&
-              len_main <= (1ull << 34) && len_drft <= (1ull << 34);
-
-    llama_tokens tokens(n_tokens);
-    ok = ok && (n_tokens == 0 || fread(tokens.data(), sizeof(llama_token), n_tokens, f) == n_tokens);
-
-    state.data.main.resize(len_main);
-    state.data.drft.resize(len_drft);
-    ok = ok && (len_main == 0 || fread(state.data.main.data(), 1, len_main, f) == len_main);
-    ok = ok && (len_drft == 0 || fread(state.data.drft.data(), 1, len_drft, f) == len_drft);
-
-    ok = ok && disk_read_ckpt_section(f, n_ckpt, state.prompt.checkpoints);
-
-    state.prompt.tokens = server_tokens(tokens, false);
-
-    // v2: a shared base section is appended after the checkpoints (dedup, now removed);
-    //     read and discard it so stale v2 entries still load
-    if (ok && version == 2) {
-        int64_t  base_n_tokens = 0;
-        int32_t  base_pos_max  = 0;
-        uint64_t len_base_tgt  = 0;
-        uint64_t len_base_dft  = 0;
-
-        ok = ok && rd(&base_n_tokens, 8) && rd(&base_pos_max, 4) &&
-              rd(&len_base_tgt, 8) && rd(&len_base_dft, 8) &&
-              len_base_tgt <= (1ull << 34) && len_base_dft <= (1ull << 34);
-
-        ok = ok && (len_base_tgt == 0 || fseek(f, len_base_tgt, SEEK_CUR) == 0);
-        ok = ok && (len_base_dft == 0 || fseek(f, len_base_dft, SEEK_CUR) == 0);
-    }
-
-    return ok;
-}
-
-
-} // namespace
-
+static void disk_write_meta_file(const std::string & dir, const std::string & fingerprint);
 
 bool server_prompt_cache::save_to_disk(const std::string & dir, const std::string & fingerprint) const {
     namespace fs = std::filesystem;
@@ -4023,108 +3946,10 @@ bool server_prompt_cache::save_to_disk(const std::string & dir, const std::strin
         }
     }
 
-    const std::string meta_path = (fs::path(dir) / "meta").string();
-    const std::string meta_tmp  = (fs::path(dir) / "meta.tmp").string();
-
-    std::string stored;
-    {
-        std::ifstream in(meta_path, std::ios::binary);
-        stored.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
-        // strip trailing newlines (older saves wrote a trailing '\n')
-        while (!stored.empty() && (stored.back() == '\n' || stored.back() == '\r')) {
-            stored.pop_back();
-        }
-    }
-
-    // a config change invalidates the whole directory
-    if (stored != fingerprint) {
-        SRV_INF(" - disk prompt cache: fingerprint changed, clearing '%s'\n", dir.c_str());
-        for (auto & entry : fs::directory_iterator(dir, ec)) {
-            if (entry.path().extension() == ".dpc" || entry.path().extension() == ".dts" ||
-                entry.path().extension() == ".ccn" ||
-                entry.path().extension() == ".dcp" || entry.path().extension() == ".dci") {
-                fs::remove(entry.path(), ec);
-            }
-        }
-    }
-
-    bool ok = true;
-
-    for (const auto & state : states) {
-        // media placeholders cannot be rebuilt from token ids, skip such entries
-        if (state.prompt.tokens.has_media()) {
-            SRV_TRC("%s", " - disk prompt cache: skipping media prompt\n");
-            continue;
-        }
-
-        // disk-full write guard: same rule as the write-through path. evict-first
-        // from the shared pool, then skip the entry if the volume is still tight
-        const llama_tokens tokens = state.prompt.tokens.get_text_tokens();
-        const std::string fname = dpc_sha256_hex((const uint8_t *) tokens.data(), tokens.size() * sizeof(llama_token)) + ".dpc";
-        const std::string path  = (fs::path(dir) / fname).string();
-        const std::string tmp   = path + ".tmp";
-
-        {
-            const fs::path root = fs::path(dir).parent_path();
-            const uint64_t need = (uint64_t) state.size() + 64ull * 1024 * 1024;
-
-            std::error_code ec_space;
-            const auto free0 = fs::space(root, ec_space).available;
-            if (!ec_space && free0 < need) {
-                prune_disk_budget(dir, need);
-                const auto free1 = fs::space(root, ec_space).available;
-                if (ec_space || free1 < need) {
-                    SRV_WRN(" - disk prompt cache: skipping save '%s' - %.3f MiB free (need %.3f MiB)\n",
-                            fname.c_str(), (double) free1 / (1024.0 * 1024.0), (double) need / (1024.0 * 1024.0));
-                    continue;
-                }
-            }
-        }
-
-        FILE * f = fopen(tmp.c_str(), "wb");
-        if (f == nullptr) {
-            SRV_WRN(" - disk prompt cache: cannot open '%s'\n", tmp.c_str());
-            ok = false;
-            continue;
-        }
-
-        const uint32_t magic   = DPC_MAGIC;
-        const uint32_t version = DPC_VERSION;
-
-        bool entry_ok = fwrite(&magic, 4, 1, f) == 1 && fwrite(&version, 4, 1, f) == 1 && dpc_write_state(f, state);
-        fclose(f);
-
-        if (entry_ok) {
-            fs::rename(tmp, path, ec);
-            if (ec) {
-                SRV_WRN(" - disk prompt cache: rename to '%s' failed: %s\n", path.c_str(), ec.message().c_str());
-                ok = false;
-            }
-        } else {
-            SRV_WRN(" - disk prompt cache: write to '%s' failed\n", tmp.c_str());
-            ok = false;
-        }
-    }
-
-    // entries that left the RAM tier stay on disk: only a config change (handled
-    // above) clears the directory. enforce the independent disk budget instead,
-    // removing the oldest entries first.
-    prune_disk_budget(dir);
-
-    // the fingerprint is written last: an interrupted save leaves the old meta
-    // in place and the directory is never treated as valid against the new config
-    {
-        std::ofstream out(meta_tmp, std::ios::binary);
-        out.write(fingerprint.data(), (std::streamsize) fingerprint.size());
-        out.close();
-    }
-    fs::rename(meta_tmp, meta_path, ec);
-    if (ec) {
-        SRV_WRN(" - disk prompt cache: failed to write meta: %s\n", ec.message().c_str());
-        ok = false;
-    }
-
-    return ok;
+    // v4 only: all data is already in the chunk store (cache.dcp + .dts sidecars).
+    // this call only updates the meta fingerprint so the directory is valid on boot.
+    disk_write_meta_file(dir, fingerprint);
+    return true;
 }
 
 void server_prompt_cache::prune_disk_budget(const std::string & dir, uint64_t min_free) const {
@@ -4233,10 +4058,10 @@ void server_prompt_cache::prune_pool(const std::string & root, const std::string
             if (f) {
                 uint32_t magic = 0, version = 0, n_tokens = 0;
                 if (fread(&magic, 4, 1, f) == 1 && magic == DTS_MAGIC &&
-                    fread(&version, 4, 1, f) == 1 && (version == DTS_VERSION || version == 2 || version == 1) &&
+                    fread(&version, 4, 1, f) == 1 && version == DTS_VERSION &&
                     fread(&n_tokens, 4, 1, f) == 1 && n_tokens > 0 && n_tokens <= 131072) {
-                        // skip len_main(8) + len_drft(8) + n_ckpt(4) = 20 bytes
-                        fseek(f, 20, SEEK_CUR);
+                        // skip len_main(8) + len_drft(8) + n_ckpt(4) + last_access(8) = 28 bytes
+                        fseek(f, 28, SEEK_CUR);
                         std::vector<int32_t> tokens(n_tokens);
                         if (fread(tokens.data(), sizeof(int32_t), n_tokens, f) == n_tokens) {
                             std::array<uint8_t, 32> fp;
@@ -4461,42 +4286,16 @@ void disk_write_token_index(const std::string & dir, const std::string & fp_hex,
     const uint32_t n_tokens = (uint32_t) tokens.size();
     uint32_t n_ckpt = (uint32_t) std::min<size_t>(checkpoints.size(), DPC_MAX_CHECKPOINTS);
 
-    // never let the checkpoint section push the volume full: measure what the
-    // meta-only section needs and when free space cannot hold it (plus 64 MiB
-    // headroom) write a v1 token-only sidecar instead - restore degrades to a
-    // full re-prefill, the store batch itself is already committed at this point
-    const uint64_t ckpt_section = disk_ckpt_meta_size(n_ckpt);
-    uint32_t version = DTS_VERSION;
-    if (ckpt_section > 0) {
-        std::error_code ecs;
-        const uint64_t free = fs::space(fs::path(dir), ecs).available;
-        if (ecs || free < ckpt_section + 64ull * 1024 * 1024) {
-            SRV_WRN(" - disk prompt cache: %.3f MiB free cannot hold %zu MiB of checkpoint metadata in '%s', writing v1 sidecar (no checkpoints)\n",
-                    free / (1024.0 * 1024.0), ckpt_section / (1024 * 1024), fp_hex.c_str());
-            version = 1;
-            n_ckpt  = 0;
-        }
-    }
-
-    // len_* fields carry the chunk-id split in store order: the first len_main
-    // ids reassemble the main blob, the following len_drft reassemble the draft
-    // blob. a (0,0) pair reads as a legacy pre-split entry (all main chunks)
+    // v4: always write last_access + checkpoint metadata (44-byte headers, no payloads)
     bool ok = fwrite(&DTS_MAGIC,   4, 1, f) == 1;
-    ok = ok && fwrite(&version,     4, 1, f) == 1;
+    ok = ok && fwrite(&DTS_VERSION, 4, 1, f) == 1;
     ok = ok && fwrite(&n_tokens,    4, 1, f) == 1;
     ok = ok && fwrite(&len_main,    8, 1, f) == 1;
     ok = ok && fwrite(&len_drft,    8, 1, f) == 1;
     ok = ok && fwrite(&n_ckpt,      4, 1, f) == 1;
-    // v4: last_access_unix (8 bytes) — must be written before tokens
-    if (version == 4) {
-        ok = ok && fwrite(&last_access, 8, 1, f) == 1;
-    }
+    ok = ok && fwrite(&last_access,  8, 1, f) == 1;
     ok = ok && (n_tokens == 0 || fwrite(tokens.data(), sizeof(llama_token), n_tokens, f) == n_tokens);
-
-    // v4: the meta-only checkpoint section (44-byte headers, no payloads)
-    if (version == DTS_VERSION) {
-        ok = ok && disk_write_ckpt_meta(f, checkpoints, n_ckpt);
-    }
+    ok = ok && disk_write_ckpt_meta(f, checkpoints, n_ckpt);
     fclose(f);
 
     if (!ok) {
@@ -4842,100 +4641,9 @@ void server_prompt_cache::disk_run_state_job(disk_write_job & job) {
         return;
     }
 
-    const std::string fname = dpc_sha256_hex((const uint8_t *) tokens.data(), tokens.size() * sizeof(llama_token)) + ".dpc";
-    const std::string path  = (fs::path(dir) / fname).string();
-    const std::string tmp   = path + ".tmp";
-
-    // disk-full write guard: never attempt a write into a full volume. the pool
-    // root is the parent of the per-preset dir; when the free space is below the
-    // write need plus a safety margin, evict-first from the shared pool and only
-    // then write; if still insufficient, skip the write entirely
-    {
-        const fs::path root = fs::path(dir).parent_path();
-        const uint64_t need = (uint64_t) state.size() + 64ull * 1024 * 1024; // entry + 64 MiB headroom
-
-        std::error_code ec_space;
-        const auto free0 = fs::space(root, ec_space).available;
-        if (!ec_space && free0 < need) {
-            std::vector<std::array<uint8_t, 32>> evicted;
-            disk_prune_dpc(dir, &evicted, need);
-            if (!evicted.empty()) {
-                std::lock_guard<std::mutex> store_lock(disk_store_mtx_);
-                if (disk_store_) {
-                    disk_store_->drop_evicted(evicted);
-                }
-            }
-            const auto free1 = fs::space(root, ec_space).available;
-            if (ec_space || free1 < need) {
-                SRV_WRN(" - disk prompt cache: skipping write-through '%s' - %.3f MiB free (need %.3f MiB)\n",
-                        fname.c_str(), (double) free1 / (1024.0 * 1024.0), (double) need / (1024.0 * 1024.0));
-                return;
-            }
-        }
-    }
-
-    FILE * f = fopen(tmp.c_str(), "wb");
-    if (f == nullptr) {
-        SRV_WRN(" - disk prompt cache: cannot open '%s'\n", tmp.c_str());
-        return;
-    }
-
-    const uint32_t magic   = DPC_MAGIC;
-    const uint32_t version = DPC_VERSION;
-
-    bool ok = fwrite(&magic, 4, 1, f) == 1 && fwrite(&version, 4, 1, f) == 1 && dpc_write_state(f, state);
-    fclose(f);
-
-    if (!ok) {
-        SRV_WRN(" - disk prompt cache: write to '%s' failed\n", tmp.c_str());
-        std::error_code ec_rm;
-        fs::remove(tmp, ec_rm);
-        return;
-    }
-
-    fs::rename(tmp, path, ec);
-    if (ec) {
-        SRV_WRN(" - disk prompt cache: rename to '%s' failed: %s\n", path.c_str(), ec.message().c_str());
-        return;
-    }
-
-    // append to the index and flag it valid so later matches do not need a reload
-    {
-        std::lock_guard<std::mutex> lock(disk_index_mtx_);
-        disk_entries.push_back({ fname, path, state.prompt.tokens.clone(), (size_t) fs::file_size(path, ec) });
-        disk_index_valid = true;
-    }
-
-    // .dpc-only prune; .ccn files are owned by the main thread and budgeted at exit
-    {
-        std::vector<std::array<uint8_t, 32>> evicted;
-        disk_prune_dpc(dir, &evicted);
-        if (!evicted.empty()) {
-            std::lock_guard<std::mutex> store_lock(disk_store_mtx_);
-            if (disk_store_) {
-                disk_store_->drop_evicted(evicted);
-            }
-        }
-    }
-
-    // keep the in-memory index in sync with any entries the prune removed
-    {
-        std::error_code ec_x;
-        std::lock_guard<std::mutex> lock(disk_index_mtx_);
-        disk_entries.erase(
-            std::remove_if(disk_entries.begin(), disk_entries.end(),
-                [&](const disk_entry & e) {
-                    return !fs::exists(e.path, ec_x);
-                }),
-            disk_entries.end());
-    }
-
-    // keep the meta file current so a later shutdown save does not treat this
-    // directory as a config mismatch and clear the freshly written entries
-    disk_write_meta_file(dir, fingerprint);
-
-    const size_t state_bytes = state.size();
-    SRV_INF(" - disk prompt cache: wrote through state '%s' (%.3f MiB)\n", fname.c_str(), state_bytes / (1024.0 * 1024.0));
+    // v4 only: chunk-store write-through is required. the legacy .dpc fallback is
+    // no longer supported — if the chunk store write failed, the entry is dropped
+    SRV_WRN("v4 only: chunk store write failed, dropping state%s", "");
 }
 
 void server_prompt_cache::disk_run_sidecar_job(disk_write_job & job) {
@@ -5060,24 +4768,26 @@ bool server_prompt_cache::load_from_disk_tier(server_prompt & prompt, const serv
             // payloads from the REGION_CKPT chunks trailing the main/draft ids.
             if (ok && magic == DTS_MAGIC) {
                 dts_header hdr;
-                ok = disk_parse_dts_header(f, hdr);
-
-                llama_tokens dts_tokens(hdr.n_tokens);
-                ok = ok && (hdr.n_tokens == 0 || fread(dts_tokens.data(), sizeof(llama_token), hdr.n_tokens, f) == hdr.n_tokens);
-
-                // v4 = metadata headers only; v2 = full checkpoint payloads
-                if (ok && hdr.version == DTS_VERSION) {
-                    ok = disk_read_ckpt_meta(f, hdr.n_ckpt, state.prompt.checkpoints);
-                } else if (ok && hdr.version == 2) {
-                    ok = disk_read_ckpt_section(f, hdr.n_ckpt, state.prompt.checkpoints);
-                }
-                fclose(f);
-
-                if (!ok) {
-                    SRV_ERR("failed to load prompt state from disk ('%s')\n", best_fname.c_str());
-
+                if (!disk_parse_dts_header(f, hdr)) {
+                    SRV_ERR("load_from_disk_tier: disk_parse_dts_header failed for '%s'\n", best_fname.c_str());
+                    fclose(f);
                     return false;
                 }
+
+                llama_tokens dts_tokens(hdr.n_tokens);
+                if (hdr.n_tokens > 0 && fread(dts_tokens.data(), sizeof(llama_token), hdr.n_tokens, f) != hdr.n_tokens) {
+                    SRV_ERR("load_from_disk_tier: token fread failed for '%s' (n_tokens=%u)\n", best_fname.c_str(), hdr.n_tokens);
+                    fclose(f);
+                    return false;
+                }
+
+                // v4 = metadata headers only
+                if (!disk_read_ckpt_meta(f, hdr.n_ckpt, state.prompt.checkpoints)) {
+                    SRV_ERR("load_from_disk_tier: disk_read_ckpt_meta failed for '%s' (n_ckpt=%u)\n", best_fname.c_str(), hdr.n_ckpt);
+                    fclose(f);
+                    return false;
+                }
+                fclose(f);
 
                 // ensure the chunk store is open; the same pool instance serves
                 // the writer thread, and io_mtx_ guards the concurrent reads
@@ -5106,9 +4816,13 @@ bool server_prompt_cache::load_from_disk_tier(server_prompt & prompt, const serv
                 dpc_sha256_raw((const uint8_t *) dts_tokens.data(), dts_tokens.size() * sizeof(llama_token), fp.data());
 
                 prompt_cache_chunk_store::state_ref st;
-                if (!disk_store_->get_state(fp, st) || st.n_tokens != (uint64_t) dts_tokens.size()) {
-                    SRV_WRN(" - disk prompt cache: entry '%s' no longer in the chunk store, dropping stale entry\n", best_path.c_str());
-
+                if (!disk_store_->get_state(fp, st)) {
+                    SRV_ERR("load_from_disk_tier: chunk store get_state failed for '%s' (fp mismatch - likely old index with garbage tokens)\n", best_fname.c_str());
+                    drop_stale();
+                    continue;
+                }
+                if (st.n_tokens != (uint64_t) dts_tokens.size()) {
+                    SRV_ERR("load_from_disk_tier: chunk store n_tokens mismatch for '%s': dts_tokens=%zu st.n_tokens=%llu\n", best_fname.c_str(), dts_tokens.size(), (unsigned long long) st.n_tokens);
                     drop_stale();
                     continue;
                 }
@@ -5238,14 +4952,10 @@ bool server_prompt_cache::load_from_disk_tier(server_prompt & prompt, const serv
                 state.prompt.tokens = server_tokens(dts_tokens, false);
                 restored_from_store = true;
             } else {
-                ok = ok && (magic == DPC_MAGIC && (version == DPC_VERSION || version == 2 || version == 1)) && dpc_read_state(f, version, state);
+                // v4 only: non-DTS files are unsupported
+                SRV_ERR("load_from_disk_tier: unsupported file format '%s' (not .dts v4)\n", best_fname.c_str());
                 fclose(f);
-
-                if (!ok) {
-                    SRV_ERR("failed to load prompt state from disk ('%s')\n", best_fname.c_str());
-
-                    return false;
-                }
+                return false;
             }
         }
 
@@ -5342,8 +5052,7 @@ size_t server_prompt_cache::load_disk_index(const std::string & dir, const std::
 
     std::vector<fs::path> files;
     for (auto & entry : fs::directory_iterator(dir, ec)) {
-        const auto ext = entry.path().extension();
-        if (ext == ".dpc" || ext == ".dts") {
+        if (entry.path().extension() == ".dts") {
             files.push_back(entry.path());
         }
     }
@@ -5369,13 +5078,14 @@ size_t server_prompt_cache::load_disk_index(const std::string & dir, const std::
         uint64_t len_main = 0;
         uint64_t len_drft = 0;
         uint32_t n_ckpt   = 0;
+        uint64_t last_access = 0;
 
         bool ok =
             fread(&magic, 4, 1, f) == 1 && fread(&version, 4, 1, f) == 1 &&
             fread(&n_tokens, 4, 1, f) == 1 && fread(&len_main, 8, 1, f) == 1 &&
             fread(&len_drft, 8, 1, f) == 1 && fread(&n_ckpt, 4, 1, f) == 1 &&
-            (magic == DPC_MAGIC ? (version == DPC_VERSION || version == 2 || version == 1)
-                                : (magic == DTS_MAGIC && (version == DTS_VERSION || version == 2 || version == 1))) &&
+            fread(&last_access, 8, 1, f) == 1 &&
+            magic == DTS_MAGIC && version == DTS_VERSION &&
             n_tokens <= DPC_MAX_TOKENS && n_ckpt <= DPC_MAX_CHECKPOINTS;
 
         llama_tokens tokens(n_tokens);
