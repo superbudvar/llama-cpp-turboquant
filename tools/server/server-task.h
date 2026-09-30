@@ -679,7 +679,7 @@ class prompt_cache_chunk_store {
 public:
     static constexpr uint32_t DCP_MAGIC   = 0x54514331; // "TQC1"
     static constexpr uint32_t DCI_MAGIC   = 0x31494344; // "DCI1"
-    static constexpr uint32_t FORMAT_VER  = 2;
+    static constexpr uint32_t FORMAT_VER  = 3;
 
     // TURBO_DISK_CHUNK_STORE=0 disables the store entirely (legacy .dpc writer,
     // one-pass rollback prune of store files at boot). read once per process.
@@ -787,6 +787,7 @@ public:
     void drop_evicted(const std::vector<std::array<uint8_t, 32>> & fps);  // batch tombstone for prune_pool evictions
     uint64_t compact();          // returns bytes freed; keeps all offsets valid
     void compact_if_stale();     // compact when dead/live chunk ratio > 0.35
+    bool should_compact(uint64_t disk_max_size = 0);  // true if any trigger condition is met
     void write_index();          // lazily flush cache.dci (before close/compact)
 
     stats get_stats() const;
@@ -953,6 +954,16 @@ struct server_prompt_cache {
         // 0 disables the store-cap pass (only the shared-pool budget applies).
         this->disk_max_store_size = disk_store_mib > 0 ? 1024ull*1024ull*disk_store_mib
                                                        : (this->disk_max_size * 6) / 10;
+        start_vacuum_thread();
+    }
+
+    ~server_prompt_cache() {
+        drain_disk_writes();
+        if (vacuum_thread_.joinable()) {
+            vacuum_stop_.store(true, std::memory_order_relaxed);
+            vacuum_cv_.notify_one();
+            vacuum_thread_.join();
+        }
     }
 
     std::list<server_prompt_cache_state> states;
@@ -1098,6 +1109,14 @@ private:
     std::condition_variable disk_jobs_cv_;
     std::deque<disk_write_job> disk_jobs_;
     bool disk_thread_stop_ = false;
+
+    // vacuum thread: sweeps all model cache dirs every 5 min and compacts .dcp stores
+    void start_vacuum_thread();
+    void vacuum_sweep_all();
+    std::thread vacuum_thread_;
+    std::mutex vacuum_mtx_;
+    std::condition_variable vacuum_cv_;
+    std::atomic<bool> vacuum_stop_{false};
 
     // guards disk_entries and disk_index_valid between the loop thread and the writer
     std::mutex disk_index_mtx_;

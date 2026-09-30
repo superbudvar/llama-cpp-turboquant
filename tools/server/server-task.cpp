@@ -2376,6 +2376,8 @@ struct prompt_cache_chunk_store::impl {
     std::map<std::string, uint64_t> state_tokens_;          // fp-str -> n_tokens
     std::map<chunk_key, uint64_t>  by_key_;                 // dedup oracle -> chunk id
 
+    uint64_t n_tombs_ = 0;   // persistent tombstone count in .dci header
+
     bool writable_   = false;
     bool want_dedup_ = true;
     bool dci_valid_  = false;
@@ -2393,7 +2395,7 @@ struct prompt_cache_chunk_store::impl {
         return CHUNK_REC_HDR + ((len + 7) & ~(size_t) 7);
     }
 
-    bool file_size_of(const std::string & path, uint64_t & out) {
+    bool file_size_of(const std::string & path, uint64_t & out) const {
         std::error_code ec;
         const uintmax_t sz = std::filesystem::file_size(path, ec);
         if (ec) {
@@ -2537,6 +2539,7 @@ struct prompt_cache_chunk_store::impl {
         states_.clear();
         state_tokens_.clear();
         by_key_.clear();
+        n_tombs_ = 0;
 
         // read and verify the header first
         uint8_t hdr[24];
@@ -2633,6 +2636,7 @@ struct prompt_cache_chunk_store::impl {
                 memcpy(fp.data(), payload.data(), 32);
                 states_.erase(fp_str(fp));
                 state_tokens_.erase(fp_str(fp));
+                n_tombs_++;
             }
 
             off += (int64_t) rec_size(len);
@@ -2655,8 +2659,8 @@ struct prompt_cache_chunk_store::impl {
         if (!in) {
             return false;
         }
-        uint8_t hdr[48];
-        in.read((char *) hdr, 48);
+        uint8_t hdr[52];
+        in.read((char *) hdr, 52);
         if (!in || cc_io::get_u32(hdr) != DCI_MAGIC || cc_io::get_u32(hdr + 4) != FORMAT_VER) {
             return false;
         }
@@ -2671,6 +2675,7 @@ struct prompt_cache_chunk_store::impl {
         }
         const uint32_t n_chunks = cc_io::get_u32(hdr + 32);
         const uint32_t n_states = cc_io::get_u32(hdr + 36);
+        n_tombs_ = cc_io::get_u64(hdr + 40);
 
         chunks_.clear();
         states_.clear();
@@ -2730,7 +2735,7 @@ struct prompt_cache_chunk_store::impl {
         if (!out) {
             return;
         }
-        uint8_t hdr[48];
+        uint8_t hdr[52];
         memset(hdr, 0, sizeof(hdr));
         cc_io::put_u32(hdr,      DCI_MAGIC);
         cc_io::put_u32(hdr + 4,  FORMAT_VER);
@@ -2741,7 +2746,8 @@ struct prompt_cache_chunk_store::impl {
         cc_io::put_u64(hdr + 24, dcp_size);
         cc_io::put_u32(hdr + 32, (uint32_t) chunks_.size());
         cc_io::put_u32(hdr + 36, (uint32_t) states_.size());
-        out.write((const char *) hdr, 48);
+        cc_io::put_u64(hdr + 40, n_tombs_);
+        out.write((const char *) hdr, 52);
 
         for (size_t i = 0; i < chunks_.size(); i++) {
             uint8_t e[48];
@@ -3203,6 +3209,7 @@ void prompt_cache_chunk_store::drop_state(const std::array<uint8_t, 32> & fp) {
         I.sync_file();
         I.committed_gen_++;
         I.dci_valid_ = false;
+        I.n_tombs_++;
         // unref and drop
         for (uint64_t id : it->second) {
             if (id < I.chunks_.size() && I.chunks_[id].refs > 0) {
@@ -3241,6 +3248,7 @@ void prompt_cache_chunk_store::drop_evicted(const std::vector<std::array<uint8_t
             I.sync_file();
             I.committed_gen_++;
             I.dci_valid_ = false;
+            I.n_tombs_++;
             for (uint64_t id : I.states_[fp_s]) {
                 if (id < I.chunks_.size() && I.chunks_[id].refs > 0) {
                     I.chunks_[id].refs--;
@@ -3257,13 +3265,15 @@ void prompt_cache_chunk_store::drop_evicted(const std::vector<std::array<uint8_t
     }
 }
 
-void prompt_cache_chunk_store::compact_if_stale() {
+bool prompt_cache_chunk_store::should_compact(uint64_t disk_max_size) {
     if (!p_) {
-        return;
+        return false;
     }
     impl & I = *p_;
-    // read stats without the lock (n_dead/n_chunks are only written under io_mtx_
-    // by compact/drop_state, and stale reads are harmless here)
+    if (!I.writable_ || I.queued_gen_ != 0) {
+        return false;
+    }
+
     uint64_t n_dead = 0, n_total = 0;
     {
         std::lock_guard<std::mutex> lk(I.io_mtx_);
@@ -3274,11 +3284,52 @@ void prompt_cache_chunk_store::compact_if_stale() {
             }
         }
     }
+
+    if (n_total == 0) {
+        return false;
+    }
+
     const uint64_t n_live = n_total - n_dead;
-    if (n_dead == 0 || (n_live > 0 && n_dead * 100 / n_live <= 35)) {
+
+    // Trigger 1: dead/live ratio > 35% (existing behavior, always checked)
+    // also compact when n_live == 0 && n_dead > 0 (all chunks are dead)
+    if (n_live == 0 && n_dead > 0) {
+        return true;
+    }
+    if (n_live > 0 && n_dead * 100 / n_live > 35) {
+        return true;
+    }
+
+    // Triggers 2 and 3 only fire when disk_max_size > 0 (vacuum + non-eviction path)
+    if (disk_max_size == 0) {
+        return false;
+    }
+
+    // Trigger 2: tomb/live ratio > 20% (persistent tombstones from evicted .dts)
+    if (n_live > 0 && I.n_tombs_ > 0 && I.n_tombs_ * 100 / n_live > 20) {
+        return true;
+    }
+
+    // Trigger 3: .dcp size > 50% of disk_max_size (eager, size-based)
+    uint64_t dcp_size = 0;
+    if (I.file_size_of(I.dcp_path_, dcp_size) && dcp_size > disk_max_size * 50 / 100) {
+        return true;
+    }
+
+    return false;
+}
+
+void prompt_cache_chunk_store::compact_if_stale() {
+    if (!p_) {
         return;
     }
-    // compact() acquires io_mtx_ internally; no lock held here
+    // compact_if_stale is called after drop_evicted in the eviction path.
+    // it checks dead/live > 35% and tomb/live > 20% (size trigger is handled
+    // separately in the non-eviction path of disk_run_state_job).
+    if (!should_compact(0)) {
+        return;
+    }
+    // compact() acquires io_mtx_ internally
     compact();
 }
 
@@ -3427,6 +3478,7 @@ uint64_t prompt_cache_chunk_store::compact() {
             }
         }
         I.recompute_refs();
+        I.n_tombs_ = 0;   // tombstones are dropped by compaction
 
         if (!I.file_size_of(I.dcp_path_, after)) {
             after = before;
@@ -4217,6 +4269,62 @@ void server_prompt_cache::drain_disk_writes() {
     disk_thread_.join();
 }
 
+void server_prompt_cache::start_vacuum_thread() {
+    if (disk_max_size == 0) {
+        return;   // no disk budget: vacuum disabled
+    }
+    if (vacuum_thread_.joinable()) {
+        return;
+    }
+    try {
+        vacuum_thread_ = std::thread([this] {
+            constexpr auto INTERVAL = std::chrono::minutes(5);
+            std::unique_lock<std::mutex> lk(vacuum_mtx_);
+            while (!vacuum_stop_.load(std::memory_order_relaxed)) {
+                vacuum_cv_.wait_for(lk, INTERVAL, [this] {
+                    return vacuum_stop_.load(std::memory_order_relaxed);
+                });
+                if (vacuum_stop_.load(std::memory_order_relaxed)) {
+                    break;
+                }
+                lk.unlock();
+                vacuum_sweep_all();
+                lk.lock();
+            }
+        });
+    } catch (const std::system_error & e) {
+        SRV_WRN(" - disk prompt cache: failed to start vacuum thread: %s\n", e.what());
+    }
+}
+
+void server_prompt_cache::vacuum_sweep_all() {
+    namespace fs = std::filesystem;
+    if (disk_dir_.empty()) {
+        return;
+    }
+    const fs::path root = fs::path(disk_dir_).parent_path();
+    std::error_code ec;
+    if (!fs::is_directory(root, ec)) {
+        return;
+    }
+    for (const auto & sd : fs::directory_iterator(root, ec)) {
+        if (!sd.is_directory(ec)) {
+            continue;
+        }
+        const auto sub = sd.path();
+        // each subdir gets its own temporary store so we never conflict with
+        // the writer thread's disk_store_
+        prompt_cache_chunk_store vacuum_store;
+        if (!vacuum_store.open(sub.string(), 0)) {
+            continue;  // no .dcp here or locked by writer
+        }
+        if (vacuum_store.should_compact(disk_max_size)) {
+            vacuum_store.compact();
+        }
+        vacuum_store.close();
+    }
+}
+
 bool server_prompt_cache::enqueue_sidecar(const std::string & path, std::vector<uint8_t> bytes) {
     start_disk_thread();
     if (!disk_thread_.joinable()) {
@@ -4581,9 +4689,8 @@ void server_prompt_cache::disk_thread_main() {
 void server_prompt_cache::disk_run_state_job(disk_write_job & job) {
     namespace fs = std::filesystem;
 
-    const auto & dir        = job.dir;
-    const auto & fingerprint = job.fingerprint;
-    auto & state             = *job.state;
+    const auto & dir  = job.dir;
+    auto & state      = *job.state;
 
     std::error_code ec;
     if (!fs::is_directory(dir, ec)) {
@@ -4624,7 +4731,15 @@ void server_prompt_cache::disk_run_state_job(disk_write_job & job) {
             std::lock_guard<std::mutex> store_lock(disk_store_mtx_);
             if (disk_store_) {
                 disk_store_->drop_evicted(evicted);
-                disk_store_->compact_if_stale();
+                if (evicted.empty()) {
+                    // no .dts eviction occurred: check size-based trigger
+                    if (disk_store_->should_compact(disk_max_size)) {
+                        disk_store_->compact();
+                    }
+                } else {
+                    // eviction path: compact_if_stale checks dead/live and tomb/live
+                    disk_store_->compact_if_stale();
+                }
             }
         }
 
