@@ -989,11 +989,18 @@ static void common_params_fit_impl(
         // file-static cache: captured once, reused for all subsequent calls
         static per_device_layer_costs cached_costs;
         static bool cached = false;
+        static bool capture_invalid = false; // set when first-call load placed nothing on any GPU device (model went to host)
         static std::string cached_path;
 
         // re-capture if model path changed (new model in same session)
         if (!cached || cached_path != path_model) {
             cached_path = path_model;
+            cached = false;
+        }
+        // If a previous capture attempt placed everything on host (no GPU
+        // placement), the per-layer costs are zero and the analytical path is
+        // unsafe. Keep the cache empty so every call falls back to a full load.
+        if (capture_invalid) {
             cached = false;
         }
 
@@ -1015,7 +1022,30 @@ static void common_params_fit_impl(
             }
 
             cached_costs = costs;
-            cached = true;
+            // Detect "model went to host" — if no layer was placed on any GPU
+            // device (all per-device bytes are 0), the capture is invalid. The
+            // requested split didn't fit on any device and ggml silently moved
+            // the model to host. Subsequent analytical recomputes would be wrong
+            // for every split, so mark the cache as invalid and force every
+            // call to do a full load.
+            int64_t bytes_total = 0;
+            for (auto b : costs.bytes) bytes_total += b;
+            for (auto ld : costs.layer_dev) {
+                if (ld >= 0) {
+                    // at least one layer was on some device
+                    bytes_total = 1;
+                    break;
+                }
+            }
+            if (bytes_total == 0) {
+                capture_invalid = true;
+                cached = false;
+                LOG_WRN("%s: first-call load placed no tensors on any GPU device "
+                    "(model went to host); per-layer cache is invalid, every call "
+                    "will fall back to a full load\n", func_name);
+            } else {
+                cached = true;
+            }
             LOG_TRC("%s: Option B first-call load captured %zu layers x %zu devices per-layer costs + "
                 "context+compute overhead\n",
                 func_name, costs.n_layer_all, costs.n_device);
