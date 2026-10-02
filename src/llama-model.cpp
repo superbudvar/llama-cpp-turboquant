@@ -1397,7 +1397,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const int n_layer_all = hparams.n_layer_all;
     const int n_gpu_layers = this->n_gpu_layers();
 
-    const bool use_mmap_buffer = true;
+    const bool use_mmap_buffer = !ml.no_alloc;
 
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
 

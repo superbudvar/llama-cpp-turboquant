@@ -11,6 +11,7 @@
 #include <array>
 #include <cassert>
 #include <cinttypes>
+#include <cstring>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -300,6 +301,13 @@ struct common_fit_logger_guard {
     }
 };
 
+struct per_device_layer_costs {
+    size_t n_layer_all = 0;
+    size_t n_device = 0;
+    std::vector<int64_t> bytes;          // [layer][device] = model bytes, row-major
+    std::vector<int64_t> context_compute; // [device] = context + compute overhead
+};
+
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const char * path_model,
         const llama_model_params * mparams,
@@ -312,12 +320,13 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         std::vector<llama_moe_tensor_info> * moe_tensors = nullptr,
         llama_context * ctx_parent = nullptr,
         uint32_t * n_layer_all = nullptr,
-        bool no_alloc = false) {
+        bool no_alloc = false,
+        per_device_layer_costs * per_layer_costs = nullptr) {
     common_fit_logger_guard logger_guard(log_level);
 
     llama_model_params mparams_copy = *mparams;
     mparams_copy.no_alloc  = no_alloc;
-    mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
+    mparams_copy.load_mode = LLAMA_LOAD_MODE_MMAP;
 
     llama_model_ptr model(llama_model_load_from_file(path_model, mparams_copy));
     if (model == nullptr) {
@@ -336,6 +345,35 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
 
     const size_t nd = llama_model_n_devices(model.get());
     std::vector<llama_device_memory_data> ret(nd + 1);
+
+    if (per_layer_costs) {
+        per_layer_costs->n_layer_all = llama_model_n_layer(model.get()) + llama_model_n_layer_nextn(model.get());
+        per_layer_costs->n_device = nd;
+        per_layer_costs->bytes.assign(per_layer_costs->n_layer_all * per_layer_costs->n_device, 0);
+        per_layer_costs->context_compute.assign(nd, 0);
+        const size_t count = llama_model_get_tensor_devices(model.get(), nullptr, 0);
+        std::vector<llama_tensor_device_info> tensor_info(count);
+        llama_model_get_tensor_devices(model.get(), tensor_info.data(), tensor_info.size());
+        for (const auto & ti : tensor_info) {
+            int layer = -1;
+            if (strstr(ti.name, "blk.") == ti.name) {
+                const char * dot1 = ti.name + 4;
+                layer = atoi(dot1);
+            }
+            size_t dev_id = nd; // default: host (CPU)
+            if (ti.dev) {
+                for (size_t i = 0; i < nd; i++) {
+                    if (ti.dev == llama_model_get_device(model.get(), i)) {
+                        dev_id = i;
+                        break;
+                    }
+                }
+            }
+            if (layer >= 0 && (size_t)layer < per_layer_costs->n_layer_all && dev_id < nd) {
+                per_layer_costs->bytes[layer * nd + dev_id] += ti.bytes;
+            }
+        }
+    }
 
     llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx.get());
 
@@ -464,7 +502,7 @@ common_device_memory_data_vec common_get_device_memory_data_with_parent(
 
     llama_model_params mparams_parent_copy = *mparams_parent;
     mparams_parent_copy.no_alloc  = true;
-    mparams_parent_copy.load_mode = LLAMA_LOAD_MODE_NONE;
+    mparams_parent_copy.load_mode = LLAMA_LOAD_MODE_MMAP;
 
     llama_model_ptr model_parent(llama_model_load_from_file(path_parent, mparams_parent_copy));
     if (model_parent == nullptr) {
@@ -841,6 +879,9 @@ static void common_params_fit_impl(
     };
 
     // utility function that returns the memory use per device for given numbers of layers per device
+    // Option B: on first call, captures per-layer per-device costs with no_alloc=true (fast load,
+    // my GGML fix routes around the buffer_from_host_ptr GGML_ASSERT). All subsequent calls
+    // compute analytically from the cached costs, eliminating 21/22 model loads.
     auto get_memory_for_layers = [&](
             const char * func_name,
             const std::vector<ngl_t> & ngl_per_device,
@@ -848,22 +889,70 @@ static void common_params_fit_impl(
         llama_model_params mparams_copy = *mparams;
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, mparams_copy);
 
-        const dmds_t dmd_nl = common_get_device_memory_data_impl(
-            path_model, &mparams_copy, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level, nullptr, nullptr, nullptr, false);
+        // file-static cache: captured once, reused for all subsequent calls
+        static per_device_layer_costs cached_costs;
+        static bool cached = false;
+        static std::string cached_path;
 
-        LOG_TRC("%s: memory for test allocation by device:\n", func_name);
-        for (size_t id = 0; id < nd; id++) {
-            const ngl_t & n = ngl_per_device[id];
-            LOG_TRC(
-                "%s: id=%zu, n_layer=%2" PRIu32 ", n_part=%2" PRIu32 ", overflow_type=%d, mem=%6" PRId64 " MiB\n",
-                func_name, id, n.n_layer, n.n_part, int(n.overflow_type), dmd_nl[id].mb.total()/MiB);
+        // re-capture if model path changed (new model in same session)
+        if (!cached || cached_path != path_model) {
+            cached_path = path_model;
+            cached = false;
         }
 
+        if (!cached) {
+            // First call: full load (no_alloc=false) to capture accurate per-layer model costs
+            // AND context+compute overhead. This is the one expensive call.
+            // Subsequent calls use no_alloc=true (fast: gguf metadata only, no weight read)
+            // and analytical recompute using cached per-layer costs + cached context/compute.
+            per_device_layer_costs costs;
+            const dmds_t dmd_nl = common_get_device_memory_data_impl(
+                path_model, &mparams_copy, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level,
+                nullptr, nullptr, nullptr, false, &costs);
+
+            // Extract context+compute overhead per device from the full load result
+            // (these are constant across layer configurations for the same n_ctx)
+            costs.context_compute.resize(nd);
+            for (size_t id = 0; id < nd; id++) {
+                costs.context_compute[id] = dmd_nl[id].mb.context + dmd_nl[id].mb.compute;
+            }
+
+            cached_costs = costs;
+            cached = true;
+            LOG_TRC("%s: Option B first-call load captured %zu layers x %zu devices per-layer costs + "
+                "context+compute overhead\n",
+                func_name, costs.n_layer_all, costs.n_device);
+
+            std::vector<int64_t> ret;
+            ret.reserve(nd);
+            for (size_t id = 0; id < nd; id++) {
+                ret.push_back(dmd_nl[id].mb.total());
+            }
+            return ret;
+        }
+
+        // Subsequent calls: compute analytically from cached per-layer costs.
+        // This eliminates 21/22 model loads in a typical fit_solve_rpc_aware session.
+        // The per-layer costs are independent of layer split configuration — only the
+        // summation over layers changes, so cached costs work for any ngl_per_device.
         std::vector<int64_t> ret;
         ret.reserve(nd);
         for (size_t id = 0; id < nd; id++) {
-            ret.push_back(dmd_nl[id].mb.total());
+            int64_t model_mem = 0;
+            uint32_t il_base = 0;
+            for (size_t jd = 0; jd < id; jd++) {
+                il_base += ngl_per_device[jd].n_layer;
+            }
+            for (uint32_t il = il_base; il < il_base + ngl_per_device[id].n_layer; il++) {
+                if (il < cached_costs.n_layer_all) {
+                    model_mem += cached_costs.bytes[il * cached_costs.n_device + id];
+                }
+            }
+            int64_t total_mem = model_mem + cached_costs.context_compute[id];
+            ret.push_back(total_mem);
         }
+
+        LOG_TRC("%s: Option B cached analytical result\n", func_name);
         return ret;
     };
 

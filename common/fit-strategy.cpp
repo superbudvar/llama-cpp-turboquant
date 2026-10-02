@@ -330,7 +330,7 @@ static common_fit_analysis fit_analyze(
 
     llama_model_params mparams_copy = *mparams;
     mparams_copy.no_alloc  = true;
-    mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
+    mparams_copy.load_mode = LLAMA_LOAD_MODE_MMAP;
 
     llama_model_ptr model(llama_model_load_from_file(path_model.c_str(), mparams_copy));
     if (model == nullptr) {
@@ -1411,7 +1411,7 @@ static void fit_validate(
     // placement read-back: load with the serialized placement and assert roles
     llama_model_params rparams = *mparams;
     rparams.no_alloc  = true;
-    rparams.load_mode = LLAMA_LOAD_MODE_NONE;
+    rparams.load_mode = LLAMA_LOAD_MODE_MMAP;
     llama_model_ptr model(llama_model_load_from_file(path_model.c_str(), rparams));
     if (model == nullptr) {
         throw std::runtime_error("failed to load model for placement verification");
