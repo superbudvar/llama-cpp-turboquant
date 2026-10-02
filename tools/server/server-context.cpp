@@ -1468,7 +1468,6 @@ private:
                 if (spec_mtp) {
                     cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
                 }
-                cparams_dft.n_rs_seq = 0;
 
                 std::vector<ggml_backend_dev_t> devs;
                 uint32_t hp_ngl = 0;
@@ -1477,11 +1476,69 @@ private:
                 try {
                     auto mparams_tgt = common_model_params_to_llama(params_base);
                     auto cparams_tgt = common_context_params_to_llama(params_base);
-                    // with a separate draft model the predictor lives in that file;
-                    // embedded MTP shares the target model. select the right file and
-                    // its own params so the MTP measurement matches the real load
-                    const char * path_dft = has_draft ? params_dft.model.path.c_str()
-                                                      : params_base.model.path.c_str();
+                    // Fitted placement from the pre-fit loop; kept alive after the
+                    // loop so the final measurement uses the same placement as the
+                    // runtime MTP context, which reuses the fitted target model.
+                    llama_model_params mparams_fit = mparams_tgt;
+                    std::vector<float> tensor_split_fit(llama_max_devices(), 0.0f);
+                    std::vector<llama_model_tensor_buft_override> tensor_buft_overrides_fit(llama_max_tensor_buft_overrides());
+                    bool have_fit = false;
+                    const char * path_dft = spec_mtp ? params_base.model.path.c_str() : params_dft.model.path.c_str();
+
+                    if (spec_mtp) {
+                        const size_t max_iterations = 4;
+                        const size_t convergence_threshold = 1024 * 1024; // 1 MiB
+                        size_t prev_spec_bytes = 0;
+
+                        std::vector<size_t> margins_work = params_base.fit_params_target;
+
+                        for (size_t iter = 0; iter < max_iterations; iter++) {
+                            llama_model_params mparams_prefit = common_model_params_to_llama(params_base);
+                            llama_context_params cparams_prefit = common_context_params_to_llama(params_base);
+                            std::vector<float> tensor_split_prefit(llama_max_devices(), 0.0f);
+                            std::vector<llama_model_tensor_buft_override> tensor_buft_overrides_prefit(llama_max_tensor_buft_overrides());
+                            common_moe_cache_params moe_cache_prefit = params_base.moe_cache;
+                            const common_params_fit_status fit_status = common_fit_params(
+                                params_base.model.path.c_str(), &mparams_prefit, &cparams_prefit,
+                                tensor_split_prefit.data(), tensor_buft_overrides_prefit.data(),
+                                &moe_cache_prefit, margins_work.data(),
+                                params_base.fit_params_min_ctx, GGML_LOG_LEVEL_ERROR);
+                            if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+                                break;
+                            }
+                            cparams_dft.n_ctx = cparams_prefit.n_ctx;
+
+                            mparams_fit = mparams_prefit;
+                            tensor_split_fit = tensor_split_prefit;
+                            tensor_buft_overrides_fit = tensor_buft_overrides_prefit;
+                            mparams_fit.tensor_split = tensor_split_fit.data();
+                            mparams_fit.tensor_buft_overrides = tensor_buft_overrides_fit.data();
+                            have_fit = true;
+
+                            auto dmd_iter = common_get_device_memory_data_with_parent(
+                                path_dft, &mparams_fit, &cparams_dft,
+                                params_base.model.path.c_str(), &mparams_fit, &cparams_tgt,
+                                devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
+                            size_t total_spec_bytes = 0;
+                            for (size_t i = 0; i < devs.size() && i < dmd_iter.size(); i++) {
+                                total_spec_bytes += dmd_iter[i].context + dmd_iter[i].compute;
+                            }
+
+                            SRV_DBG("[spec] pre-fit iter %zu: n_ctx=%u, spec=%.2f MiB\n",
+                                    iter, cparams_dft.n_ctx, total_spec_bytes / (1024.0 * 1024.0));
+
+                            if (iter > 0 && std::abs((int64_t)total_spec_bytes - (int64_t)prev_spec_bytes) < (int64_t)convergence_threshold) {
+                                SRV_DBG("[spec] pre-fit converged after %zu iterations\n", iter + 1);
+                                break;
+                            }
+                            prev_spec_bytes = total_spec_bytes;
+
+                            margins_work = params_base.fit_params_target;
+                            for (size_t i = 0; i < devs.size() && i < dmd_iter.size(); i++) {
+                                margins_work[i] += dmd_iter[i].context + dmd_iter[i].compute;
+                            }
+                        }
+                    }
                     auto measure_spec_memory = [&](const llama_model_params & mparams_measure,
                                                    const llama_model_params & mparams_parent,
                                                    std::vector<ggml_backend_dev_t> & measured_devs,
@@ -1492,38 +1549,13 @@ private:
                             path_dft, &mparams_measure, &cparams_dft,
                             params_base.model.path.c_str(), &mparams_parent, &cparams_tgt,
                             measured_devs, measured_ngl, measured_nct, measured_nex, GGML_LOG_LEVEL_ERROR);
-                        if (!spec_mtp) {
-                            return data;
-                        }
-
-                        // MTP runs a separate predictor context that reuses the target
-                        // model's mmap'd weights. its incremental VRAM (the predictor's
-                        // own KV cache and compute buffers) is the delta vs the target's
-                        // compute pool. compute a parent baseline (target ctx created
-                        // with the same cparams) and subtract it so we don't over-reserve.
-                        if (!measure_model_bytes) {
-                            std::vector<ggml_backend_dev_t> baseline_devs;
-                            uint32_t baseline_ngl = 0;
-                            uint32_t baseline_nct = 0;
-                            uint32_t baseline_nex = 0;
-                            auto baseline = common_get_device_memory_data_with_parent(
-                                params_base.model.path.c_str(), &mparams_parent, &cparams_tgt,
-                                params_base.model.path.c_str(), &mparams_parent, &cparams_tgt,
-                                baseline_devs, baseline_ngl, baseline_nct, baseline_nex, GGML_LOG_LEVEL_ERROR);
-                            for (size_t i = 0; i < data.size() && i < baseline.size(); i++) {
-                                data[i].context = std::max<int64_t>(0, data[i].context - baseline[i].context);
-                                data[i].compute = std::max<int64_t>(0, data[i].compute - baseline[i].compute);
-                            }
-                        }
-
-                        // the target model's compute is reserved separately by the fit's
-                        // own main-model measurement, so do NOT add it here: that would
-                        // double-count the target's compute buffers and over-reserve VRAM,
-                        // which makes rpc-aware reject every split and fall back to stock.
+                        // The MTP context allocates its own compute buffer; only the
+                        // target's model weights are shared via the parent context,
+                        // so the measured data already reflects the true reservation.
                         return data;
                     };
 
-                    const llama_model_params & mparams_measure = has_draft ? mparams_dft : mparams_tgt;
+                    const llama_model_params & mparams_measure = spec_mtp ? (have_fit ? mparams_fit : mparams_tgt) : mparams_dft;
                     auto dmd = measure_spec_memory(
                         mparams_measure, mparams_tgt, devs, hp_ngl, hp_nct, hp_nex);
 

@@ -584,6 +584,99 @@ static void common_params_fit_impl(
         }
     }
 
+    std::vector<int64_t> unaccounted(margins.size());
+    for (size_t id = 0; id < unaccounted.size(); id++) {
+        // memory on the device not explained by the free accounting or our own projected
+        // allocations. at probe time the model is not yet allocated, so free already
+        // includes the projected model memory and this is usually negative. fall back to
+        // a small percentage of free memory as a conservative reserve.
+        const llama_device_memory_data & dmd = nd == 0 ? dmds_full.back() : dmds_full[id];
+        const int64_t total = static_cast<int64_t>(dmd.total);
+        const int64_t free  = static_cast<int64_t>(dmd.free);
+        const int64_t self  = static_cast<int64_t>(dmd.mb.total());
+
+        unaccounted[id] = total - free - self;
+        if (unaccounted[id] < 0) {
+            unaccounted[id] = free * 10 / 100;
+            LOG_WRN("%s: device %zu: unaccounted negative (%" PRId64 " MiB), using 10%% of free = %" PRId64 " MiB\n",
+                    __func__, id, -unaccounted[id]/MiB, unaccounted[id]/MiB);
+        } else {
+            LOG_INF("%s: device %zu: unaccounted = %" PRId64 " MiB (total=%" PRId64 ", free=%" PRId64 ", self=%" PRId64 ")\n",
+                    __func__, id, unaccounted[id]/MiB, total/MiB, free/MiB, self/MiB);
+        }
+    }
+
+    // reserve memory for the MoE cache pools so the fit leaves room for them:
+    // at runtime each hosting device's pool claims min(cacheable expert bytes,
+    // free_after_model - reserve_bytes). reserve that claim on top of the user
+    // margin and the unaccounted memory, capped by the grant and budget.
+    std::vector<int64_t> moe_pool_budget(nd, 0);
+    // margins_eff is the free memory the fit must leave on each device: user margin,
+    // pool budget, and unaccounted memory used by other processes or not visible
+    // to the device free-memory query (e.g. display server on iGPUs)
+    std::vector<int64_t> margins_eff(margins.size());
+    for (size_t id = 0; id < margins_eff.size(); id++) {
+        margins_eff[id] = margins[id] + unaccounted[id];
+    }
+    if (moe_cache && moe_cache->mode != COMMON_MOE_CACHE_MODE_OFF && hp_nex > 0 && !moe_tensors.empty() && nd > 0) {
+        ggml_moe_cache_api api = ggml_moe_cache_active();
+        if (!devs.empty()) {
+            const ggml_moe_cache_api owned =
+                ggml_moe_cache_get(ggml_backend_dev_backend_reg(devs[0]));
+            if (owned.owner) {
+                api = owned;
+            }
+        }
+        ggml_moe_cache_config config = {};
+        int automatic = -1;
+        if (moe_cache->mode_explicit) {
+            automatic = moe_cache->mode == COMMON_MOE_CACHE_MODE_AUTO ? 1 : 0;
+        }
+        if (api.query_config && api.query_device && api.query_shape &&
+            api.query_config(automatic, moe_cache->budget_mib, &config)) {
+            size_t expert_bytes = 0;
+            for (const llama_moe_tensor_info & tensor : moe_tensors) {
+                if (tensor.n_expert > 0 && tensor.expert_size > 0 &&
+                    (uint64_t)tensor.n_expert <= SIZE_MAX / tensor.expert_size) {
+                    expert_bytes += (size_t)tensor.n_expert * tensor.expert_size;
+                }
+            }
+            for (size_t id = 0; id < nd; id++) {
+                ggml_moe_cache_device_caps caps = {};
+                if (!api.query_device(devs[id], &config, &caps)) {
+                    continue;
+                }
+                // only experts the runtime pool on this device can actually cache count
+                // towards the reservation
+                size_t cacheable_bytes = 0;
+                for (const llama_moe_tensor_info & tensor : moe_tensors) {
+                    ggml_moe_cache_shape_caps shape = {};
+                    if (tensor.n_expert > 0 && tensor.expert_size > 0 &&
+                        tensor.expert_size >= caps.min_expert_bytes &&
+                        (uint64_t)tensor.n_expert <= SIZE_MAX / tensor.expert_size &&
+                        api.query_shape(tensor.type, tensor.n_input, tensor.n_output,
+                            tensor.n_expert, tensor.expert_size, &shape)) {
+                        cacheable_bytes += (size_t)tensor.n_expert * tensor.expert_size;
+                    }
+                }
+                if (cacheable_bytes == 0) {
+                    continue;
+                }
+                const int64_t grant = margins[id] + unaccounted[id] - (int64_t)config.reserve_bytes;
+                if (grant <= 0) {
+                    continue;
+                }
+                moe_pool_budget[id] = std::min((int64_t)cacheable_bytes, grant);
+                if (config.budget_bytes > 0) {
+                    moe_pool_budget[id] = std::min(moe_pool_budget[id], (int64_t)config.budget_bytes);
+                }
+                margins_eff[id] += moe_pool_budget[id];
+                LOG_INF("%s: device %zu: reserving %" PRId64 " MiB for MoE cache pools (cacheable expert bytes=%zu MiB of %zu MiB, reserve=%zu MiB)\n",
+                        __func__, id, moe_pool_budget[id]/MiB, cacheable_bytes/MiB, expert_bytes/MiB, config.reserve_bytes/MiB);
+            }
+        }
+    }
+
     std::vector<std::string> dev_names;
     {
         dev_names.reserve(nd);
@@ -614,9 +707,9 @@ static void common_params_fit_impl(
         sum_projected_free = sum_free - sum_projected_used;
         LOG_TRC("%s: projected to use %" PRId64 " MiB of host memory vs. %" PRId64 " MiB of total host memory\n",
             __func__, sum_projected_used/MiB, sum_free/MiB);
-        if (sum_projected_free >= margins[0]) {
+        if (sum_projected_free >= margins_eff[0]) {
             LOG_TRC("%s: will leave %" PRId64 " >= %" PRId64 " MiB of system memory, no changes needed\n",
-                __func__, sum_projected_free/MiB, margins[0]/MiB);
+                __func__, sum_projected_free/MiB, margins_eff[0]/MiB);
             return;
         }
     } else {
@@ -637,23 +730,23 @@ static void common_params_fit_impl(
 
             if (nd > 1) {
                 LOG_TRC("%s:   - %s: %6" PRId64 " total, %6" PRId64 " used, %6" PRId64 " free vs. target of %6" PRId64 "\n",
-                    __func__, dev_names[id].c_str(), dmd.total/MiB, projected_used/MiB, projected_free/MiB, margins[id]/MiB);
+                    __func__, dev_names[id].c_str(), dmd.total/MiB, projected_used/MiB, projected_free/MiB, margins_eff[id]/MiB);
             }
         }
         assert(sum_free >= 0 && sum_projected_used >= 0);
         LOG_TRC("%s: projected to use %" PRId64 " MiB of device memory vs. %" PRId64 " MiB of free device memory\n",
             __func__, sum_projected_used/MiB, sum_free/MiB);
         if (nd == 1) {
-            if (projected_free_per_device[0] >= margins[0]) {
+            if (projected_free_per_device[0] >= margins_eff[0]) {
                 LOG_TRC("%s: will leave %" PRId64 " >= %" PRId64 " MiB of free device memory, no changes needed\n",
-                    __func__, projected_free_per_device[0]/MiB, margins[0]/MiB);
+                    __func__, projected_free_per_device[0]/MiB, margins_eff[0]/MiB);
                 log_stock_fit();
                 return;
             }
         } else {
             bool changes_needed = false;
             for (size_t id = 0; id < nd; id++) {
-                if (projected_free_per_device[id] < margins[id]) {
+                if (projected_free_per_device[id] < margins_eff[id]) {
                     changes_needed = true;
                     break;
                 }
@@ -671,16 +764,16 @@ static void common_params_fit_impl(
     {
         int64_t global_surplus = sum_projected_free;
         if (nd == 0) {
-            global_surplus -= margins[0];
+            global_surplus -= margins_eff[0];
         } else {
             for (size_t id = 0; id < nd; id++) {
-                global_surplus -= margins[id];
+                global_surplus -= margins_eff[id];
             }
         }
         if (global_surplus < 0) {
             if (nd <= 1) {
                 LOG_TRC("%s: cannot meet free memory target of %" PRId64 " MiB, need to reduce device memory by %" PRId64 " MiB\n",
-                    __func__, margins[0]/MiB, -global_surplus/MiB);
+                    __func__, margins_eff[0]/MiB, -global_surplus/MiB);
             } else {
                 LOG_TRC(
                     "%s: cannot meet free memory targets on all devices, need to use %" PRId64 " MiB less in total\n",
@@ -690,10 +783,10 @@ static void common_params_fit_impl(
                 if (hp_nct > n_ctx_min) {
                     int64_t sum_used_target = sum_free;
                     if (nd == 0) {
-                        sum_used_target -= margins[0];
+                        sum_used_target -= margins_eff[0];
                     } else {
                         for (size_t id = 0; id < nd; id++) {
-                            sum_used_target -= margins[id];
+                            sum_used_target -= margins_eff[id];
                         }
                     }
                     if (nd > 1) {
@@ -997,7 +1090,7 @@ static void common_params_fit_impl(
         }
         for (size_t id = 0; id < nd; id++) {
             if (candidate_memory[id].mb.total() > INT64_MAX ||
-                candidate_memory[id].free - (int64_t)candidate_memory[id].mb.total() < margins[id]) {
+                candidate_memory[id].free - (int64_t)candidate_memory[id].mb.total() < margins_eff[id]) {
                 return false;
             }
         }
@@ -1022,7 +1115,7 @@ static void common_params_fit_impl(
 
         for (size_t id = 0; id < nd; id++) {
             global_surplus_cpu_moe += dmds_cpu_moe[id].free;
-            global_surplus_cpu_moe -= int64_t(dmds_cpu_moe[id].mb.total()) + margins[id];
+            global_surplus_cpu_moe -= int64_t(dmds_cpu_moe[id].mb.total()) + margins_eff[id];
         }
 
         if (global_surplus_cpu_moe > 0) {
@@ -1038,11 +1131,12 @@ static void common_params_fit_impl(
         mparams->tensor_buft_overrides = tensor_buft_overrides;
     }
 
-    std::vector<int64_t> targets; // maximum acceptable memory use per device
+    std::vector<int64_t> targets;
     targets.reserve(nd);
     for (size_t id = 0; id < nd; id++) {
-        targets.push_back(dmds_clean[id].free - margins[id]);
-        LOG_TRC("%s: id=%zu, target=%" PRId64 " MiB (clean_free=%" PRId64 " MiB)\n", __func__, id, targets[id]/MiB, dmds_clean[id].free/MiB);
+        const int64_t target = dmds_full[id].free - margins_eff[id];
+        targets.push_back(target > 0 ? target : 0);
+        LOG_TRC("%s: id=%zu, target=%" PRId64 " MiB\n", __func__, id, targets[id]/MiB);
     }
 
     std::vector<ggml_backend_buffer_type_t> overflow_bufts; // which bufts the first partial layer of a device overflows to:
@@ -1403,7 +1497,7 @@ static void common_params_fit_impl(
                     if (candidate_valid) {
                         for (size_t id = 0; id < nd; id++) {
                             if (candidate_memory[id].mb.total() > INT64_MAX ||
-                                candidate_memory[id].free - (int64_t)candidate_memory[id].mb.total() < margins[id]) {
+                                candidate_memory[id].free - (int64_t)candidate_memory[id].mb.total() < margins_eff[id]) {
                                 candidate_valid = false;
                                 break;
                             }
@@ -1534,6 +1628,50 @@ enum common_params_fit_status common_fit_params(
     const int64_t t1_us = llama_time_us();
     LOG_TRC("%s: fitting params to free memory took %.2f seconds\n", __func__, (t1_us - t0_us) * 1e-6);
     return status;
+}
+
+static void common_fit_validate(
+        const char * path_model,
+        const llama_model_params * mparams,
+        const llama_context_params * cparams,
+        const std::vector<int64_t> & projected_targets) {
+
+    constexpr size_t MiB = 1024 * 1024;
+
+    struct llama_model * model = llama_model_load_from_file(path_model, *mparams);
+    if (!model) {
+        LOG_ERR("%s: failed to load model for fit validation\n", __func__);
+        return;
+    }
+
+    struct llama_context * ctx = llama_init_from_model(model, *cparams);
+    if (!ctx) {
+        LOG_ERR("%s: failed to create context for fit validation\n", __func__);
+        llama_model_free(model);
+        return;
+    }
+
+    llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx);
+    size_t id = 0;
+    for (const auto & [buft, mb] : memory_breakdown) {
+        if (!ggml_backend_buft_is_host(buft)) {
+            const int64_t actual_used = mb.total();
+            const int64_t projected = (id < projected_targets.size()) ? projected_targets[id] : 0;
+            const int64_t diff = actual_used - projected;
+
+            if (diff > 512 * (int64_t)MiB) {
+                LOG_WRN("%s: device %zu: actual %" PRId64 " MiB vs projected %" PRId64 " MiB (diff %" PRId64 " MiB)\n",
+                        __func__, id, actual_used/MiB, projected/MiB, diff/MiB);
+            } else {
+                LOG_TRC("%s: device %zu: actual %" PRId64 " MiB vs projected %" PRId64 " MiB (diff %" PRId64 " MiB)\n",
+                        __func__, id, actual_used/MiB, projected/MiB, diff/MiB);
+            }
+            id++;
+        }
+    }
+
+    llama_free(ctx);
+    llama_model_free(model);
 }
 
 void common_memory_breakdown_print(const struct llama_context * ctx) {

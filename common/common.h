@@ -532,6 +532,8 @@ struct common_params {
     // reservations the fit released (tags). the caller must then move the
     // tagged companion off VRAM before loading it.
     std::vector<std::string> fit_params_shed_tags;
+    // overhead percentage for unaccounted memory (OS/driver/fragmentation) as fallback
+    float fit_overhead_percent = 10.0f;  // default 10%, range 0-100
 
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
     enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_MMAP; // how to load the model

@@ -2910,6 +2910,10 @@ common_speculative_init_result::common_speculative_init_result(
 
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        // size MTP KV to the target n_ctx, not n_ctx_train; drafts are bounded by the server's n_ctx - prompt - 2 cap
+        if (ctx_tgt != nullptr) {
+            cparams.n_ctx = llama_n_ctx(ctx_tgt);
+        }
     }
 
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
