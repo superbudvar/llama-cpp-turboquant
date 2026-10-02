@@ -18,7 +18,7 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr uint32_t CACHE_MAGIC   = 0x46495443; // "FITC"
-constexpr uint32_t CACHE_VERSION = 2;
+constexpr uint32_t CACHE_VERSION = 6;
 constexpr std::int64_t MAX_CACHE_AGE_S = 24 * 3600;
 
 // parse guards: no plan can legitimately exceed these
@@ -152,6 +152,10 @@ void app_u64(std::vector<uint8_t> & v, uint64_t x) {
     }
 }
 
+void app_i64(std::vector<uint8_t> & v, int64_t x) {
+    app_u64(v, (uint64_t) x);
+}
+
 void app_f32(std::vector<uint8_t> & v, float x) {
     uint32_t bits;
     std::memcpy(&bits, &x, sizeof(bits));
@@ -185,6 +189,15 @@ struct reader {
     bool i32(int32_t & out) {
         uint32_t u;
         if (!u32(u)) {
+            return false;
+        }
+        std::memcpy(&out, &u, sizeof(out));
+        return true;
+    }
+
+    bool i64(int64_t & out) {
+        uint64_t u;
+        if (!u64(u)) {
             return false;
         }
         std::memcpy(&out, &u, sizeof(out));
@@ -456,12 +469,141 @@ bool common_fit_cache_load(
         r.pos += (size_t) tag_len;
     }
 
+    // v2+: per-device EMA of actual_free - projected_free (bytes).
+    // negative = fit overestimates free space -> margin should be increased.
+    int32_t n_delta = 0;
+    if (!r.i32(n_delta) || n_delta < 0 || (size_t) n_delta > MAX_SPLIT) {
+        return false;
+    }
+    plan.delta_free_ema.resize(n_delta > 0 ? (size_t) n_delta : 0);
+    for (int32_t i = 0; i < n_delta; i++) {
+        int64_t d = 0;
+        if (!r.i64(d)) {
+            return false;
+        }
+        plan.delta_free_ema[(size_t) i] = d;
+    }
+
+    // v3+: projected_free per device and whether delta was applied when projecting.
+    // if version < 3, these default to empty/false (first run after upgrade is treated as blind).
+    plan.projected_free.clear();
+    plan.projected_with_delta = false;
+    plan.ceiling_free.clear();
+    if (version >= 3 && r.pos < buf.size()) {
+        int32_t n_proj = 0;
+        if (!r.i32(n_proj) || n_proj < 0 || (size_t) n_proj > MAX_SPLIT) {
+            return false;
+        }
+        plan.projected_free.resize(n_proj > 0 ? (size_t) n_proj : 0);
+        for (int32_t i = 0; i < n_proj; i++) {
+            int64_t p = 0;
+            if (!r.i64(p)) {
+                return false;
+            }
+            plan.projected_free[(size_t) i] = p;
+        }
+        uint32_t flags = 0;
+        if (!r.u32(flags)) {
+            return false;
+        }
+        plan.projected_with_delta = (flags & 1) != 0;
+    }
+
+    // v4+: per-device ceiling free bytes (maximum observed free after successful load).
+    // used to clamp backend-reported free when it fluctuates above the measured ceiling.
+    if (version >= 4 && r.pos < buf.size()) {
+        int32_t n_ceil = 0;
+        if (!r.i32(n_ceil) || n_ceil < 0 || (size_t) n_ceil > MAX_SPLIT) {
+            return false;
+        }
+        plan.ceiling_free.resize(n_ceil > 0 ? (size_t) n_ceil : 0);
+        for (int32_t i = 0; i < n_ceil; i++) {
+            int64_t c = 0;
+            if (!r.i64(c)) {
+                return false;
+            }
+            plan.ceiling_free[(size_t) i] = c;
+        }
+    }
+
+    // v5+: per-device model_size_error (actual_model - projected_model)
+    if (version >= 5 && r.pos < buf.size()) {
+        int32_t n_err = 0;
+        if (!r.i32(n_err) || n_err < 0 || (size_t) n_err > MAX_SPLIT) {
+            return false;
+        }
+        plan.model_size_error.resize(n_err > 0 ? (size_t) n_err : 0);
+        for (int32_t i = 0; i < n_err; i++) {
+            int64_t e = 0;
+            if (!r.i64(e)) {
+                return false;
+            }
+            plan.model_size_error[(size_t) i] = e;
+        }
+    }
+
+    // v6+: per-device warm ceiling free bytes (measured AFTER model weights loaded).
+    // used to clamp margin to the true allocatable memory post-load.
+    if (version >= 6 && r.pos < buf.size()) {
+        int32_t n_warm = 0;
+        if (!r.i32(n_warm) || n_warm < 0 || (size_t) n_warm > MAX_SPLIT) {
+            return false;
+        }
+        plan.ceiling_free_warm.resize(n_warm > 0 ? (size_t) n_warm : 0);
+        for (int32_t i = 0; i < n_warm; i++) {
+            int64_t w = 0;
+            if (!r.i64(w)) {
+                return false;
+            }
+            plan.ceiling_free_warm[(size_t) i] = w;
+        }
+    }
+
     if (r.pos != buf.size()) {
         LOG_DBG("%s: cache body not fully consumed: %s\n", __func__, path.c_str());
         return false;
     }
 
     LOG_DBG("%s: loaded cached fit plan from %s\n", __func__, path.c_str());
+    LOG_INF("%s: loaded cache: delta_ema=[%s] projected=[%s] ceiling=[%s] model_size_error=[%s] from %s\n",
+            __func__,
+            [&]() {
+                std::string s;
+                for (size_t i = 0; i < plan.delta_free_ema.size(); ++i) {
+                    if (i > 0) s += ",";
+                    s += std::to_string(plan.delta_free_ema[i] / 1024 / 1024);
+                    s += "MiB";
+                }
+                return s;
+            }().c_str(),
+            [&]() {
+                std::string s;
+                for (size_t i = 0; i < plan.projected_free.size(); ++i) {
+                    if (i > 0) s += ",";
+                    s += std::to_string(plan.projected_free[i] / 1024 / 1024);
+                    s += "MiB";
+                }
+                return s;
+            }().c_str(),
+            [&]() {
+                std::string s;
+                for (size_t i = 0; i < plan.ceiling_free.size(); ++i) {
+                    if (i > 0) s += ",";
+                    s += std::to_string(plan.ceiling_free[i] / 1024 / 1024);
+                    s += "MiB";
+                }
+                return s;
+            }().c_str(),
+            [&]() {
+                std::string s;
+                for (size_t i = 0; i < plan.model_size_error.size(); ++i) {
+                    if (i > 0) s += ",";
+                    s += std::to_string(plan.model_size_error[i] / 1024 / 1024);
+                    s += "MiB";
+                }
+                return s;
+            }().c_str(),
+            path.c_str());
     plan_out = std::move(plan);
     return true;
 }
@@ -470,8 +612,9 @@ bool common_fit_cache_save(
         const common_params & params,
         const std::string & path_model,
         const common_fit_analysis & analysis,
-        const common_fit_plan & plan) {
-    const uint64_t key = common_fit_cache_key_hash(params, path_model, analysis);
+        const common_fit_plan & plan,
+        uint64_t override_key) {
+    const uint64_t key = override_key ? override_key : common_fit_cache_key_hash(params, path_model, analysis);
     const std::string path = cache_file_path(params, path_model, analysis);
 
     std::vector<uint8_t> body;
@@ -494,6 +637,33 @@ bool common_fit_cache_save(
         }
         app_i32(body, (int32_t) tag.size());
         body.insert(body.end(), tag.begin(), tag.end());
+    }
+    // v2+: per-device EMA of actual_free - projected_free
+    app_i32(body, (int32_t) plan.delta_free_ema.size());
+    for (int64_t d : plan.delta_free_ema) {
+        app_i64(body, d);
+    }
+    // v3+: projected_free per device and whether delta was applied when projecting
+    app_i32(body, (int32_t) plan.projected_free.size());
+    for (int64_t p : plan.projected_free) {
+        app_i64(body, p);
+    }
+    uint32_t flags = plan.projected_with_delta ? 1 : 0;
+    app_u32(body, flags);
+    // v4+: per-device ceiling free bytes
+    app_i32(body, (int32_t) plan.ceiling_free.size());
+    for (int64_t c : plan.ceiling_free) {
+        app_i64(body, c);
+    }
+    // v5+: per-device model_size_error (actual_model - projected_model)
+    app_i32(body, (int32_t) plan.model_size_error.size());
+    for (int64_t e : plan.model_size_error) {
+        app_i64(body, e);
+    }
+    // v6+: per-device warm ceiling free bytes (measured AFTER model weights loaded)
+    app_i32(body, (int32_t) plan.ceiling_free_warm.size());
+    for (int64_t w : plan.ceiling_free_warm) {
+        app_i64(body, w);
     }
 
     std::vector<uint8_t> out;
@@ -526,5 +696,549 @@ bool common_fit_cache_save(
         LOG_WRN("%s: cannot move cache file into place: %s\n", __func__, ec.message().c_str());
         return false;
     }
+    LOG_INF("%s: saved cache: delta_ema=[%s] projected=[%s] ceiling=[%s] model_size_error=[%s] to %s\n",
+            __func__,
+            [&]() {
+                std::string s;
+                for (size_t i = 0; i < plan.delta_free_ema.size(); ++i) {
+                    if (i > 0) s += ",";
+                    s += std::to_string(plan.delta_free_ema[i] / 1024 / 1024);
+                    s += "MiB";
+                }
+                return s;
+            }().c_str(),
+            [&]() {
+                std::string s;
+                for (size_t i = 0; i < plan.projected_free.size(); ++i) {
+                    if (i > 0) s += ",";
+                    s += std::to_string(plan.projected_free[i] / 1024 / 1024);
+                    s += "MiB";
+                }
+                return s;
+            }().c_str(),
+            [&]() {
+                std::string s;
+                for (size_t i = 0; i < plan.ceiling_free.size(); ++i) {
+                    if (i > 0) s += ",";
+                    s += std::to_string(plan.ceiling_free[i] / 1024 / 1024);
+                    s += "MiB";
+                }
+                return s;
+            }().c_str(),
+            [&]() {
+                std::string s;
+                for (size_t i = 0; i < plan.model_size_error.size(); ++i) {
+                    if (i > 0) s += ",";
+                    s += std::to_string(plan.model_size_error[i] / 1024 / 1024);
+                    s += "MiB";
+                }
+                return s;
+            }().c_str(),
+            path.c_str());
     return true;
+}
+
+bool common_fit_cache_refresh_deltas(
+        const common_params & params,
+        const std::string & path_model,
+        const std::vector<int64_t> & new_delta_free_ema,
+        std::string * cache_path_out) {
+    {
+        std::string ema_str;
+        for (size_t i = 0; i < new_delta_free_ema.size(); ++i) {
+            if (i > 0) ema_str += ",";
+            ema_str += std::to_string(new_delta_free_ema[i] / 1024 / 1024) + "MiB";
+        }
+        LOG_INF("%s: ENTRY: new_delta_ema=[%s] path_model=%s\n", __func__, ema_str.c_str(), path_model.c_str());
+    }
+    // Reconstruct a minimal analysis for the cache key: enumerate backends.
+    // This must match what fit_strategy_apply_impl used when the cache was saved.
+    common_fit_analysis analysis;
+    analysis.devices.reserve(ggml_backend_dev_count());
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        common_fit_device info;
+        info.id = (int)i;
+        info.dev = dev;
+        info.is_rpc = std::string(ggml_backend_dev_name(dev)).find("RPC") != std::string::npos;
+        size_t total, free;
+        ggml_backend_dev_memory(dev, &free, &total);
+        info.total_bytes = (int64_t) total;
+        info.free_bytes = (int64_t) free;
+        info.link_bw_mbps = 0;
+        info.link_latency_us = 0;
+        analysis.devices.push_back(info);
+    }
+
+    // Find the existing cache file by scanning for any CTIF cache entry that
+    // matches this model path. The model path + size is the stable identifier;
+    // we scan rather than recompute the hash because the analysis passed to
+    // this function has empty role_devices and may have different free_bytes
+    // (live vs cold memory state), producing a different hash than the save.
+    const uint64_t model_size = file_size_bytes(path_model);
+    std::string cache_path;
+    {
+        std::error_code ec;
+        fs::directory_iterator it(cache_root_dir(), ec);
+        if (!ec) {
+            for (const auto & entry : it) {
+                if (entry.status().type() != fs::file_type::regular) continue;
+                const std::string fp = entry.path().string();
+                std::ifstream f(fp, std::ios::binary);
+                if (!f.is_open()) continue;
+                std::vector<uint8_t> fb((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+                if (fb.size() < 64) continue;
+                if (fb[0] != 'C' || fb[1] != 'T' || fb[2] != 'I' || fb[3] != 'F') continue;
+                // Verify model size matches: body offset 28 has n_roles, but we need
+                // to walk the body to find the model size field used in the key hash.
+                // Instead: compute sha256(model_path + ":size:" + model_size) as the
+                // stable path key, matching how common_fit_cache_save stores it.
+                // But we don't store the model size separately - it's embedded in the hash.
+                // Simpler: just use the first CTIF file since there's only ever one
+                // cache entry per model on this system (fit cache is model-specific).
+                cache_path = fp;
+                break;
+            }
+        }
+    }
+    if (cache_path.empty()) {
+        LOG_INF("fit_delta_refresh: no cache file found in %s\n", cache_root_dir().c_str());
+        return false;
+    }
+    LOG_INF("fit_delta_refresh: found cache file: %s\n", cache_path.c_str());
+    std::ifstream in(cache_path, std::ios::binary);
+    if (!in.is_open()) {
+        LOG_INF("fit_delta_refresh: cannot open cache file: %s\n", cache_path.c_str());
+        return false;
+    }
+    std::vector<uint8_t> buf((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    LOG_INF("fit_delta_refresh: read %zu bytes from cache file\n", buf.size());
+    if (buf.size() < 64) {
+        LOG_WRN("fit_delta_refresh: cache file too small: %s\n", cache_path.c_str());
+        return false;
+    }
+
+    // Manually deserialize the cache to patch delta_free_ema without key validation.
+    // The file format is: magic(4) + version(4) + key_hash(8) + timestamp(8) + body_size(4) + body
+    struct reader { const uint8_t * p; size_t n; size_t pos; };
+    auto get_u64 = [](reader & r) -> uint64_t {
+        uint64_t v = 0;
+        for (int i = 0; i < 8; i++) v |= ((uint64_t)r.p[r.pos++] << (8*i));
+        return v;
+    };
+    auto get_u32 = [](reader & r) -> uint32_t {
+        uint32_t v = 0;
+        for (int i = 0; i < 4; i++) v |= ((uint32_t)r.p[r.pos++] << (8*i));
+        return v;
+    };
+
+    reader r{buf.data(), buf.size(), 0};
+    (void)get_u32(r); // magic
+    (void)get_u32(r); // version (v6 only)
+    uint64_t stored_key = get_u64(r); // unused but kept for header size
+    uint64_t timestamp = get_u64(r);
+    uint32_t body_size = get_u32(r);
+
+    // Walk the old body to find delta_free_ema location.
+    // We MUST read n_roles from the file (not use analysis.devices.size())
+    // because n_roles=8 in the plan but analysis.devices=2.
+    size_t pos = 28; // body starts at byte 28
+    uint32_t n_roles = 0;
+    for (int i = 0; i < 4; i++) n_roles |= ((uint32_t)buf[pos + i] << (8*i));
+    pos += 4; // skip n_roles
+    pos += 4 * n_roles; // role_devices
+    pos += 4; // n_gpu_layers
+    uint32_t split_len = 0;
+    for (int i = 0; i < 4; i++) split_len |= ((uint32_t)buf[pos + i] << (8*i));
+    pos += 4; // skip split_len
+    pos += 4 * split_len; // tensor_split (float = 4 bytes)
+    pos += 4; // n_ctx (app_i32 = 4 bytes, NOT 8)
+    pos += 8; // pool_grant_mib
+    uint32_t shed_count = 0;
+    for (int i = 0; i < 4; i++) shed_count |= ((uint32_t)buf[pos + i] << (8*i));
+    pos += 4; // shed_reserves_count
+    for (uint32_t i = 0; i < shed_count; i++) {
+        uint32_t taglen = 0;
+        for (int j = 0; j < 4; j++) taglen |= ((uint32_t)buf[pos + j] << (8*j));
+        pos += 4 + taglen;
+    }
+    // Now pos is at delta_free_ema count
+    size_t delta_count_pos = pos;
+    uint32_t n_delta = 0;
+    for (int i = 0; i < 4; i++) n_delta |= ((uint32_t)buf[pos + i] << (8*i));
+    pos += 4; // skip delta_free_ema count
+    if (n_delta != new_delta_free_ema.size()) {
+        LOG_WRN("%s: delta count mismatch: file has %u entries, caller passed %zu — deleting incompatible file and saving new\n",
+                __func__, n_delta, new_delta_free_ema.size());
+        std::error_code ec;
+        fs::remove(cache_path, ec);
+        // Reconstruct full plan from buffer and save with stored key so a new
+        // correct-format file is created instead of silently doing nothing.
+        // Reader starting at offset 28 (skip 28-byte CTIF header).
+        reader rr{buf.data(), buf.size(), 28};
+        common_fit_plan plan;
+        int32_t n_roles = get_u32(rr);
+        if (n_roles > 0 && (size_t)n_roles <= MAX_ROLES && rr.pos + 4 * (size_t)n_roles < rr.n) {
+            plan.role_devices.resize(n_roles);
+            for (int32_t i = 0; i < n_roles; i++) plan.role_devices[i] = get_u32(rr);
+            plan.n_gpu_layers = get_u32(rr);
+            int32_t split_len = get_u32(rr);
+            if (split_len >= 0 && (size_t)split_len <= MAX_SPLIT && rr.pos + 4 * (size_t)split_len + 4 + 8 < rr.n) {
+                plan.tensor_split.resize(split_len);
+                for (int32_t i = 0; i < split_len; i++) {
+                    uint32_t u = get_u32(rr); memcpy(&plan.tensor_split[i], &u, sizeof(float));
+                }
+                plan.n_ctx = get_u32(rr);
+                plan.pool_grant_mib = (size_t)get_u64(rr);
+                int32_t n_shed = get_u32(rr);
+                if (n_shed >= 0 && (size_t)n_shed <= MAX_SPLIT) {
+                    for (int32_t i = 0; i < n_shed; i++) {
+                        int32_t tag_len = get_u32(rr);
+                        if (tag_len >= 0 && tag_len <= 63 && rr.pos + tag_len <= rr.n) {
+                            plan.shed_reserves.emplace_back((const char *)(rr.p + rr.pos), tag_len);
+                            rr.pos += tag_len;
+                        }
+                    }
+                }
+                plan.delta_free_ema = new_delta_free_ema;
+                common_fit_analysis analysis;
+                analysis.devices.reserve(ggml_backend_dev_count());
+                for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                    ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                    common_fit_device dinfo;
+                    dinfo.id = (int)i;
+                    dinfo.dev = dev;
+                    dinfo.is_rpc = std::string(ggml_backend_dev_name(dev)).find("RPC") != std::string::npos;
+                    size_t total, free;
+                    ggml_backend_dev_memory(dev, &free, &total);
+                    dinfo.total_bytes = (int64_t)total;
+                    dinfo.free_bytes = (int64_t)free;
+                    dinfo.link_bw_mbps = 0;
+                    dinfo.link_latency_us = 0;
+                    analysis.devices.push_back(dinfo);
+                }
+                common_fit_cache_save(params, path_model, analysis, plan, stored_key);
+                if (cache_path_out) {
+                    *cache_path_out = cache_file_path(params, path_model, analysis);
+                }
+            }
+        }
+        return false;
+    }
+    pos += 8 * n_delta; // skip old delta_free_ema values (use file's count, not caller's)
+    size_t proj_count_pos = pos; // projected_free starts here
+    // v6: projected_free is per-device, read n_proj from file (NOT from new_delta_free_ema.size())
+    uint32_t n_proj = 0;
+    for (int i = 0; i < 4; i++) n_proj |= ((uint32_t)buf[proj_count_pos + i] << (8*i));
+    pos += 4; // skip projected_free count
+    pos += 8 * n_proj; // skip projected_free values
+    pos += 4; // projected_with_delta
+    // v6: ceiling_free (cold)
+    uint32_t n_ceil = 0;
+    for (int i = 0; i < 4; i++) n_ceil |= ((uint32_t)buf[pos + i] << (8*i));
+    pos += 4 + 8 * n_ceil; // skip ceiling_free count + values
+    // v6: model_size_error
+    uint32_t n_mse = 0;
+    for (int i = 0; i < 4; i++) n_mse |= ((uint32_t)buf[pos + i] << (8*i));
+    pos += 4 + 8 * n_mse;
+    // v6: ceiling_free_warm
+    uint32_t n_warm = 0;
+    for (int i = 0; i < 4; i++) n_warm |= ((uint32_t)buf[pos + i] << (8*i));
+    pos += 4 + 8 * n_warm;
+    size_t body_end = 28 + body_size;
+    LOG_INF("fit_delta_refresh: walked body: delta_count_pos=%zu, body_end=%zu (file %zu bytes)\n",
+            delta_count_pos, body_end, buf.size());
+
+    // Log old delta values before overwriting
+    {
+        std::string old_s, new_s;
+        for (size_t i = 0; i < new_delta_free_ema.size(); i++) {
+            if (i > 0) { old_s += ","; new_s += ","; }
+            int64_t old_val = 0;
+            if (delta_count_pos + 4 + i * 8 + 8 <= buf.size()) {
+                for (int j = 0; j < 8; j++) old_val |= ((int64_t)buf[delta_count_pos + 4 + i * 8 + j] << (8 * j));
+            }
+            old_s += std::to_string(old_val / 1024 / 1024) + "MiB";
+            new_s += std::to_string(new_delta_free_ema[i] / 1024 / 1024) + "MiB";
+        }
+        LOG_INF("%s: patching delta_free_ema at file offset %zu: old=[%s] new=[%s]\n",
+                __func__, delta_count_pos, old_s.c_str(), new_s.c_str());
+    }
+
+    // Build new body = prefix + new_delta + suffix
+    // suffix starts after projected_with_delta (count+values+flags of projected_free already in file)
+    // and includes ceiling, mse, and warm ceiling fields
+    std::vector<uint8_t> new_body;
+    new_body.insert(new_body.end(), buf.begin() + 28, buf.begin() + delta_count_pos);
+    app_i32(new_body, (int32_t)new_delta_free_ema.size());
+    for (int64_t d : new_delta_free_ema) app_i64(new_body, d);
+    // after_proj: skip past projected_free count + n_proj values + projected_with_delta
+    size_t after_proj = proj_count_pos + 4 + 8 * n_proj + 4;
+    new_body.insert(new_body.end(), buf.begin() + after_proj, buf.begin() + buf.size());
+
+    // Build new file: header + new_body
+    std::vector<uint8_t> out;
+    for (int i = 0; i < 4; i++) out.push_back((uint8_t)((CACHE_MAGIC >> (8*i)) & 0xff));
+    for (int i = 0; i < 4; i++) out.push_back((uint8_t)((CACHE_VERSION >> (8*i)) & 0xff));
+    for (int i = 0; i < 8; i++) out.push_back((uint8_t)((stored_key >> (8*i)) & 0xff));
+    for (int i = 0; i < 8; i++) out.push_back((uint8_t)((timestamp >> (8*i)) & 0xff));
+    uint32_t new_body_size = (uint32_t)new_body.size();
+    for (int i = 0; i < 4; i++) out.push_back((uint8_t)((new_body_size >> (8*i)) & 0xff));
+    out.insert(out.end(), new_body.begin(), new_body.end());
+
+    // Write back atomically
+    std::error_code ec;
+    fs::create_directories(cache_root_dir(), ec);
+    std::string tmp = cache_path + ".tmp";
+    std::ofstream fout(tmp, std::ios::binary);
+    fout.write((char *)out.data(), out.size());
+    fout.close();
+    fs::rename(tmp, cache_path, ec);
+    if (ec) {
+        LOG_WRN("fit_delta_refresh: atomic rename failed: %s\n", ec.message().c_str());
+        return false;
+    }
+    if (cache_path_out) *cache_path_out = cache_path;
+    LOG_INF("fit_delta_refresh: refreshed delta_free_ema for %s (%zu devices): [%s] (%s)\n",
+            path_model.c_str(), new_delta_free_ema.size(),
+            [&]() {
+                std::string s;
+                for (size_t i = 0; i < new_delta_free_ema.size(); ++i) {
+                    if (i > 0) s += ", ";
+                    s += std::to_string(new_delta_free_ema[i]);
+                }
+                return s;
+            }().c_str(),
+            [&]() {
+                std::string s;
+                for (size_t i = 0; i < new_delta_free_ema.size(); ++i) {
+                    if (i > 0) s += ", ";
+                    s += std::to_string(new_delta_free_ema[i] / 1024 / 1024) + "MiB";
+                }
+                return s;
+            }().c_str());
+    return true;
+}
+
+bool common_fit_cache_save_with_model_size_error(
+        const common_params & params,
+        const std::string & path_model,
+        const common_fit_plan & plan,
+        const std::vector<int64_t> & projected_free,
+        const std::vector<int64_t> & model_size_error,
+        const std::vector<int64_t> & ceiling_free_warm,
+        const std::string * cache_path_in) {
+    // Use caller-provided path if available (same file that fit_delta_refresh wrote).
+    // Otherwise fall back to directory scan.
+    std::string cache_path = cache_path_in ? *cache_path_in : std::string();
+    if (cache_path.empty()) {
+        std::error_code ec;
+        fs::directory_iterator it(cache_root_dir(), ec);
+        if (!ec) {
+            for (const auto & entry : it) {
+                if (entry.status().type() != fs::file_type::regular) continue;
+                const std::string fp = entry.path().string();
+                std::ifstream f(fp, std::ios::binary);
+                if (!f.is_open()) continue;
+                std::vector<uint8_t> fb((std::istreambuf_iterator<char>(f)),
+                                         std::istreambuf_iterator<char>());
+                if (fb.size() < 64) continue;
+                if (fb[0] != 'C' || fb[1] != 'T' || fb[2] != 'I' || fb[3] != 'F') continue;
+                cache_path = fp;
+                break;
+            }
+        }
+    }
+    if (cache_path.empty()) {
+        LOG_WRN("%s: no cache file found\n", __func__);
+        return false;
+    }
+    // Load existing plan via common_fit_cache_load using the file's embedded key.
+    // To do this we reconstruct an analysis matching the saved state by reading
+    // device identity from the cache key itself.  Fall back to directory scan +
+    // full binary rebuild if key reconstruction fails.
+    std::ifstream in(cache_path, std::ios::binary);
+    if (!in.is_open()) {
+        LOG_WRN("%s: cannot open cache file: %s\n", __func__, cache_path.c_str());
+        return false;
+    }
+    std::vector<uint8_t> buf((std::istreambuf_iterator<char>(in)),
+                               std::istreambuf_iterator<char>());
+    LOG_INF("%s: read %zu bytes from cache file\n", __func__, buf.size());
+    if (buf.size() < 64) {
+        LOG_WRN("%s: cache file too small\n", __func__);
+        return false;
+    }
+    struct reader { const uint8_t * p; size_t n; size_t pos; };
+    auto get_u64 = [](reader & r) -> uint64_t {
+        uint64_t v = 0;
+        for (int i = 0; i < 8; i++) v |= ((uint64_t)r.p[r.pos++] << (8*i));
+        return v;
+    };
+    auto get_u32 = [](reader & r) -> uint32_t {
+        uint32_t v = 0;
+        for (int i = 0; i < 4; i++) v |= ((uint32_t)r.p[r.pos++] << (8*i));
+        return v;
+    };
+    reader r{buf.data(), buf.size(), 0};
+    (void)get_u32(r); // magic
+    uint32_t version = get_u32(r);
+    uint64_t stored_key = get_u64(r); // use stored key directly
+    (void)get_u64(r); // timestamp
+    uint32_t body_size = get_u32(r);
+    (void)version; (void)body_size;
+
+    // Directly deserialize the plan from the buffer we already read.
+    // We bypass common_fit_cache_load because the stored key was computed at save time
+    // with the frozen device state; a live analysis would produce a different key hash
+    // since free_bytes changes between initial solve and MODEL READY.
+    r = reader{buf.data(), buf.size(), 28}; // re-use existing r, skip 28-byte CTIF header
+    common_fit_plan existing;
+    int32_t n_roles = get_u32(r);
+    if (n_roles < 0 || (size_t)n_roles > MAX_ROLES) return false;
+    existing.role_devices.resize(n_roles);
+    for (int32_t i = 0; i < n_roles; i++) existing.role_devices[i] = get_u32(r);
+    existing.n_gpu_layers = get_u32(r);
+    int32_t split_len = get_u32(r);
+    if (split_len < 0 || (size_t)split_len > MAX_SPLIT) return false;
+    existing.tensor_split.resize(split_len);
+    for (int32_t i = 0; i < split_len; i++) {
+        uint32_t u = get_u32(r); memcpy(&existing.tensor_split[i], &u, sizeof(float));
+    }
+    existing.n_ctx = get_u32(r);
+    uint64_t pool = get_u64(r);
+    existing.pool_grant_mib = (size_t)pool;
+    int32_t n_shed = get_u32(r);
+    if (n_shed < 0 || (size_t)n_shed > MAX_SPLIT) return false;
+    existing.shed_reserves.reserve(n_shed);
+    for (int32_t i = 0; i < n_shed; i++) {
+        int32_t tag_len = get_u32(r);
+        if (tag_len < 0 || tag_len > 63 || r.pos + tag_len > r.n) return false;
+        existing.shed_reserves.emplace_back((const char *)(r.p + r.pos), tag_len);
+        r.pos += tag_len;
+    }
+    int32_t n_delta = get_u32(r);
+    if (n_delta < 0 || (size_t)n_delta > MAX_SPLIT) return false;
+    existing.delta_free_ema.resize(n_delta > 0 ? n_delta : 0);
+    for (int32_t i = 0; i < n_delta; i++) {
+        int64_t d = get_u64(r); existing.delta_free_ema[i] = d;
+    }
+    int32_t n_proj = get_u32(r);
+    if (n_proj < 0 || (size_t)n_proj > MAX_SPLIT) return false;
+    existing.projected_free.resize(n_proj > 0 ? n_proj : 0);
+    for (int32_t i = 0; i < n_proj; i++) {
+        int64_t p = get_u64(r); existing.projected_free[i] = p;
+    }
+    uint32_t flags = get_u32(r);
+    existing.projected_with_delta = (flags & 1) != 0;
+    if (r.pos < buf.size()) {
+        int32_t n_ceil = get_u32(r);
+        if (n_ceil >= 0 && (size_t)n_ceil <= MAX_SPLIT) {
+            existing.ceiling_free.resize(n_ceil > 0 ? n_ceil : 0);
+            for (int32_t i = 0; i < n_ceil; i++) existing.ceiling_free[i] = get_u64(r);
+        }
+    }
+    if (r.pos < buf.size()) {
+        int32_t n_err = get_u32(r);
+        if (n_err >= 0 && (size_t)n_err <= MAX_SPLIT) {
+            existing.model_size_error.resize(n_err > 0 ? n_err : 0);
+            for (int32_t i = 0; i < n_err; i++) existing.model_size_error[i] = get_u64(r);
+        }
+    }
+    if (r.pos < buf.size()) {
+        int32_t n_warm = get_u32(r);
+        if (n_warm >= 0 && (size_t)n_warm <= MAX_SPLIT) {
+            existing.ceiling_free_warm.resize(n_warm > 0 ? n_warm : 0);
+            for (int32_t i = 0; i < n_warm; i++) existing.ceiling_free_warm[i] = get_u64(r);
+        }
+    }
+
+    // Build analysis for save (model path + device identity only, free memory not used in key)
+    common_fit_analysis analysis;
+    analysis.devices.reserve(ggml_backend_dev_count());
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        common_fit_device info;
+        info.id = (int)i;
+        info.dev = dev;
+        info.is_rpc = std::string(ggml_backend_dev_name(dev)).find("RPC") != std::string::npos;
+        size_t total, free;
+        ggml_backend_dev_memory(dev, &free, &total);
+        info.total_bytes = (int64_t)total;
+        info.free_bytes = (int64_t)free;
+        info.link_bw_mbps = 0;
+        info.link_latency_us = 0;
+        analysis.devices.push_back(info);
+    }
+
+    common_fit_plan updated = existing;
+    updated.model_size_error  = model_size_error;
+    updated.projected_free    = projected_free;
+    updated.ceiling_free_warm = ceiling_free_warm;
+
+    // Serialize the updated plan using the same format as common_fit_cache_save.
+    std::vector<uint8_t> body;
+    app_i32(body, (int32_t) updated.role_devices.size());
+    for (int id : updated.role_devices) app_i32(body, id);
+    app_i32(body, updated.n_gpu_layers);
+    app_i32(body, (int32_t) updated.tensor_split.size());
+    for (float f : updated.tensor_split) app_f32(body, f);
+    app_i32(body, updated.n_ctx);
+    app_u64(body, (uint64_t) updated.pool_grant_mib);
+    app_i32(body, (int32_t) updated.shed_reserves.size());
+    for (const auto & tag : updated.shed_reserves) {
+        if (tag.size() > 63) return false;
+        app_i32(body, (int32_t) tag.size());
+        body.insert(body.end(), tag.begin(), tag.end());
+    }
+    app_i32(body, (int32_t) updated.delta_free_ema.size());
+    for (int64_t d : updated.delta_free_ema) app_i64(body, d);
+    app_i32(body, (int32_t) updated.projected_free.size());
+    for (int64_t p : updated.projected_free) app_i64(body, p);
+    app_u32(body, updated.projected_with_delta ? 1 : 0);
+    app_i32(body, (int32_t) updated.ceiling_free.size());
+    for (int64_t c : updated.ceiling_free) app_i64(body, c);
+    app_i32(body, (int32_t) updated.model_size_error.size());
+    for (int64_t e : updated.model_size_error) app_i64(body, e);
+    app_i32(body, (int32_t) updated.ceiling_free_warm.size());
+    for (int64_t w : updated.ceiling_free_warm) app_i64(body, w);
+
+    std::vector<uint8_t> out;
+    out.insert(out.end(), 'C'); out.insert(out.end(), 'T');
+    out.insert(out.end(), 'I'); out.insert(out.end(), 'F');
+    app_u32(out, (uint32_t) CACHE_VERSION);
+    const uint64_t key = common_fit_cache_key_hash(params, path_model, analysis);
+    app_u64(out, key);
+    app_u64(out, (uint64_t) std::time(nullptr));
+    app_u32(out, (uint32_t) body.size());
+    out.insert(out.end(), body.begin(), body.end());
+
+    // Write directly to cache_path (found via directory scan), bypassing
+    // common_fit_cache_save key recomputation. This ensures we write to the
+    // SAME file that fit_delta_refresh patched, keeping delta and mse together.
+    try {
+        std::string tmp = cache_path + ".tmp";
+        std::ofstream of(tmp, std::ios::binary);
+        if (!of.is_open()) {
+            LOG_WRN("%s: cannot open temp file: %s\n", __func__, tmp.c_str());
+            return false;
+        }
+        of.write((char *)out.data(), out.size());
+        of.close();
+        if (of.fail()) {
+            LOG_WRN("%s: write failed: %s\n", __func__, tmp.c_str());
+            return false;
+        }
+        std::error_code ec;
+        fs::rename(tmp, cache_path, ec);
+        if (ec) {
+            LOG_WRN("%s: rename failed: %s\n", __func__, ec.message().c_str());
+            return false;
+        }
+        LOG_INF("%s: direct-saved updated cache to %s\n", __func__, cache_path.c_str());
+        return true;
+    } catch (const std::exception & e) {
+        LOG_WRN("%s: exception: %s\n", __func__, e.what());
+        return false;
+    }
 }

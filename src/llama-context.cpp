@@ -448,6 +448,19 @@ llama_context::llama_context(
             backend_buf_exp_size.push_back(0);
         }
 
+        // Add target context's backends to the scheduler so tensors from the target model
+        // (e.g., output.weight used by DFlash2) can be scheduled correctly.
+        // These are only used by the scheduler - they are not owned by the draft context.
+        if (cparams.ctx_other != nullptr) {
+            llama_context * ctx_other = cparams.ctx_other;
+            for (const auto & backend_other : ctx_other->backends) {
+                auto * buft_other = ggml_backend_get_default_buffer_type(backend_other.get());
+                backend_ptrs.push_back(backend_other.get());
+                backend_buft.push_back(buft_other);
+                backend_buf_exp_size.push_back(0);
+            }
+        }
+
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
 
         // TODO: move these checks to ggml_backend_sched
@@ -584,23 +597,41 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     }
 
     if (cparams.auto_fgdn) {
-        LLAMA_LOG_INFO("%s: resolving fused Gated Delta Net support:\n", func);
-        resolve(llm_fused_op_gdn_ar_probe, cparams.fused_gdn_ar);
-        resolve(llm_fused_op_gdn_ch_probe, cparams.fused_gdn_ch);
+        if (cparams.ctx_other != nullptr) {
+            LLAMA_LOG_INFO("%s: skipping GDN probe for draft context\n", func);
+            cparams.fused_gdn_ar = false;
+            cparams.fused_gdn_ch = false;
+        } else {
+            LLAMA_LOG_INFO("%s: resolving fused Gated Delta Net support:\n", func);
+            resolve(llm_fused_op_gdn_ar_probe, cparams.fused_gdn_ar);
+            resolve(llm_fused_op_gdn_ch_probe, cparams.fused_gdn_ch);
+        }
         cparams.auto_fgdn = false;
     }
 
     if (cparams.auto_flid) {
-        LLAMA_LOG_INFO("%s: resolving fused Lightning Indexer support:\n", func);
-        resolve(llm_fused_op_lid_probe, cparams.fused_lid);
+        if (cparams.ctx_other != nullptr) {
+            LLAMA_LOG_INFO("%s: skipping FLID probe for draft context\n", func);
+            cparams.fused_lid = false;
+        } else {
+            LLAMA_LOG_INFO("%s: resolving fused Lightning Indexer support:\n", func);
+            resolve(llm_fused_op_lid_probe, cparams.fused_lid);
+        }
         cparams.auto_flid = false;
     }
 
     if (cparams.auto_fhc) {
-        LLAMA_LOG_INFO("%s: resolving fused DeepSeek V4 HC support:\n", func);
-        resolve(llm_fused_op_dsv4_hc_pre_probe,  cparams.fused_dsv4_hc_pre);
-        resolve(llm_fused_op_dsv4_hc_comb_probe, cparams.fused_dsv4_hc_comb);
-        resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
+        if (cparams.ctx_other != nullptr) {
+            LLAMA_LOG_INFO("%s: skipping FHC probe for draft context\n", func);
+            cparams.fused_dsv4_hc_pre   = false;
+            cparams.fused_dsv4_hc_comb  = false;
+            cparams.fused_dsv4_hc_post  = false;
+        } else {
+            LLAMA_LOG_INFO("%s: resolving fused DeepSeek V4 HC support:\n", func);
+            resolve(llm_fused_op_dsv4_hc_pre_probe,  cparams.fused_dsv4_hc_pre);
+            resolve(llm_fused_op_dsv4_hc_comb_probe, cparams.fused_dsv4_hc_comb);
+            resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
+        }
         cparams.auto_fhc = false;
     }
 }
@@ -815,6 +846,17 @@ void llama_context::sched_reserve() {
         resolve(llm_fused_op_dsv4_hc_comb_probe, cparams.fused_dsv4_hc_comb);
         resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
         cparams.auto_fhc = false;
+    }
+
+    // draft contexts (ctx_other) use small fixed graphs built dynamically at runtime,
+    // and include tensors from the target model (via ctx_other) that may not be
+    // schedulable on draft backends — skip the worst-case graph reservation
+    if (cparams.ctx_other != nullptr) {
+        const int64_t t_end_us = ggml_time_us();
+        LLAMA_LOG_INFO("%s: draft context, skipping worst-case graph reservation (took %.2f ms)\n",
+                __func__, (t_end_us - t_start_us)/1000.0);
+        sched_need_reserve = false;
+        return;
     }
 
     // reserve worst-case graph

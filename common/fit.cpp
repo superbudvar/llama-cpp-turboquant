@@ -311,11 +311,12 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         ggml_log_level log_level,
         std::vector<llama_moe_tensor_info> * moe_tensors = nullptr,
         llama_context * ctx_parent = nullptr,
-        uint32_t * n_layer_all = nullptr) {
+        uint32_t * n_layer_all = nullptr,
+        bool no_alloc = false) {
     common_fit_logger_guard logger_guard(log_level);
 
     llama_model_params mparams_copy = *mparams;
-    mparams_copy.no_alloc  = true;
+    mparams_copy.no_alloc  = no_alloc;
     mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
 
     llama_model_ptr model(llama_model_load_from_file(path_model, mparams_copy));
@@ -434,7 +435,7 @@ common_device_memory_data_vec common_get_device_memory_data(
         uint32_t & hp_n_expert,
         ggml_log_level log_level) {
     std::vector<llama_device_memory_data> impl = common_get_device_memory_data_impl(
-            path_model, mparams, cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level);
+            path_model, mparams, cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level, nullptr, nullptr, nullptr, false);
 
     common_device_memory_data_vec ret(impl.size());
     for (size_t i = 0; i < impl.size(); i++) {
@@ -477,7 +478,7 @@ common_device_memory_data_vec common_get_device_memory_data_with_parent(
 
     std::vector<llama_device_memory_data> impl = common_get_device_memory_data_impl(
             path_model, mparams, cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert,
-            log_level, nullptr, ctx_parent.get());
+            log_level, nullptr, ctx_parent.get(), nullptr, false);
 
     common_device_memory_data_vec ret(impl.size());
     for (size_t i = 0; i < impl.size(); i++) {
@@ -517,7 +518,7 @@ static void common_params_fit_impl(
     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
     const dmds_t dmds_full = common_get_device_memory_data_impl(
             path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex,
-            log_level, &moe_tensors, nullptr, &n_layer_all);
+            log_level, &moe_tensors, nullptr, &n_layer_all, false);
     const size_t nd = devs.size(); // number of devices
 
     auto log_stock_fit = [&] {
@@ -662,7 +663,7 @@ static void common_params_fit_impl(
 
                     int64_t sum_projected_used_min_ctx = 0;
                     cparams->n_ctx = n_ctx_min;
-                    const dmds_t dmds_min_ctx = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+                    const dmds_t dmds_min_ctx = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level, nullptr, nullptr, nullptr, false);
                     if (nd == 0) {
                         sum_projected_used_min_ctx = dmds_min_ctx.back().mb.total();
                     } else {
@@ -841,7 +842,7 @@ static void common_params_fit_impl(
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, mparams_copy);
 
         const dmds_t dmd_nl = common_get_device_memory_data_impl(
-            path_model, &mparams_copy, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            path_model, &mparams_copy, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level, nullptr, nullptr, nullptr, false);
 
         LOG_TRC("%s: memory for test allocation by device:\n", func_name);
         for (size_t id = 0; id < nd; id++) {
@@ -894,7 +895,7 @@ static void common_params_fit_impl(
         uint32_t candidate_nex = 0;
         candidate_memory = common_get_device_memory_data_impl(
                 path_model, &candidate, cparams, candidate_devs,
-                candidate_ngl, candidate_nct, candidate_nex, log_level);
+                candidate_ngl, candidate_nct, candidate_nex, log_level, nullptr, nullptr, nullptr, false);
         if (candidate_devs != devs || candidate_memory.size() != nd + 1) {
             return false;
         }
@@ -921,7 +922,7 @@ static void common_params_fit_impl(
 
         LOG_TRC("%s: getting device memory data with all MoE tensors moved to system memory:\n", __func__);
         const dmds_t dmds_cpu_moe = common_get_device_memory_data_impl(
-            path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level, nullptr, nullptr, nullptr, false);
 
         for (size_t id = 0; id < nd; id++) {
             global_surplus_cpu_moe += dmds_cpu_moe[id].free;
@@ -1300,7 +1301,7 @@ static void common_params_fit_impl(
                     uint32_t c_ngl = 0, c_nct = 0, c_nex = 0;
                     dmds_t candidate_memory = common_get_device_memory_data_impl(
                             path_model, &candidate, cparams, candidate_devs,
-                            c_ngl, c_nct, c_nex, log_level);
+                            c_ngl, c_nct, c_nex, log_level, nullptr, nullptr, nullptr, false);
 
                     bool candidate_valid = (candidate_devs == devs && candidate_memory.size() == nd + 1);
                     if (candidate_valid) {
@@ -1639,7 +1640,7 @@ void common_fit_print(
     uint32_t hp_nct = 0; // hparams.n_ctx_train
     uint32_t hp_nex = 0; // hparams.n_expert
 
-    auto dmd = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
+    auto dmd = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR, nullptr, nullptr, nullptr, false);
     GGML_ASSERT(dmd.size() == devs.size() + 1);
 
     for (size_t id = 0; id < devs.size(); id++) {

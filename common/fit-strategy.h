@@ -70,6 +70,34 @@ struct common_fit_plan {
     // tags of soft reservations this plan released ("mmproj", "spec"). the
     // caller moves those companions off VRAM before loading them.
     std::vector<std::string> shed_reserves;
+    // per-device EMA of (actual_free - projected_free) after each successful
+    // MODEL READY. negative = fit overestimates free space, so margin should be
+    // increased. indexed by device id from common_fit_analysis.devices.
+    // version 2+: stored in cache; version 1 has no delta (initialized to 0).
+    std::vector<int64_t> delta_free_ema;
+    // projected free bytes per device at fit time (cold_free - used from probe).
+    // used to compute actual delta after MODEL READY: delta = actual_free - projected_free.
+    // indexed by device id. populated by fit_solve_rpc_aware before returning.
+    std::vector<int64_t> projected_free;
+    // true when delta_free_ema was applied to margins before computing projected_free.
+    // lets subsequent runs know this projected_free came from delta-adjusted margins.
+    bool projected_with_delta = false;
+    // per-device maximum observed free bytes after a successful MODEL READY. set by
+    // fit_probe_ceiling() or recorded after a successful load. subsequent fits clamp
+    // the backend-reported free to min(free, ceiling) to avoid overestimating when
+    // free fluctuates due to driver overhead or fragmented pools.
+    // indexed by device id. version 4+: stored in cache; earlier versions have empty.
+    std::vector<int64_t> ceiling_free;
+    // warm counterpart of ceiling_free: measured AFTER model weights are loaded but
+    // BEFORE KV cache/context init. captures the driver overhead at the moment the
+    // context will be created, preventing the cold-only ceiling from masking the
+    // ~800 MiB ROCm driver allocation growth during init. version 6+ or same as
+    // ceiling_free when not separately captured.
+    std::vector<int64_t> ceiling_free_warm;
+    // per-device model_size_error: actual_model_used - projected_model_from_probe.
+    // this is the dominant component of delta_free_ema but converges slowly via EMA.
+    // storing it directly avoids the multi-load convergence lag. version 5+: cached.
+    std::vector<int64_t> model_size_error;
 };
 
 // Measure seam: mirrors the common_get_device_memory_data signature (fit.h:96).
@@ -90,12 +118,14 @@ struct common_fit_probe {
 
 // Full entry point: analyze -> solve -> serialize -> validate.
 // plan != nullptr = manual placement: skip solve, validate the plan, fail loudly on conflict.
+// plan_out != nullptr = return the computed plan (including projected_free and delta_free_ema).
 // Returns the same status contract as common_fit_params (fit.cpp:1422-1427).
 common_params_fit_status common_fit_strategy_apply(
         common_params & params,
         llama_model_params * mparams,
         llama_context_params * cparams,
-        const common_fit_plan * plan = nullptr);
+        const common_fit_plan * plan = nullptr,
+        common_fit_plan * plan_out = nullptr);
 
 // Internal overload with an injectable measure seam (used by tests).
 common_params_fit_status common_fit_strategy_apply_impl(
@@ -103,12 +133,19 @@ common_params_fit_status common_fit_strategy_apply_impl(
         llama_model_params * mparams,
         llama_context_params * cparams,
         const common_fit_plan * plan,
-        const common_fit_probe & probe);
+        const common_fit_probe & probe,
+        common_fit_plan * plan_out = nullptr);
 
 // Bounded MoE pool budget. user_budget_mib != 0 wins.
 // Else: min(clamp(remaining/2, max(2*working_set, 256 MiB), 4 GiB), remaining).
 // When remaining < floor: grant = 0 (caller must WRN).
 size_t common_fit_strategy_pool_budget(size_t working_set_bytes, size_t remaining_vram, size_t user_budget_mib);
+
+// Probe the warm (post-model-load, pre-KV-init) ceiling on all devices.
+// unlike fit_probe_ceiling which uses analysis.devices (frozen before model load),
+// this reads live free via ggml_backend_dev_memory after model weights are loaded.
+// indexed by device id matching common_fit_analysis.devices order (same as llama_model_get_device(i)).
+std::vector<int64_t> common_fit_probe_ceiling_warm(llama_model * model, const common_params & params);
 
 // Activation profile schema (Issue 3, schema + sink only - no decode-path hooks in v1).
 struct common_activation_profile {

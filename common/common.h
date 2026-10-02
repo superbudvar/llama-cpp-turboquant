@@ -508,7 +508,7 @@ struct common_params {
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
 
     int32_t n_gpu_layers       = -1;    // number of layers to store in VRAM, -1 is auto, <= -2 is all
-    int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
+    int32_t main_gpu           = -1;    // the GPU that is used for scratch and small tensors (-1 = auto-select first non-RPC)
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
     bool    fit_params_print   = false; // print the estimated required memory to run the model
@@ -517,6 +517,8 @@ struct common_params {
     common_fit_strategy fit_strategy       = COMMON_FIT_STRATEGY_UPSTREAM; // selectable fit engine
     int32_t             fit_strategy_min_ctx = 0; // strategy floor, 0 = unset -> required for non-upstream
     bool                fit_cache_clear    = false; // discard the disk fit result cache for this model before fitting
+    bool                fit_params_no_context_reserve = false; // honor --fit-target as explicit margin, ignore 2 GiB context_reserve floor
+    bool                fit_params_probe_ceiling = false; // probe device ceiling and clamp reported free to measured maximum
 
     std::vector<std::string> rpc_hosts; // RPC server hosts captured at parse time (cold-start signal)
 
@@ -984,6 +986,18 @@ struct common_init_result {
     void reset_samplers();
 
     std::vector<llama_adapter_lora_ptr> & lora();
+
+    // fit delta feedback: set projected_free and delta_ema before MODEL READY,
+    // then call update_fit_delta after MODEL READY to compute actual_delta and
+    // update the EMA in the on-disk cache.
+    void set_fit_projections(std::vector<int64_t> projected_free, std::vector<int64_t> delta_free_ema);
+    void set_model_path(const std::string & path);
+    void set_ceiling_free_warm(std::vector<int64_t> ceiling_free_warm);
+    void update_fit_delta();
+    const std::vector<int64_t> & model_size_error() const;
+    const std::vector<int64_t> & ceiling_free_warm() const;
+
+    const std::string & model_path() const;
 
 private:
     struct impl;

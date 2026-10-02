@@ -842,7 +842,15 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
 
         if (padded_size > original_size) {
             ggml_cuda_set_device(ctx->device);
-            CUDA_CHECK(cudaMemset((char *)tensor->data + original_size, 0, padded_size - original_size));
+            GGML_LOG_DEBUG("%s: init tensor padding: name=%s, ne{%d,%d}, original_size=%zu, padded_size=%zu, buffer_size=%zu, data=%p\n",
+                __func__, tensor->name, tensor->ne[0], tensor->ne[1], original_size, padded_size, buffer->size, tensor->data);
+            void * base = ggml_backend_buffer_get_base(buffer);
+            if ((char *)tensor->data + padded_size <= (char *)base + buffer->size) {
+                CUDA_CHECK(cudaMemset((char *)tensor->data + original_size, 0, padded_size - original_size));
+            } else {
+                GGML_LOG_DEBUG("%s: skipping padding memset for %s: tensor data region [data=%p, end=%p) exceeds buffer [base=%p, end=%p)\n",
+                    __func__, tensor->name, tensor->data, (char *)tensor->data + padded_size, base, (char *)base + buffer->size);
+            }
         }
     }
     return GGML_STATUS_SUCCESS;
@@ -6002,8 +6010,12 @@ static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_
     //
     // Off by default, because otherwise the scheduler is free to place any weight here, including
     // the ones that would be ruinous. Select tensors deliberately with --override-tensor.
-    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev)
-        || ((integrated || ggml_cuda_host_weights_enabled()) && ggml_backend_buft_is_cuda_host(buft));
+    if (ggml_backend_buft_is_cuda(buft)) {
+        ggml_backend_dev_t buft_dev_obj = ggml_backend_buft_get_device(buft);
+        const int buft_dev = buft_dev_obj ? ((ggml_backend_cuda_device_context *)buft_dev_obj->context)->device : -1;
+        return buft_dev == dev_ctx->device;
+    }
+    return (integrated || ggml_cuda_host_weights_enabled()) && ggml_backend_buft_is_cuda_host(buft);
 }
 
 static int64_t get_op_batch_size(const ggml_tensor * op) {

@@ -106,6 +106,11 @@ static int fit_tensor_layer(const std::string & name) {
     return (i < name.size() && name[i] == '.') ? il : -1;
 }
 
+// forward declaration
+static std::vector<int64_t> fit_probe_ceiling(
+        const common_fit_analysis & analysis,
+        const common_params & params);
+
 // the device list index of the best non-RPC device by free memory, or -1
 static int fit_best_local(const common_fit_analysis & analysis, int exclude = -1) {
     int best = -1;
@@ -230,7 +235,9 @@ static bool fit_fits_margins(
         const common_device_memory_data_vec & memory,
         const std::vector<int64_t> & margins,
         const common_fit_analysis & analysis,
-        size_t * fail_dev = nullptr) {
+        size_t * fail_dev = nullptr,
+        const std::vector<int64_t> * ceiling_free = nullptr,
+        const std::vector<int64_t> * ceiling_free_warm = nullptr) {
     const size_t nd = analysis.devices.size();
     if (fail_dev) { *fail_dev = (size_t) -1; }
     LOG_DBG("%s: memory.size()=%zu nd+1=%zu margins.size()=%zu nd=%zu\n",
@@ -251,7 +258,19 @@ static bool fit_fits_margins(
         // buffers, so the cold free is the correct basis for the fit. The model,
         // context and compute sizes come from the GGUF/tensor metadata via
         // llama_get_memory_breakdown, so `used` is exact.
-        const int64_t free_cold = analysis.devices[id].free_bytes;
+        // ceiling_free (when set) clamps the reported free to the measured ceiling
+        // so that driver-level fluctuations above the measured ceiling don't cause
+        // fits to overestimate usable memory.
+        // ceiling_free_warm (when set) captures the true allocatable memory AFTER
+        // model weights are loaded but before KV cache init, preventing the cold-only
+        // ceiling from masking the ~800 MiB ROCm driver growth during init.
+        int64_t free_cold = analysis.devices[id].free_bytes;
+        if (ceiling_free && id < ceiling_free->size() && (*ceiling_free)[id] > 0) {
+            free_cold = std::min(free_cold, (*ceiling_free)[id]);
+        }
+        if (ceiling_free_warm && id < ceiling_free_warm->size() && (*ceiling_free_warm)[id] > 0) {
+            free_cold = std::min(free_cold, (*ceiling_free_warm)[id]);
+        }
         const int64_t rem = free_cold - used;
         LOG_DBG("%s: dev[%zu] free_cold=%lld used=%lld (m%d c%d k%d) rem=%lld margin=%lld -> %s\n",
                 __func__, id,
@@ -535,7 +554,9 @@ static int32_t fit_grow_context(
         const std::string & path_model,
         common_fit_plan & out_plan,
         fit_measure_result & out_measure,
-        int32_t ngl_override = -1) {
+        int32_t ngl_override,
+        const std::vector<int64_t> & ceiling_free,
+        const std::vector<int64_t> & ceiling_free_warm) {
     const size_t nd = analysis.devices.size();
     // an explicit --ctx-size is a hard requirement: fit model + exactly that
     // context and never grow or shrink it. the fit then only sheds model layers
@@ -550,7 +571,7 @@ static int32_t fit_grow_context(
         const bool ok_m = fit_measure_plan(decode_probe, p, mparams, cparams, path_model, m);
         if (!ok_m) { LOG_DBG("%s: grow fits FAIL measure n_ctx=%u\n", __func__, p.n_ctx); return false; }
         if (!fit_same_devices(m.devs, analysis)) { LOG_DBG("%s: grow fits FAIL devs n_ctx=%u\n", __func__, p.n_ctx); return false; }
-        const bool ok_fm = fit_fits_margins(m.memory, margins, analysis);
+        const bool ok_fm = fit_fits_margins(m.memory, margins, analysis, nullptr, &ceiling_free, &ceiling_free_warm);
         LOG_DBG("%s: grow fits n_ctx=%u measure=%d margins=%d -> %s\n", __func__, p.n_ctx, ok_m ? 1 : 0, ok_fm ? 1 : 0, ok_fm ? "ok" : "FAIL");
         return ok_fm;
     };
@@ -652,7 +673,9 @@ static int32_t fit_spill_split_at_ngl(
         float scan_hi,
         common_fit_plan & out_plan,
         fit_measure_result & out_measure,
-        float & out_frac) {
+        float & out_frac,
+        const std::vector<int64_t> & ceiling_free,
+        const std::vector<int64_t> & ceiling_free_warm) {
     out_frac = -1.0f;
     const int32_t min_ctx = (int32_t) (params.n_ctx > 0 ? params.n_ctx : params.fit_strategy_min_ctx);
     const float step = 0.05f;
@@ -709,7 +732,7 @@ static int32_t fit_spill_split_at_ngl(
         const bool ok_measure = fit_measure_plan(probe, plan, mparams, cparams, path_model, m);
         const bool ok_devs    = ok_measure && fit_same_devices(m.devs, analysis);
         size_t fail = (size_t) -1;
-        const bool ok_margin  = ok_devs && fit_fits_margins(m.memory, margins, analysis, &fail);
+        const bool ok_margin  = ok_devs && fit_fits_margins(m.memory, margins, analysis, &fail, &ceiling_free, &ceiling_free_warm);
         LOG_DBG("%s: ngl=%d rpc_frac=%.4f measure=%d devs=%d margin=%d -> %s\n",
                 __func__, ngl, f, ok_measure ? 1 : 0, ok_devs ? 1 : 0, ok_margin ? 1 : 0,
                 ok_margin ? "FEASIBLE" : "rejected");
@@ -746,7 +769,7 @@ static int32_t fit_spill_split_at_ngl(
                 const bool ok_measure = fit_measure_plan(probe, plan, mparams, cparams, path_model, m);
                 const bool ok_devs    = ok_measure && fit_same_devices(m.devs, analysis);
                 size_t fail = (size_t) -1;
-                const bool ok_margin  = ok_devs && fit_fits_margins(m.memory, margins, analysis, &fail);
+                const bool ok_margin  = ok_devs && fit_fits_margins(m.memory, margins, analysis, &fail, &ceiling_free, &ceiling_free_warm);
                 LOG_DBG("%s: ngl=%d bisect rpc_frac=%.4f measure=%d devs=%d margin=%d -> %s\n",
                         __func__, ngl, fm, ok_measure ? 1 : 0, ok_devs ? 1 : 0, ok_margin ? 1 : 0,
                         ok_margin ? "FEASIBLE" : "rejected");
@@ -794,7 +817,7 @@ static int32_t fit_spill_split_at_ngl(
         common_fit_plan plan;
         fit_measure_result m;
         const int32_t ctx = fit_grow_context(analysis, margins, params, mparams, cparams,
-                probe, spec, f, loader_ngl, path_model, plan, m, ngl);
+                probe, spec, f, loader_ngl, path_model, plan, m, ngl, ceiling_free, ceiling_free_warm);
         if (ctx < 0) { continue; }
         if (best_ctx < 0 || ctx > best_ctx) {
             best_ctx = ctx;
@@ -896,7 +919,9 @@ static bool fit_solve_rpc_aware(
         uint32_t loader_ngl,
         common_fit_plan & out_plan,
         fit_measure_result & out_measure,
-        int32_t ngl_hint = -1) {
+        int32_t ngl_hint,
+        const std::vector<int64_t> & ceiling_free,
+        const std::vector<int64_t> & ceiling_free_warm) {
     const int effective_main = fit_effective_main_gpu(analysis, params.main_gpu);
     if (params.main_gpu >= 0 && params.main_gpu < (int) analysis.devices.size() &&
         analysis.devices[params.main_gpu].is_rpc) {
@@ -1000,11 +1025,16 @@ static bool fit_solve_rpc_aware(
                 common_fit_plan plan;
                 fit_measure_result m;
                 const int32_t ctx = fit_grow_context(analysis, margins, params, mparams, cparams,
-                        probe, cand, -1.0f, loader_ngl, path_model, plan, m, ngl_hint);
+                        probe, cand, -1.0f, loader_ngl, path_model, plan, m, ngl_hint, ceiling_free, ceiling_free_warm);
                 if (ctx >= 0) {
                     out_plan = plan;
                     out_measure = m;
                     out_plan.shed_reserves = shed_tags;
+                    out_plan.projected_with_delta = !out_plan.delta_free_ema.empty();
+                    out_plan.projected_free.resize(analysis.devices.size());
+                    for (size_t id = 0; id < analysis.devices.size(); id++) {
+                        out_plan.projected_free[id] = analysis.devices[id].free_bytes - fit_device_used(out_measure.memory[id]);
+                    }
                     LOG_DBG("%s: selected candidate %s with n_ctx=%d (min=%d)\n",
                             __func__, cand.label.c_str(), ctx, params.fit_strategy_min_ctx);
                     return true;
@@ -1028,7 +1058,7 @@ static bool fit_solve_rpc_aware(
                 fit_measure_result m;
                 const bool ok_measure = fit_measure_plan(probe, plan, mparams, cparams, path_model, m);
                 const bool ok_devs    = ok_measure && fit_same_devices(m.devs, analysis);
-                const bool ok_margin  = ok_devs && fit_fits_margins(m.memory, margins, analysis);
+                const bool ok_margin  = ok_devs && fit_fits_margins(m.memory, margins, analysis, nullptr, &ceiling_free, &ceiling_free_warm);
                 LOG_DBG("%s: rpc_frac=%.4f measure=%d devs=%d margin=%d -> %s\n",
                         __func__, f, ok_measure ? 1 : 0, ok_devs ? 1 : 0, ok_margin ? 1 : 0,
                         ok_margin ? "FEASIBLE" : "rejected");
@@ -1068,7 +1098,7 @@ static bool fit_solve_rpc_aware(
                 common_fit_plan plan;
                 fit_measure_result m;
                 const int32_t ctx = fit_grow_context(analysis, margins, params, mparams, cparams,
-                        probe, cand, ftry, loader_ngl, path_model, plan, m);
+                        probe, cand, ftry, loader_ngl, path_model, plan, m, -1, ceiling_free, ceiling_free_warm);
                 if (ctx < 0) continue;
                 if (best_ctx < 0 || ctx > best_ctx) {
                     best_ctx = ctx;
@@ -1081,6 +1111,11 @@ static bool fit_solve_rpc_aware(
                 out_plan = best_plan;
                 out_measure = best_m;
                 out_plan.shed_reserves = shed_tags;
+                out_plan.projected_with_delta = !out_plan.delta_free_ema.empty();
+                out_plan.projected_free.resize(analysis.devices.size());
+                for (size_t id = 0; id < analysis.devices.size(); id++) {
+                    out_plan.projected_free[id] = analysis.devices[id].free_bytes - fit_device_used(out_measure.memory[id]);
+                }
                 LOG_DBG("%s: selected candidate %s rpc_frac=%.4f n_ctx=%d (min=%d, feasible rpc_frac [%.4f,%.4f], max-context)\n",
                         __func__, cand.label.c_str(), best_ftry, best_ctx,
                         params.fit_strategy_min_ctx, f_lo_off, f_hi_off);
@@ -1127,10 +1162,10 @@ static bool fit_solve_rpc_aware(
                 if (spec_is_rpc_split) {
                     ctx = fit_spill_split_at_ngl(analysis, margins, params, mparams, cparams,
                             probe, spill_spec, loader_ngl, path_model, mid_ngl, scan_hi,
-                            plan, m, frac);
+                            plan, m, frac, ceiling_free, ceiling_free_warm);
                 } else {
                     ctx = fit_grow_context(analysis, margins, params, mparams, cparams,
-                            probe, spill_spec, -1.0f, loader_ngl, path_model, plan, m, mid_ngl);
+                            probe, spill_spec, -1.0f, loader_ngl, path_model, plan, m, mid_ngl, ceiling_free, ceiling_free_warm);
                 }
                 if (ctx >= min_ctx) {
                     best_ngl = mid_ngl;
@@ -1146,6 +1181,11 @@ static bool fit_solve_rpc_aware(
                 out_plan = best_plan;
                 out_measure = best_m;
                 out_plan.shed_reserves = shed_tags;
+                out_plan.projected_with_delta = !out_plan.delta_free_ema.empty();
+                out_plan.projected_free.resize(analysis.devices.size());
+                for (size_t id = 0; id < analysis.devices.size(); id++) {
+                    out_plan.projected_free[id] = analysis.devices[id].free_bytes - fit_device_used(out_measure.memory[id]);
+                }
                 if (best_frac >= 0.0f) {
                     LOG_WRN("%s: spilling %u layers to CPU to reach min-ctx %d (n_gpu_layers=%d of %u, rpc_frac=%.4f)\n",
                             __func__, (uint32_t) (loader_ngl + 1 - best_ngl), min_ctx, best_ngl, loader_ngl + 1, best_frac);
@@ -1173,7 +1213,9 @@ static common_fit_plan fit_solve_maxctx(
         const common_fit_probe & probe,
         const std::string & path_model,
         uint32_t loader_ngl,
-        fit_measure_result & out_measure) {
+        fit_measure_result & out_measure,
+        const std::vector<int64_t> & ceiling_free,
+        const std::vector<int64_t> & ceiling_free_warm) {
     if (params.fit_strategy_min_ctx <= 0) {
         throw common_params_fit_exception("maxctx strategy requires --fit-strategy-min-ctx");
     }
@@ -1203,7 +1245,7 @@ static common_fit_plan fit_solve_maxctx(
             common_fit_plan plan;
             fit_measure_result m;
             const int32_t ctx = fit_grow_context(analysis, margins, params, mparams, cparams,
-                    probe, placement, -1.0f, loader_ngl, path_model, plan, m);
+                    probe, placement, -1.0f, loader_ngl, path_model, plan, m, -1, ceiling_free, ceiling_free_warm);
             if (ctx < 0) {
                 LOG_DBG("%s: placement %s cannot fit even the minimum context, skipping\n",
                         __func__, placement.label.c_str());
@@ -1330,7 +1372,8 @@ static void fit_validate(
         llama_model_params * mparams,
         llama_context_params * cparams,
         const common_fit_probe & probe,
-        const std::string & path_model) {
+        const std::string & path_model,
+        const std::vector<int64_t> * ceiling_free_warm = nullptr) {
     // one final measure with the serialized placement
     fit_measure_result final_measure;
     if (!fit_measure_plan(probe, plan, mparams, cparams, path_model, final_measure)) {
@@ -1345,8 +1388,14 @@ static void fit_validate(
         // `free` (committed backends) or `total - used` (lazy backends). Using
         // `free - used` double-counts the footprint and rejects valid placements.
         // No stats overhead is added: the device baseline is already in `free`.
-        const int64_t rem = std::min((int64_t) final_measure.memory[id].free,
-                                     (int64_t) final_measure.memory[id].total - used);
+        // ceiling_free_warm (when set) further constrains the headroom to the
+        // measured warm ceiling, preventing ROCm driver overhead from masking the
+        // true allocatable memory at context-init time.
+        int64_t rem = std::min((int64_t) final_measure.memory[id].free,
+                               (int64_t) final_measure.memory[id].total - used);
+        if (ceiling_free_warm && id < ceiling_free_warm->size() && (*ceiling_free_warm)[id] > 0) {
+            rem = std::min(rem, (*ceiling_free_warm)[id]);
+        }
         const int64_t free_mib = (int64_t) final_measure.memory[id].free / (1024 * 1024);
         const int64_t used_mib = used / (1024 * 1024);
         const int64_t proj_free_mib = rem / (1024 * 1024);
@@ -1441,7 +1490,8 @@ common_params_fit_status common_fit_strategy_apply_impl(
         llama_model_params * mparams,
         llama_context_params * cparams,
         const common_fit_plan * plan,
-        const common_fit_probe & probe) {
+        const common_fit_probe & probe,
+        common_fit_plan * plan_out) {
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     try {
@@ -1465,17 +1515,45 @@ common_params_fit_status common_fit_strategy_apply_impl(
 
         // margins are indexed by model device order; the user's explicit
         // fit-target values are honored per device (no RPC main_gpu swap).
+        // the context_reserve (2 GiB per device) is a hard floor for the margin:
+        // fit-target can only increase the margin, never drop it below context_reserve.
+        // the delta_free_ema (from cache) corrects systematic bias: actual_free tends
+        // to be lower than projected_free when model+KV+compute are counted separately.
+        // a negative EMA means we underestimated the footprint -> increase margin.
+        const int64_t context_reserve = 2LL * 1024 * 1024 * 1024;
         std::vector<int64_t> margins;
         margins.reserve(analysis.devices.size());
         for (size_t id = 0; id < analysis.devices.size(); id++) {
-            margins.push_back(id < params.fit_params_target.size()
+            int64_t target = (id < params.fit_params_target.size()
                 ? (int64_t) params.fit_params_target[id] : 0);
+            if (params.fit_params_no_context_reserve && target > 0) {
+                margins.push_back(target);
+            } else {
+                margins.push_back(std::max(target, context_reserve));
+            }
         }
 
         common_fit_plan final_plan;
         fit_measure_result win_measure;
         bool have_plan = false;
-
+        // ceiling_free from an existing plan: clamps backend-reported free to the measured
+        // ceiling so fluctuations above the ceiling don't cause fits to overestimate.
+        std::vector<int64_t> ceiling_free;
+        if (plan && !plan->ceiling_free.empty()) {
+            ceiling_free = plan->ceiling_free;
+            LOG_DBG("%s: using ceiling_free from provided plan (%zu devices)\n",
+                    __func__, ceiling_free.size());
+        }
+        // ceiling_free_warm: measured AFTER model weights are loaded but BEFORE KV cache.
+        // captured by fit_probe_ceiling_warm() after model load and passed to fit_fits_margins
+        // for post-load validation. empty during the solve phase.
+        std::vector<int64_t> ceiling_free_warm;
+        if (plan && !plan->ceiling_free_warm.empty()) {
+            ceiling_free_warm = plan->ceiling_free_warm;
+            LOG_DBG("%s: using ceiling_free_warm from provided plan (%zu devices)\n",
+                    __func__, ceiling_free_warm.size());
+        }
+        
         if (plan == nullptr) {
             // fit cache: a hit substitutes the cached placement for the probe
             // suite. it is validated with a single probe; on any failure the
@@ -1485,6 +1563,49 @@ common_params_fit_status common_fit_strategy_apply_impl(
             if (common_fit_cache_load(params, params.model.path, analysis, cache_plan)) {
                 LOG_INF("%s: fit cache hit for %s, validating cached placement\n",
                         __func__, params.model.path.c_str());
+                // apply learned delta EMA to margins before validation and solving
+                if (!cache_plan.delta_free_ema.empty()) {
+                    for (size_t id = 0; id < margins.size() && id < cache_plan.delta_free_ema.size(); id++) {
+                        int64_t delta = cache_plan.delta_free_ema[id];
+                        // delta is actual_free - proj_free: negative means fit overestimates
+                        // free space, so margin should increase to compensate
+                        int64_t new_margin = margins[id] - delta;
+                        if (params.fit_params_no_context_reserve) {
+                            margins[id] = std::max((int64_t)0, new_margin);
+                        } else {
+                            margins[id] = std::max(context_reserve, new_margin);
+                        }
+                        LOG_DBG("%s: device %zu: margin %lld - delta %lld (ema) = %lld\n",
+                                __func__, id, (long long) margins[id] + delta, (long long) delta, (long long) margins[id]);
+                    }
+                }
+                // extract ceiling from cache if available
+                if (!cache_plan.ceiling_free.empty()) {
+                    ceiling_free = cache_plan.ceiling_free;
+                    LOG_DBG("%s: using ceiling_free from cache (%zu devices)\n",
+                            __func__, ceiling_free.size());
+                }
+                // extract warm ceiling from cache if available
+                if (!cache_plan.ceiling_free_warm.empty()) {
+                    ceiling_free_warm = cache_plan.ceiling_free_warm;
+                    LOG_DBG("%s: using ceiling_free_warm from cache (%zu devices)\n",
+                            __func__, ceiling_free_warm.size());
+                }
+                // apply model_size_error from cache: this is the dominant component of delta
+                // (actual_model - projected_model). unlike EMA which converges slowly, this is
+                // stored directly so the margin grows by the full error on the NEXT load.
+                if (!cache_plan.model_size_error.empty()) {
+                    for (size_t id = 0; id < margins.size() && id < cache_plan.model_size_error.size(); id++) {
+                        int64_t err = cache_plan.model_size_error[id];
+                        // err > 0: fit overestimates free (actual_model > projected_model), need more margin
+                        // err < 0: fit underestimates free, can reduce margin
+                        // same sign convention as delta: margin -= err
+                        int64_t prev = margins[id];
+                        margins[id] -= err;
+                        LOG_INF("%s: device %zu: margin %lld - model_size_error %lld = %lld (from cache)\n",
+                                __func__, id, (long long) prev, (long long) err, (long long) margins[id]);
+                    }
+                }
                 // an explicit --ctx-size is a hard requirement: never replay a
                 // placement measured for a different context
                 const bool ctx_mismatch = params.n_ctx > 0 && cache_plan.n_ctx != (int32_t) params.n_ctx;
@@ -1509,10 +1630,24 @@ common_params_fit_status common_fit_strategy_apply_impl(
                     // released are released here too
                     const std::vector<int64_t> cache_margins =
                         fit_effective_margins(margins, params.fit_params_reserves, cache_plan.shed_reserves);
-                    if (fit_fits_margins(win_measure.memory, cache_margins, analysis)) {
+                    if (fit_fits_margins(win_measure.memory, cache_margins, analysis, nullptr, &ceiling_free, &ceiling_free_warm)) {
                         final_plan = cache_plan;
                         have_plan  = true;
                         cache_ok   = true;
+                        if (!ceiling_free.empty()) {
+                            const char * d0 = analysis.devices.size() > 0 ? ggml_backend_dev_name(analysis.devices[0].dev) : "dev0";
+                            const char * d1 = analysis.devices.size() > 1 ? ggml_backend_dev_name(analysis.devices[1].dev) : "dev1";
+                            LOG_INF("%s: cache hit loaded ceiling_free: %s=%.1f MiB %s=%.1f MiB\n",
+                                    __func__, d0, ceiling_free[0] / (1024.0 * 1024.0),
+                                    d1, ceiling_free.size() > 1 ? ceiling_free[1] / (1024.0 * 1024.0) : 0.0);
+                        }
+                        // cache hit but no ceiling data yet: probe now so the next
+                        // load gets it without spending time on a redundant measure pass
+                        if (params.fit_params_probe_ceiling && ceiling_free.empty()) {
+                            ceiling_free = fit_probe_ceiling(analysis, params);
+                            LOG_INF("%s: cache hit had no ceiling, probing now: %zu devices\n",
+                                    __func__, ceiling_free.size());
+                        }
                     }
                 }
                 if (!cache_ok) {
@@ -1520,6 +1655,17 @@ common_params_fit_status common_fit_strategy_apply_impl(
                 }
             }
             if (!cache_ok) {
+                // run the ceiling probe if requested and no ceiling is available from cache or plan
+                if (params.fit_params_probe_ceiling && ceiling_free.empty()) {
+                    ceiling_free = fit_probe_ceiling(analysis, params);
+                    LOG_DBG("%s: fit-probe-ceiling recorded: %zu devices\n", __func__, ceiling_free.size());
+                }
+                // carry the learned delta through to final_plan so it persists in the cache
+                final_plan.delta_free_ema = cache_plan.delta_free_ema;
+                // carry the ceiling through as well so a subsequent refit doesn't clobber it
+                if (!cache_plan.ceiling_free.empty()) {
+                    final_plan.ceiling_free = cache_plan.ceiling_free;
+                }
                 if (params.fit_strategy == COMMON_FIT_STRATEGY_RPC_AWARE) {
                     const int32_t ngl_hint = cache_plan.n_gpu_layers >= 0 ? cache_plan.n_gpu_layers : -1;
                     if (ngl_hint >= 0) {
@@ -1528,7 +1674,8 @@ common_params_fit_status common_fit_strategy_apply_impl(
                     }
                     have_plan = fit_solve_rpc_aware(
                             analysis, margins, params.fit_params_reserves, params, mparams, cparams, probe,
-                            params.model.path, analysis.loader_ngl, final_plan, win_measure, ngl_hint);
+                            params.model.path, analysis.loader_ngl, final_plan, win_measure, ngl_hint,
+                            ceiling_free, ceiling_free_warm);
                     if (!have_plan) {
                         // exhaust: fall back to the stock solver. it cannot shed
                         // reservations, so its margins fold every one of them in
@@ -1549,7 +1696,7 @@ common_params_fit_status common_fit_strategy_apply_impl(
                 } else {
                     final_plan = fit_solve_maxctx(
                             analysis, margins, params.fit_params_reserves, params, mparams, cparams, probe,
-                            params.model.path, analysis.loader_ngl, win_measure);
+                            params.model.path, analysis.loader_ngl, win_measure, ceiling_free, ceiling_free_warm);
                     have_plan = true;
                 }
             }
@@ -1567,7 +1714,7 @@ common_params_fit_status common_fit_strategy_apply_impl(
             if (!fit_same_devices(win_measure.devs, analysis)) {
                 throw std::runtime_error("manual plan changed the device set");
             }
-            if (!fit_fits_margins(win_measure.memory, margins, analysis)) {
+            if (!fit_fits_margins(win_measure.memory, margins, analysis, nullptr, &ceiling_free, &ceiling_free_warm)) {
                 throw std::runtime_error("manual plan does not fit within the per-device margins");
             }
             have_plan = true;
@@ -1584,16 +1731,28 @@ common_params_fit_status common_fit_strategy_apply_impl(
             fit_effective_margins(margins, params.fit_params_reserves, final_plan.shed_reserves);
 
         fit_serialize(final_plan, params, mparams, cparams, analysis, win_measure, final_margins);
-        fit_validate(final_plan, analysis, final_margins, analysis.loader_ngl, mparams, cparams, probe, params.model.path);
+        fit_validate(final_plan, analysis, final_margins, analysis.loader_ngl, mparams, cparams, probe, params.model.path,
+                    ceiling_free_warm.empty() ? nullptr : &ceiling_free_warm);
 
         // publish the shed state so callers can move companions off VRAM
         params.fit_params_shed_tags = final_plan.shed_reserves;
+
+        // record the ceiling so subsequent runs clamp free to the measured ceiling
+        if (!ceiling_free.empty()) {
+            final_plan.ceiling_free = ceiling_free;
+        }
+        if (!ceiling_free_warm.empty()) {
+            final_plan.ceiling_free_warm = ceiling_free_warm;
+        }
 
         // save the successful placement to the disk cache (best-effort); on a
         // cache hit this refreshes the freshness timestamp
         common_fit_cache_save(params, params.model.path, analysis, final_plan);
 
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
+        if (plan_out) {
+            *plan_out = final_plan;
+        }
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());
         status = COMMON_PARAMS_FIT_STATUS_FAILURE;
@@ -1610,7 +1769,8 @@ common_params_fit_status common_fit_strategy_apply(
         common_params & params,
         llama_model_params * mparams,
         llama_context_params * cparams,
-        const common_fit_plan * plan) {
+        const common_fit_plan * plan,
+        common_fit_plan * plan_out) {
     common_fit_probe probe;
     probe.measure = [](const char * path_model,
                        const llama_model_params * mparams,
@@ -1623,7 +1783,7 @@ common_params_fit_status common_fit_strategy_apply(
         return common_get_device_memory_data(
             path_model, mparams, cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level);
     };
-    return common_fit_strategy_apply_impl(params, mparams, cparams, plan, probe);
+    return common_fit_strategy_apply_impl(params, mparams, cparams, plan, probe, plan_out);
 }
 
 size_t common_fit_strategy_pool_budget(size_t working_set_bytes, size_t remaining_vram, size_t user_budget_mib) {
@@ -1737,4 +1897,133 @@ ggml_backend_dev_t llama_model_get_device_by_backend_id(const struct llama_model
     }
 
     return nullptr;
+}
+
+// Binary-searches the OOM threshold on each device by trying to allocate progressively
+// larger buffers using ggml_backend_buft_alloc_buffer. Returns per-device ceiling free
+// bytes (the maximum allocation that succeeded). These ceilings are used to clamp the
+// backend-reported free bytes so that fit strategy never overestimates usable memory.
+//
+// The probe runs EXPONENTIAL search first (doubling step) to find the approximate
+// ceiling quickly, then BINARY search between last-success and first-failure to
+// refine. Allocations use 256 MiB alignment. Failures are silent (null buffer returned
+// by ggml_backend_buft_alloc_buffer), no exception thrown.
+static std::vector<int64_t> fit_probe_ceiling(
+        const common_fit_analysis & analysis,
+        const common_params & /*params*/) {
+    std::vector<int64_t> ceiling_free(analysis.devices.size(), 0);
+    constexpr int64_t PROBE_STEP = 256 * 1024 * 1024; // 256 MiB alignment and step
+    constexpr int MAX_EXPONENTIAL_STEPS = 20;      // up to 256 GiB range with doubling
+
+    for (size_t di = 0; di < analysis.devices.size(); di++) {
+        const int id = analysis.devices[di].id;
+        ggml_backend_dev_t dev = analysis.devices[di].dev;
+        ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+        if (!dev || !buft) {
+            LOG_DBG("%s: device %d has no buffer type, skipping ceiling probe\n", __func__, id);
+            continue;
+        }
+
+        int64_t lo = 0;                                          // last known good
+        int64_t hi = analysis.devices[di].free_bytes;            // start upper bound at current free
+        if (hi < PROBE_STEP) {
+            ceiling_free[di] = 0;
+            LOG_DBG("%s: device %d free=%ld too small, ceiling=0\n", __func__, id, (long)hi);
+            continue;
+        }
+
+        // exponential phase: find an upper bound
+        int64_t step = PROBE_STEP;
+        int64_t attempt = step;
+        for (int s = 0; s < MAX_EXPONENTIAL_STEPS; s++) {
+            ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, (size_t)attempt);
+            if (buf) {
+                lo = attempt;
+                ggml_backend_buffer_free(buf);
+                if (lo + step >= hi) break; // next step would exceed hi
+                attempt = std::min(lo + step, hi);
+                step <<= 1; // double for next iteration
+            } else {
+                hi = attempt; // first failure: hi is too high
+                break;
+            }
+        }
+
+        // binary phase: refine between lo (known good) and hi (known bad)
+        // invariant: lo succeeds, hi fails, hi > lo
+        while (lo + PROBE_STEP / 2 < hi) {
+            int64_t mid = lo + (hi - lo) / 2;
+            mid = (mid / PROBE_STEP) * PROBE_STEP; // align down to PROBE_STEP
+            if (mid <= lo) mid = lo + PROBE_STEP;
+            ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, (size_t)mid);
+            if (buf) {
+                lo = mid;
+                ggml_backend_buffer_free(buf);
+            } else {
+                hi = mid;
+            }
+        }
+
+        ceiling_free[di] = lo; // lo is the largest successful allocation
+        LOG_DBG("%s: device %d ceiling_free=%ld (from backend_free=%ld)\n",
+                __func__, id, (long)lo, (long)analysis.devices[di].free_bytes);
+    }
+
+    return ceiling_free;
+}
+
+// Like fit_probe_ceiling but reads live device free instead of analysis.devices.free_bytes.
+// Must be called after model weights are loaded but before KV cache/context init, so the
+// driver overhead at that precise moment is captured. See fit-strategy.h ceiling_free_warm.
+std::vector<int64_t> common_fit_probe_ceiling_warm(llama_model * model, const common_params & /*params*/) {
+    const int32_t nd = llama_model_n_devices(model);
+    std::vector<int64_t> ceiling_free(nd, 0);
+    constexpr int64_t PROBE_STEP = 256 * 1024 * 1024;
+
+    for (int32_t i = 0; i < nd; i++) {
+        ggml_backend_dev_t dev = llama_model_get_device(model, i);
+        ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+        if (!dev || !buft) {
+            continue;
+        }
+        size_t live_free = 0, live_total = 0;
+        ggml_backend_dev_memory(dev, &live_free, &live_total);
+        int64_t hi = (int64_t) live_free;
+        if (hi < PROBE_STEP) {
+            ceiling_free[i] = 0;
+            LOG_DBG("%s: device %d live_free=%ld too small, ceiling=0\n", __func__, i, (long)hi);
+            continue;
+        }
+        int64_t lo = 0;
+        int64_t step = PROBE_STEP;
+        int64_t attempt = step;
+        for (int s = 0; s < 20; s++) {
+            ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, (size_t)attempt);
+            if (buf) {
+                lo = attempt;
+                ggml_backend_buffer_free(buf);
+                if (lo + step >= hi) break;
+                attempt = std::min(lo + step, hi);
+                step <<= 1;
+            } else {
+                hi = attempt;
+                break;
+            }
+        }
+        while (lo + PROBE_STEP / 2 < hi) {
+            int64_t mid = lo + (hi - lo) / 2;
+            mid = (mid / PROBE_STEP) * PROBE_STEP;
+            if (mid <= lo) mid = lo + PROBE_STEP;
+            ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, (size_t)mid);
+            if (buf) {
+                lo = mid;
+                ggml_backend_buffer_free(buf);
+            } else {
+                hi = mid;
+            }
+        }
+        ceiling_free[i] = lo;
+        LOG_DBG("%s: device %d warm ceiling=%ld (from live_free=%ld)\n", __func__, i, (long)lo, (long)hi);
+    }
+    return ceiling_free;
 }

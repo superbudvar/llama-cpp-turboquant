@@ -3006,6 +3006,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_FIT_CTX"));
     add_opt(common_arg(
+        {"--fit-no-context-reserve"},
+        string_format("honor --fit-target as the explicit margin per device, "
+            "ignoring the default 2 GiB context_reserve floor (use to reclaim headroom "
+            "when actual KV cache + compute footprint is smaller than the conservative estimate, "
+            "default: %s)"),
+        [](common_params & params) {
+            params.fit_params_no_context_reserve = true;
+        }
+    ).set_env("LLAMA_ARG_FIT_NO_CONTEXT_RESERVE"));
+    add_opt(common_arg(
+        {"--fit-probe-ceiling"},
+        "probe each device to find the maximum allocatable memory before OOM, "
+        "then clamp the reported free memory to this ceiling on all subsequent runs. "
+        "makes fit predictions more stable when free memory fluctuates due to driver overhead. "
+        "default: off",
+        [](common_params & params) {
+            params.fit_params_probe_ceiling = true;
+        }
+    ).set_env("LLAMA_ARG_FIT_PROBE_CEILING"));
+    add_opt(common_arg(
         {"--check-tensors"},
         string_format("check model tensor data for invalid values (default: %s)", params.check_tensors ? "true" : "false"),
         [](common_params & params) {

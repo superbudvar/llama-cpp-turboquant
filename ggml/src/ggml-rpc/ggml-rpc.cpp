@@ -1239,6 +1239,9 @@ bool rpc_server::init_tensor(const rpc_msg_init_tensor_req & request) {
     // Call the backend's buffer_init_tensor function
     ggml_backend_buffer_t buffer = tensor->buffer;
     if (buffer && buffer->iface.init_tensor) {
+        GGML_LOG_DEBUG("[%s] calling init_tensor: name=%s, type=%d, ne{%u,%u,%u,%u}, nbytes=%zu, buffer_size=%zu\n",
+            __func__, tensor->name, tensor->type, tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3],
+            ggml_nbytes(tensor), buffer->size);
         buffer->iface.init_tensor(buffer, tensor);
     } else {
         if (!buffer) {

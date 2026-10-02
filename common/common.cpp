@@ -3,6 +3,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "fit-cache.h"
 #include "fit.h"
 #include "fit-strategy.h"
 #include "log.h"
@@ -10,6 +11,8 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "unicode.h"
+
+#include "../src/llama-ext.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -1229,6 +1232,8 @@ struct common_init_result::impl {
 
     // note: the order in which model, context, etc. are declared matters because their destructors will be called bottom-to-top
 
+    common_params params; // copy: model path and fit config needed for cache refresh
+
     llama_model_ptr   model;
     llama_context_ptr context;
 
@@ -1236,10 +1241,20 @@ struct common_init_result::impl {
 
     std::vector<common_sampler_ptr> samplers;
     std::vector<llama_sampler_seq_config> samplers_seq_config;
+
+    // fit delta feedback: populated by common_fit_strategy_apply, consumed after MODEL READY
+    std::vector<int64_t> projected_free;
+    std::vector<int64_t> delta_free_ema;
+    std::vector<int64_t> model_size_error;
+    std::string model_path;
+    // warm ceiling: populated by common_fit_probe_ceiling_warm after model load, consumed
+    // by common_fit_strategy_apply on the NEXT invocation to improve fit accuracy
+    std::vector<int64_t> ceiling_free_warm;
 };
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    pimpl->params = params; // copy for cache refresh after MODEL READY
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
@@ -1256,9 +1271,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.tensor_buft_overrides;
         const common_moe_cache_params moe_cache_before = params.moe_cache;
 
+        common_fit_plan fit_plan;
         const common_params_fit_status fit_status =
             params.fit_strategy != COMMON_FIT_STRATEGY_UPSTREAM
-            ? common_fit_strategy_apply(params, &mparams, &cparams)
+            ? common_fit_strategy_apply(params, &mparams, &cparams, nullptr, &fit_plan)
             : common_fit_params(
                 params.model.path.c_str(), &mparams, &cparams,
                 params.tensor_split,
@@ -1282,6 +1298,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             mparams.tensor_split = params.tensor_split;
             mparams.tensor_buft_overrides = params.tensor_buft_overrides.empty()
                 ? nullptr : params.tensor_buft_overrides.data();
+        } else {
+            // fit succeeded: store projected_free and delta_free_ema for post-MODEL READY delta update
+            this->set_fit_projections(fit_plan.projected_free, fit_plan.delta_free_ema);
+            this->set_model_path(params.model.path);
         }
     }
 
@@ -1299,6 +1319,21 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         }
     }
 
+    auto print_dev_memory = [](const char * when) {
+        const size_t nd = ggml_backend_dev_count();
+        if (nd == 0) {
+            LOG_DBG("%s: no backends registered yet\n", when);
+            return;
+        }
+        for (size_t i = 0; i < nd; i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            size_t free = 0, total = 0;
+            ggml_backend_dev_memory(dev, &free, &total);
+            LOG_DBG("%s: dev %zu %s: free=%zu total=%zu\n", when, i, ggml_backend_dev_name(dev), free, total);
+        }
+    };
+
+    print_dev_memory("PRE-MODEL-LOAD");
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {
         return;
@@ -1310,6 +1345,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         return;
     }
 
+    print_dev_memory("POST-MODEL-LOAD");
+    if (params.fit_params_probe_ceiling) {
+        std::vector<int64_t> ceiling_free_warm = common_fit_probe_ceiling_warm(model, params);
+        pimpl->ceiling_free_warm = std::move(ceiling_free_warm);
+    }
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     // load and optionally apply lora adapters
@@ -1374,10 +1414,13 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         return;
     }
 
+    pimpl->context.reset(lctx);
+    print_dev_memory("POST-CTX-INIT");
+
     LOG_TMPL(GGML_LOG_LEVEL_INFO, LOG_LEVEL_INFO, "MODEL READY - device memory breakdown for '%s':", params.model.path.c_str());
     common_memory_breakdown_print(lctx);
 
-    pimpl->context.reset(lctx);
+    this->update_fit_delta();
 }
 
 llama_model * common_init_result::model() {
@@ -1403,6 +1446,93 @@ void common_init_result::reset_samplers() {
 
 std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
     return pimpl->lora;
+}
+
+void common_init_result::set_fit_projections(std::vector<int64_t> projected_free, std::vector<int64_t> delta_free_ema) {
+    pimpl->projected_free = std::move(projected_free);
+    pimpl->delta_free_ema = std::move(delta_free_ema);
+}
+
+void common_init_result::set_model_path(const std::string & path) {
+    pimpl->model_path = path;
+}
+
+const std::string & common_init_result::model_path() const {
+    return pimpl->model_path;
+}
+
+void common_init_result::update_fit_delta() {
+    if (pimpl->projected_free.empty() || !pimpl->model || !pimpl->context) {
+        LOG_INF("%s: skipped: projected_free.size=%zu model=%p context=%p\n",
+                __func__, pimpl->projected_free.size(),
+                (void *)pimpl->model.get(), (void *)pimpl->context.get());
+        return;
+    }
+    const size_t nd = pimpl->projected_free.size();
+    // Ensure delta_free_ema is sized to match projected_free (may be empty on first load)
+    if (pimpl->delta_free_ema.size() != nd) {
+        pimpl->delta_free_ema.resize(nd, 0);
+    }
+    // model_size_error tracks the dominant component of delta: actual_model - projected_model.
+    // projected_model = free_at_probe - projected_free. actual_model from breakdown.
+    if (pimpl->model_size_error.size() != nd) {
+        pimpl->model_size_error.resize(nd, 0);
+    }
+    llama_model * model = pimpl->model.get();
+    constexpr float alpha = 0.75f;
+    LOG_INF("%s: updating EMA for %zu devices (alpha=%.2f)\n", __func__, nd, alpha);
+    for (size_t i = 0; i < nd; i++) {
+        ggml_backend_dev_t dev = llama_model_get_device(model, i);
+        if (!dev) {
+            LOG_INF("%s:   device %zu: no dev\n", __func__, i);
+            continue;
+        }
+        size_t free, total;
+        ggml_backend_dev_memory(dev, &free, &total);
+        int64_t actual_free = (int64_t) free;
+        int64_t proj_free = pimpl->projected_free[i];
+        int64_t actual_delta = actual_free - proj_free;
+        int64_t old_ema = pimpl->delta_free_ema[i];
+        int64_t new_ema = (int64_t)(alpha * actual_delta + (1 - alpha) * old_ema);
+        pimpl->delta_free_ema[i] = new_ema;
+
+        // model_size_error = actual_delta = actual_free - proj_free. When delta is
+        // negative, the model was larger than projected, so the margin must increase.
+        // Applied as margins -= delta (which increases margin when delta < 0).
+        pimpl->model_size_error[i] = actual_delta;
+        LOG_INF("%s:   device %zu: dev=%s actual_free=%lld proj_free=%lld delta=%lld old_ema=%lld new_ema=%lld model_size_error=%lld\n",
+                __func__, i, ggml_backend_dev_name(dev),
+                (long long) actual_free, (long long) proj_free,
+                (long long) actual_delta, (long long) old_ema, (long long) new_ema,
+                (long long) pimpl->model_size_error[i]);
+    }
+    // Persist the updated EMA to the on-disk cache so the next load applies it
+    if (!pimpl->model_path.empty() && !pimpl->delta_free_ema.empty()) {
+        LOG_INF("%s: refreshing cache for model_path=%s (%zu devices)\n",
+                __func__, pimpl->model_path.c_str(), pimpl->delta_free_ema.size());
+        std::string cache_path;
+        bool refreshed = common_fit_cache_refresh_deltas(
+                pimpl->params, pimpl->model_path, pimpl->delta_free_ema, &cache_path);
+        // Also save the full plan with model_size_error so next load has the margin correction.
+        // Pass the path that refresh_deltas wrote to so we update the SAME file, avoiding
+        // directory-scan path mismatch when multiple cache entries exist.
+        if (!pimpl->projected_free.empty() && !pimpl->model_size_error.empty()) {
+            common_fit_plan plan;
+            common_fit_cache_save_with_model_size_error(
+                    pimpl->params, pimpl->model_path, plan,
+                    pimpl->projected_free, pimpl->model_size_error,
+                    pimpl->ceiling_free_warm, &cache_path);
+        }
+        (void)refreshed;
+    }
+}
+
+const std::vector<int64_t> & common_init_result::model_size_error() const {
+    return pimpl->model_size_error;
+}
+
+const std::vector<int64_t> & common_init_result::ceiling_free_warm() const {
+    return pimpl->ceiling_free_warm;
 }
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {

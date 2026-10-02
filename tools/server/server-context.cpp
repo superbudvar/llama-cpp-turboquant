@@ -1798,7 +1798,10 @@ private:
         }
 
         if (ctx_dft) {
-            ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
+            // skip: draft contexts use output.weight from the target model (via ctx_other) that
+            // may be in a buffer incompatible with the draft backend, causing GGML_ABORT in
+            // ggml_backend_sched_alloc_graph during the llama_decode probe call
+            ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
         }
 
         if (spec) {

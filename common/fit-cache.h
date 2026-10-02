@@ -62,4 +62,30 @@ bool common_fit_cache_save(
         const common_params & params,
         const std::string & path_model,
         const common_fit_analysis & analysis,
-        const common_fit_plan & plan);
+        const common_fit_plan & plan,
+        uint64_t override_key = 0);
+
+// Refresh just the delta_free_ema field in an existing cache entry.
+// Called after MODEL READY: update_fit_delta() has computed the new EMA but
+// the cache was already saved (before projected_free existed). This patches
+// the delta into the existing cache so the NEXT load applies it.
+// Returns false if no cache entry exists or refresh fails (non-fatal).
+bool common_fit_cache_refresh_deltas(
+        const common_params & params,
+        const std::string & path_model,
+        const std::vector<int64_t> & delta_free_ema,
+        std::string * cache_path_out = nullptr);
+
+// Save/update the plan including model_size_error and ceiling_free_warm.
+// Reconstructs the analysis from live device enumeration. Called after
+// update_fit_delta() computes model_size_error so the next load has the full
+// correction. ceiling_free_warm is the post-model-load warm ceiling measured by
+// common_fit_probe_ceiling_warm and stored in pimpl->ceiling_free_warm.
+bool common_fit_cache_save_with_model_size_error(
+        const common_params & params,
+        const std::string & path_model,
+        const common_fit_plan & plan,
+        const std::vector<int64_t> & projected_free,
+        const std::vector<int64_t> & model_size_error,
+        const std::vector<int64_t> & ceiling_free_warm,
+        const std::string * cache_path = nullptr);

@@ -675,6 +675,102 @@ int main(int argc, char ** argv) {
         check(evicted.size() == 1, "s7: evicted carries the .dts fingerprint");
     }
 
+    //
+    //  scenario 8 (B1): knob B loop evicts ALL own .dts, not just one.
+    //  before the fix: the loop broke after one eviction, leaving the store
+    //  over cap with most .dts intact. now it evicts until own_foot <= cap.
+    //
+    if (only.empty() || only == "s8") {
+        fprintf(stderr, "\n== scenario 8: knob B evicts ALL own .dts ==\n");
+
+        fs::remove_all(root / "preset-A");
+        fs::remove_all(root / "preset-B");
+        fs::create_directories(dirA);
+        fs::create_directories(dirB);
+
+        // disk_max_store_size = 60% of 1 MiB pool = 0.6 MiB cap = 614400 bytes.
+        // create a store of 680 KiB (over cap) plus 3 .dts files (~64B each).
+        // after evicting one .dts (64B): 680 - 64 = 679.9 KiB > 614.4 KiB cap.
+        // old code: break after first evict_one, store still over cap.
+        // fix: loop continues until own_foot <= cap, evicting all 3 .dts.
+        const auto dcp = dirA / "cache.dcp";
+        const auto dci = dirA / "cache.dci";
+        write_file(dcp, 380u * 1024, now - std::chrono::hours(1));
+        write_file(dci, 300u * 1024, now - std::chrono::hours(1));
+
+        auto write_dts = [&](const fs::path & p, uint32_t tok_offset) {
+            constexpr uint32_t N_TOK = 8;
+            uint32_t hdr[3] = { DTS_MAGIC, DTS_VERSION, N_TOK };
+            std::ofstream out(p, std::ios::binary);
+            out.write((const char *) hdr, sizeof(hdr));
+            uint64_t len[2] = { 0, 0 };
+            uint32_t n_ckpt = 0;
+            out.write((const char *) len, sizeof(len));
+            out.write((const char *) &n_ckpt, sizeof(n_ckpt));
+            for (uint32_t i = 0; i < N_TOK; i++) {
+                int32_t t = (int32_t) (tok_offset + i);
+                out.write((const char *) &t, sizeof(t));
+            }
+        };
+
+        const auto dts1 = dirA / "a1.dts";
+        const auto dts2 = dirA / "a2.dts";
+        const auto dts3 = dirA / "a3.dts";
+        write_dts(dts1, 100);
+        write_dts(dts2, 200);
+        write_dts(dts3, 300);
+
+        fs::last_write_time(dts1, now - std::chrono::hours(3));
+        fs::last_write_time(dts2, now - std::chrono::hours(2));
+        fs::last_write_time(dts3, now - std::chrono::hours(1));
+
+        write_meta(dirA, fingerprint);
+
+        // own_foot = 0.6 MiB (store) + 192 B (.dts) ~= 0.6002 MiB > 0.6 MiB cap
+        // -> knob B loop runs and should evict all 3 .dts
+        std::vector<std::array<uint8_t, 32>> evicted;
+        A.disk_prune_dpc(dirA.string(), &evicted);
+
+        check(!file_exists(dts1), "s8: oldest .dts evicted (dts1)");
+        check(!file_exists(dts2), "s8: middle .dts evicted (dts2)");
+        check(!file_exists(dts3), "s8: newest .dts evicted (dts3)");
+        check(evicted.size() == 3, "s8: all 3 fingerprints returned as evicted");
+        // store files must remain (they are evicted only as last resort)
+        check(file_exists(dcp) && file_exists(dci), "s8: store files kept after knob B eviction");
+    }
+
+    //
+    //  scenario 9 (B4): last-resort .dcp/.dci eviction when pool is massively
+    //  over budget (>120% of disk_max_size) and all .dts candidates are exhausted.
+    //  this is the escape valve when a single store is so large that even evicting
+    //  all its .dts cannot bring the pool under control.
+    //
+    if (only.empty() || only == "s9") {
+        fprintf(stderr, "\n== scenario 9: last-resort .dcp/.dci eviction ==\n");
+
+        fs::remove_all(root / "preset-A");
+        fs::remove_all(root / "preset-B");
+        fs::create_directories(dirA);
+        fs::create_directories(dirB);
+
+        // pool budget = 1 MiB. create a store of 0.8 MiB in dirA, no .dts.
+        // pool used = 0.8 MiB > 120% * 1 MiB = 1.2 MiB? no, 0.8 < 1.2.
+        // Need store > 1.2 MiB. Let's make it 1.4 MiB (over budget alone).
+        const auto dcp = dirA / "cache.dcp";
+        const auto dci = dirA / "cache.dci";
+        write_file(dcp, 700u * 1024, now - std::chrono::hours(1));
+        write_file(dci, 700u * 1024, now - std::chrono::hours(1));
+
+        write_meta(dirA, fingerprint);
+
+        // pool used = 1.4 MiB > 1.2 MiB (120% of 1 MiB budget), no .dts candidates
+        // -> last-resort eviction should trigger
+        A.disk_prune_dpc(dirA.string(), nullptr);
+
+        check(!file_exists(dcp), "s9: .dcp deleted as last-resort eviction");
+        check(!file_exists(dci), "s9: .dci deleted as last-resort eviction");
+    }
+
     fs::remove_all(tmp, ec_tmp);
 
     if (g_failures) {
