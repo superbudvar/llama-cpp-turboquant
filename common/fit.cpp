@@ -12,6 +12,7 @@
 #include <cassert>
 #include <cinttypes>
 #include <cstring>
+#include <functional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -975,7 +976,7 @@ static void common_params_fit_impl(
     // Option B: on first call, captures per-layer per-device costs with no_alloc=true (fast load,
     // my GGML fix routes around the buffer_from_host_ptr GGML_ASSERT). All subsequent calls
     // compute analytically from the cached costs, eliminating 21/22 model loads.
-    auto get_memory_for_layers = [&](
+    std::function<std::vector<int64_t>(const char *, const std::vector<ngl_t> &, const std::vector<ggml_backend_buffer_type_t> &)> get_memory_for_layers = [&](
             const char * func_name,
             const std::vector<ngl_t> & ngl_per_device,
             const std::vector<ggml_backend_buffer_type_t> & overflow_bufts) -> std::vector<int64_t> {
@@ -1028,8 +1029,14 @@ static void common_params_fit_impl(
         // This eliminates 21/22 model loads in a typical fit_solve_rpc_aware session.
         // The per-layer costs are independent of layer split configuration — only the
         // summation over layers changes, so cached costs work for any ngl_per_device.
-        std::vector<int64_t> ret;
-        ret.reserve(nd);
+        //
+        // Guard: for MoE models the per-layer cost capture can be wrong because
+        // bytes[layer*nd+dev] doesn't map cleanly to device assignment (shared expert
+        // tensors, capture-time placement artifacts). If the analytical total for any
+        // device exceeds its pre-load free memory, the cost model is wrong — discard
+        // the cache and fall back to a full load.
+        std::vector<int64_t> analytical_ret;
+        analytical_ret.reserve(nd);
         for (size_t id = 0; id < nd; id++) {
             int64_t model_mem = 0;
             uint32_t il_base = 0;
@@ -1042,11 +1049,26 @@ static void common_params_fit_impl(
                 }
             }
             int64_t total_mem = model_mem + cached_costs.context_compute[id];
-            ret.push_back(total_mem);
+            analytical_ret.push_back(total_mem);
+        }
+        bool guard_pass = true;
+        for (size_t id = 0; id < nd; id++) {
+            int64_t avail = dmds_clean[id].free;
+            if (analytical_ret[id] > avail) {
+                LOG_TRC("%s: analytical total %" PRId64 " MiB > device %zu free %" PRId64 " MiB, "
+                    "per-layer cost model wrong for this split, falling back to full load\n",
+                    __func__, analytical_ret[id]/MiB, id, avail/MiB);
+                guard_pass = false;
+                break;
+            }
+        }
+        if (!guard_pass) {
+            cached = false;
+            return get_memory_for_layers(func_name, ngl_per_device, overflow_bufts);
         }
 
         LOG_TRC("%s: Option B cached analytical result\n", func_name);
-        return ret;
+        return analytical_ret;
     };
 
     auto set_cache_layer_split = [&](const std::vector<uint32_t> & layers,
