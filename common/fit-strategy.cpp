@@ -1496,7 +1496,25 @@ common_params_fit_status common_fit_strategy_apply_impl(
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     try {
         if (params.fit_strategy == COMMON_FIT_STRATEGY_UPSTREAM) {
-            // never reached through the dispatch, but honor the contract
+            uint32_t hp_ngl = 0;
+            common_fit_analysis analysis = fit_analyze(params, mparams, params.model.path, hp_ngl);
+            uint32_t hp_n_ctx_train = 0;
+            uint32_t hp_n_expert = 0;
+            std::vector<ggml_backend_dev_t> devs;
+            devs.reserve(analysis.devices.size());
+            for (const auto & d : analysis.devices) {
+                devs.push_back(d.dev);
+            }
+            ggml_log_level log_level = params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR;
+            auto dmd = common_get_device_memory_data(
+                    params.model.path.c_str(), mparams, cparams,
+                    devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level);
+            if (plan_out) {
+                plan_out->projected_free.resize(dmd.size());
+                for (size_t i = 0; i < dmd.size(); i++) {
+                    plan_out->projected_free[i] = dmd[i].free - dmd[i].model;
+                }
+            }
             return COMMON_PARAMS_FIT_STATUS_SUCCESS;
         }
         if (params.fit_strategy_min_ctx <= 0 && params.n_ctx <= 0) {

@@ -519,6 +519,13 @@ static void common_params_fit_impl(
     const dmds_t dmds_full = common_get_device_memory_data_impl(
             path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex,
             log_level, &moe_tensors, nullptr, &n_layer_all, false);
+
+    LOG_TRC("%s: getting clean device memory data (no tensors allocated):\n", __func__);
+    llama_model_params mparams_zero = *mparams;
+    mparams_zero.n_gpu_layers = 0;
+    const dmds_t dmds_clean = common_get_device_memory_data_impl(
+            path_model, &mparams_zero, cparams, devs, hp_ngl, hp_nct, hp_nex,
+            log_level, nullptr, nullptr, nullptr, true);
     const size_t nd = devs.size(); // number of devices
 
     auto log_stock_fit = [&] {
@@ -945,8 +952,8 @@ static void common_params_fit_impl(
     std::vector<int64_t> targets; // maximum acceptable memory use per device
     targets.reserve(nd);
     for (size_t id = 0; id < nd; id++) {
-        targets.push_back(dmds_full[id].free - margins[id]);
-        LOG_TRC("%s: id=%zu, target=%" PRId64 " MiB\n", __func__, id, targets[id]/MiB);
+        targets.push_back(dmds_clean[id].free - margins[id]);
+        LOG_TRC("%s: id=%zu, target=%" PRId64 " MiB (clean_free=%" PRId64 " MiB)\n", __func__, id, targets[id]/MiB, dmds_clean[id].free/MiB);
     }
 
     std::vector<ggml_backend_buffer_type_t> overflow_bufts; // which bufts the first partial layer of a device overflows to:
