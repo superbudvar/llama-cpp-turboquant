@@ -307,6 +307,7 @@ struct per_device_layer_costs {
     size_t n_device = 0;
     std::vector<int64_t> bytes;          // [layer][device] = model bytes, row-major
     std::vector<int64_t> context_compute; // [device] = context + compute overhead
+    std::vector<int32_t> layer_dev;      // [layer] = device id the layer was captured on, or -1 for unassigned
 };
 
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
@@ -352,6 +353,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         per_layer_costs->n_device = nd;
         per_layer_costs->bytes.assign(per_layer_costs->n_layer_all * per_layer_costs->n_device, 0);
         per_layer_costs->context_compute.assign(nd, 0);
+        per_layer_costs->layer_dev.assign(per_layer_costs->n_layer_all, -1);
         const size_t count = llama_model_get_tensor_devices(model.get(), nullptr, 0);
         std::vector<llama_tensor_device_info> tensor_info(count);
         llama_model_get_tensor_devices(model.get(), tensor_info.data(), tensor_info.size());
@@ -372,6 +374,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
             }
             if (layer >= 0 && (size_t)layer < per_layer_costs->n_layer_all && dev_id < nd) {
                 per_layer_costs->bytes[layer * nd + dev_id] += ti.bytes;
+                per_layer_costs->layer_dev[layer] = (int32_t) dev_id;
             }
         }
     }
@@ -1016,6 +1019,19 @@ static void common_params_fit_impl(
             LOG_TRC("%s: Option B first-call load captured %zu layers x %zu devices per-layer costs + "
                 "context+compute overhead\n",
                 func_name, costs.n_layer_all, costs.n_device);
+            // Diagnostic: dump per-layer per-device bytes to verify the cost model.
+            for (size_t il = 0; il < costs.n_layer_all; il++) {
+                std::string line;
+                for (size_t id = 0; id < costs.n_device; id++) {
+                    char buf[64];
+                    snprintf(buf, sizeof(buf), "  d%zu=%" PRId64, id, costs.bytes[il * costs.n_device + id]/MiB);
+                    line += buf;
+                }
+                LOG_TRC("  layer %zu: %s\n", il, line.c_str());
+            }
+            for (size_t id = 0; id < costs.n_device; id++) {
+                LOG_TRC("  device %zu context+compute: %" PRId64 " MiB\n", id, costs.context_compute[id]/MiB);
+            }
 
             std::vector<int64_t> ret;
             ret.reserve(nd);
@@ -1035,8 +1051,14 @@ static void common_params_fit_impl(
         // tensors, capture-time placement artifacts). If the analytical total for any
         // device exceeds its pre-load free memory, the cost model is wrong — discard
         // the cache and fall back to a full load.
+        //
+        // Assignment guard: bytes[il*nd+id] is only meaningful for the device the
+        // layer was captured on (layer_dev[il]). If the requested split puts layer
+        // il on a different device, the cost for that placement is unmeasured, so
+        // the analytical result is unsafe.
         std::vector<int64_t> analytical_ret;
         analytical_ret.reserve(nd);
+        bool assignment_match = true;
         for (size_t id = 0; id < nd; id++) {
             int64_t model_mem = 0;
             uint32_t il_base = 0;
@@ -1045,13 +1067,25 @@ static void common_params_fit_impl(
             }
             for (uint32_t il = il_base; il < il_base + ngl_per_device[id].n_layer; il++) {
                 if (il < cached_costs.n_layer_all) {
+                    if ((int32_t) id != cached_costs.layer_dev[il]) {
+                        // This layer was captured on a different device.
+                        // The bytes cost for placing it on this device is unmeasured.
+                        assignment_match = false;
+                    }
                     model_mem += cached_costs.bytes[il * cached_costs.n_device + id];
                 }
             }
             int64_t total_mem = model_mem + cached_costs.context_compute[id];
             analytical_ret.push_back(total_mem);
         }
-        bool guard_pass = true;
+        // Diagnostic: log the analytical total per device alongside available memory.
+        // Helps reveal cases where the per-layer cost model is wrong but the
+        // total still fits within free memory, allowing unsafe splits to proceed.
+        for (size_t id = 0; id < nd; id++) {
+            LOG_TRC("%s: analytical total for device %zu = %" PRId64 " MiB (free = %" PRId64 " MiB)\n",
+                __func__, id, analytical_ret[id]/MiB, dmds_clean[id].free/MiB);
+        }
+        bool guard_pass = assignment_match;
         for (size_t id = 0; id < nd; id++) {
             int64_t avail = dmds_clean[id].free;
             if (analytical_ret[id] > avail) {
@@ -1061,6 +1095,10 @@ static void common_params_fit_impl(
                 guard_pass = false;
                 break;
             }
+        }
+        if (!assignment_match) {
+            LOG_TRC("%s: requested split assigns some layers to a device they were not captured on; "
+                "falling back to full load\n", __func__);
         }
         if (!guard_pass) {
             cached = false;
