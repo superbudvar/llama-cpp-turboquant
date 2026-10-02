@@ -590,7 +590,7 @@ static void common_params_fit_impl(
         // allocations. at probe time the model is not yet allocated, so free already
         // includes the projected model memory and this is usually negative. fall back to
         // a small percentage of free memory as a conservative reserve.
-        const llama_device_memory_data & dmd = nd == 0 ? dmds_full.back() : dmds_full[id];
+        const llama_device_memory_data & dmd = nd == 0 ? dmds_clean.back() : dmds_clean[id];
         const int64_t total = static_cast<int64_t>(dmd.total);
         const int64_t free  = static_cast<int64_t>(dmd.free);
         const int64_t self  = static_cast<int64_t>(dmd.mb.total());
@@ -1134,7 +1134,7 @@ static void common_params_fit_impl(
     std::vector<int64_t> targets;
     targets.reserve(nd);
     for (size_t id = 0; id < nd; id++) {
-        const int64_t target = dmds_full[id].free - margins_eff[id];
+        const int64_t target = dmds_clean[id].free - margins[id];
         targets.push_back(target > 0 ? target : 0);
         LOG_TRC("%s: id=%zu, target=%" PRId64 " MiB\n", __func__, id, targets[id]/MiB);
     }
