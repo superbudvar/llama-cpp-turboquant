@@ -11,9 +11,11 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <climits>
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -2044,4 +2046,37 @@ std::vector<int64_t> common_fit_probe_ceiling_warm(llama_model * model, const co
         LOG_DBG("%s: device %d warm ceiling=%ld (from live_free=%ld)\n", __func__, i, (long)lo, (long)hi);
     }
     return ceiling_free;
+}
+
+// Validate a user-provided list of RPC device IDs against the local id space.
+// Contract per the Wave 2 plan: empty list is OK; per-id checks run in
+// invalid-range -> non-local -> duplicate order; first failure wins.
+// Duplicates downgrade OK to DUPLICATE but the function still returns;
+// NON_LOCAL and INVALID are hard errors the caller must abort on.
+fit_rpc_device_id_error fit_validate_rpc_device_ids(
+    const std::vector<int> & device_ids,
+    int local_device_count) {
+    fit_rpc_device_id_error result = FIT_RPC_DEVICE_ID_OK;
+    std::set<int> seen;
+    for (size_t i = 0; i < device_ids.size(); i++) {
+        const int id = device_ids[i];
+        if (id < 0 || id == INT_MAX) {
+            LOG_ERR("%s: device_ids[%zu]=%d is out of the [0, INT_MAX) range\n",
+                    __func__, i, id);
+            return FIT_RPC_DEVICE_ID_INVALID;
+        }
+        if (id >= local_device_count) {
+            LOG_ERR("%s: device_ids[%zu]=%d is not local (local_device_count=%d)\n",
+                    __func__, i, id, local_device_count);
+            return FIT_RPC_DEVICE_ID_NON_LOCAL;
+        }
+        if (!seen.insert(id).second) {
+            LOG_WRN("%s: device_ids[%zu]=%d is duplicated; proceeding with the unique set\n",
+                    __func__, i, id);
+            if (result == FIT_RPC_DEVICE_ID_OK) {
+                result = FIT_RPC_DEVICE_ID_DUPLICATE;
+            }
+        }
+    }
+    return result;
 }

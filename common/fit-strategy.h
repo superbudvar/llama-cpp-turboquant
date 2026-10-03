@@ -170,3 +170,24 @@ LLAMA_API int llama_model_get_backend_device_id(const struct llama_model * model
 
 // Get a device handle by backend device index
 LLAMA_API ggml_backend_dev_t llama_model_get_device_by_backend_id(const struct llama_model * model, int backend_device_id);
+
+// RPC device-id validation result. duplicate id is soft (warn, allow);
+// non-local id and out-of-range id (id < 0 or id == INT_MAX) are hard
+// (caller must abort). see fit_validate_rpc_device_ids for the contract.
+enum fit_rpc_device_id_error {
+    FIT_RPC_DEVICE_ID_OK = 0,
+    FIT_RPC_DEVICE_ID_DUPLICATE,    // log WRN, caller may continue
+    FIT_RPC_DEVICE_ID_NON_LOCAL,    // log ERR, caller must abort
+    FIT_RPC_DEVICE_ID_INVALID,      // log ERR, caller must abort
+};
+
+// Validate a user-provided list of RPC device IDs against the local id space.
+// First failure wins; per-id checks run in (a) o[k] order:
+//   id < 0 or id == INT_MAX -> INVALID
+//   id >= local_device_count -> NON_LOCAL
+//   id already seen -> DUPLICATE (warn, allow)
+// Empty list is OK. The function reports only; callers must abort on
+// NON_LOCAL or INVALID.
+fit_rpc_device_id_error fit_validate_rpc_device_ids(
+    const std::vector<int> & device_ids,
+    int local_device_count);

@@ -18,6 +18,7 @@
 
 #include <cstdio>
 #include <algorithm>
+#include <climits>
 #include <cstdlib>
 #include <fstream>
 #include <string>
@@ -263,6 +264,34 @@ static void test_pool_budget_formula() {
             "the automatic budget is half of the remaining VRAM");
     expect(common_fit_strategy_pool_budget((size_t) (100 * MiB), (size_t) (16 * GiB), 0) == (size_t) (4 * GiB),
             "the automatic budget is capped at 4 GiB");
+}
+
+static void test_fit_strategy_rpc_device_id_validation() {
+    // positive path: empty and unique-in-range
+    expect(fit_validate_rpc_device_ids({}, 4) == FIT_RPC_DEVICE_ID_OK,
+            "empty list is valid");
+    expect(fit_validate_rpc_device_ids({0, 1, 3}, 4) == FIT_RPC_DEVICE_ID_OK,
+            "unique in-range IDs return OK");
+    // rejects_duplicate_id_with_wrn
+    expect(fit_validate_rpc_device_ids({0, 1, 1, 3}, 4) == FIT_RPC_DEVICE_ID_DUPLICATE,
+            "duplicate IDs return DUPLICATE (warn, allow)");
+    expect(fit_validate_rpc_device_ids({0, 0}, 4) == FIT_RPC_DEVICE_ID_DUPLICATE,
+            "two copies of the same ID return DUPLICATE");
+    // rejects_non_local_id_with_abort
+    expect(fit_validate_rpc_device_ids({0, 5}, 4) == FIT_RPC_DEVICE_ID_NON_LOCAL,
+            "out-of-range ID returns NON_LOCAL (caller must abort)");
+    expect(fit_validate_rpc_device_ids({4}, 4) == FIT_RPC_DEVICE_ID_NON_LOCAL,
+            "id == local_device_count is not local (half-open interval)");
+    // rejects_negative_id_with_abort: covers id < 0 and id == INT_MAX
+    expect(fit_validate_rpc_device_ids({-1, 0}, 4) == FIT_RPC_DEVICE_ID_INVALID,
+            "negative ID returns INVALID (caller must abort)");
+    expect(fit_validate_rpc_device_ids({INT_MAX, 0}, 4) == FIT_RPC_DEVICE_ID_INVALID,
+            "INT_MAX ID returns INVALID (caller must abort)");
+    // first failure wins: INVALID precedes NON_LOCAL precedes DUPLICATE
+    expect(fit_validate_rpc_device_ids({-1, 5, 0, 0}, 4) == FIT_RPC_DEVICE_ID_INVALID,
+            "INVALID is reported before NON_LOCAL and DUPLICATE");
+    expect(fit_validate_rpc_device_ids({5, 0, 0}, 4) == FIT_RPC_DEVICE_ID_NON_LOCAL,
+            "NON_LOCAL is reported before DUPLICATE");
 }
 
 static void test_maxctx_above_floor() {
@@ -862,6 +891,7 @@ static const struct test_case {
     { "measurement_contract",       test_measurement_contract },
     { "preset_placement_rejected",  test_preset_placement_rejected },
     { "pool_budget_formula",        test_pool_budget_formula },
+    { "rpc_device_id_validation",   test_fit_strategy_rpc_device_id_validation },
     { "maxctx_above_floor",         test_maxctx_above_floor },
     { "floor_unreachable_errors",   test_floor_unreachable_errors },
     { "rpc_aware_placement",        test_rpc_aware_placement },
