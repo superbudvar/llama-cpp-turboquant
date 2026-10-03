@@ -380,6 +380,16 @@ printf("test-arg-parser: test fit-strategy flags\n\n");
         assert(fit_params.fit_strategy_min_ctx == 1024);
     }
 
+    // no-fit-tool-ignore: the original plan called for a 5th case testing
+// that tokenize / batched-bench / export-lora accept --fit-strategy
+// but ignore it (per common/arg.cpp:1275-1285 comment). The premise
+// is wrong: --fit-strategy's set_examples (common/arg.cpp:2826-2837)
+// does not include TOKENIZE / BENCH / EXPORT_LORA, so the parser
+// rejects the CLI flag with "invalid argument" before the cross-flag
+// skip is reached. To make this case pass, --fit-strategy's
+// set_examples would need to add those three, which is a metadata
+// change beyond "no production change" Wave 3. Deferred.
+
 // skip this part on windows, because setenv is not supported
 #ifdef _WIN32
     printf("test-arg-parser: skip on windows build\n");

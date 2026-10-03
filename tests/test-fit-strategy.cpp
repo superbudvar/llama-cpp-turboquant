@@ -11,6 +11,7 @@
 // exits non-zero.
 
 #include "fit-strategy.h"
+#include "fit-cache.h"
 #include "common.h"
 #include "../src/llama-ext.h" // llama_model_n_devices, llama_model_get_device, ...
 
@@ -20,9 +21,13 @@
 #include <algorithm>
 #include <climits>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <string>
+#include <system_error>
 #include <vector>
+
+namespace fs = std::filesystem;
 
 static constexpr int64_t MiB = 1024 * 1024;
 static constexpr int64_t GiB = 1024 * MiB;
@@ -292,6 +297,89 @@ static void test_fit_strategy_rpc_device_id_validation() {
             "INVALID is reported before NON_LOCAL and DUPLICATE");
     expect(fit_validate_rpc_device_ids({5, 0, 0}, 4) == FIT_RPC_DEVICE_ID_NON_LOCAL,
             "NON_LOCAL is reported before DUPLICATE");
+}
+
+static void test_cache_partial_hit() {
+    // The cache round-trip is exercised with a synthesized analysis (empty
+    // devices) and a non-existent path_model: cache_key_hash tolerates a
+    // missing file by emitting size=-1 / mtime=-1. The temp dir under
+    // LLAMA_FIT_CACHE keeps this test from touching the user's real cache.
+    const std::string tmp_root = "/tmp/opencode/fit-cache-test";
+    std::error_code ec;
+    fs::remove_all(tmp_root, ec);
+    fs::create_directories(tmp_root, ec);
+    expect(!ec, "test scratch dir must be creatable");
+    setenv("LLAMA_FIT_CACHE", tmp_root.c_str(), 1);
+
+    common_params params;
+    common_fit_analysis analysis;
+    analysis.model_id = "unit-test-model";
+
+    const std::string path_model = "/nonexistent/unit-test.gguf";
+    common_fit_plan plan_save;
+    plan_save.n_gpu_layers = 7;
+    plan_save.n_ctx = 4096;
+    plan_save.pool_grant_mib = 0;
+    plan_save.role_devices = {0, 0, 0, 0, 0, 0, 0};
+    plan_save.tensor_split = {1.0f};
+    plan_save.shed_reserves = {};
+    plan_save.delta_free_ema = {0};          // partial: a single zero entry
+    plan_save.projected_free = {0};
+    plan_save.projected_with_delta = false;
+    plan_save.ceiling_free = {0};
+    plan_save.model_size_error = {0};
+
+    expect(common_fit_cache_save(params, path_model, analysis, plan_save),
+            "cache_save with empty devices must succeed");
+
+    common_fit_plan plan_load;
+    expect(common_fit_cache_load(params, path_model, analysis, plan_load),
+            "cache_load must round-trip a valid save");
+    expect(plan_load.n_ctx == plan_save.n_ctx,
+            "loaded n_ctx must match saved n_ctx");
+    expect(plan_load.n_gpu_layers == plan_save.n_gpu_layers,
+            "loaded n_gpu_layers must match saved n_gpu_layers");
+    expect(plan_load.pool_grant_mib == plan_save.pool_grant_mib,
+            "loaded pool_grant_mib must match saved pool_grant_mib");
+    expect(plan_load.role_devices == plan_save.role_devices,
+            "loaded role_devices must match saved role_devices");
+    expect(plan_load.tensor_split == plan_save.tensor_split,
+            "loaded tensor_split must match saved tensor_split");
+
+    // Partial-hit negative: a different path_model changes the cache key
+    // (model=path, size, mtime) and the load must refuse the mismatch.
+    common_fit_plan plan_tampered;
+    expect(!common_fit_cache_load(params, "/nonexistent/other-model.gguf", analysis, plan_tampered),
+            "cache_load must refuse a tampered path_model key");
+}
+
+static void test_grow_fill_headroom() {
+    // The fill headroom step (fit-strategy.cpp:fit_grow_context FILL_STEP=4096)
+    // extends best_ctx upward after the binary search finds the largest ctx
+    // that fits. With generous VRAM the headroom is bounded by the upper
+    // cap (params.n_ctx or the model's train context). The contract: best_ctx
+    // must reach at least min_ctx and never overshoot the upper cap.
+    if (g_model.empty()) {
+        test_skip("no model available");
+        return;
+    }
+    common_params params;
+    params.fit_strategy = COMMON_FIT_STRATEGY_MAXCTX;
+    params.fit_strategy_min_ctx = 1024;
+    params.n_ctx = 8192;
+    params.model.path = g_model;
+    llama_model_params mparams = common_model_params_to_llama(params);
+    llama_context_params cparams = common_context_params_to_llama(params);
+    fake_probe_ctx cfg;
+    cfg.default_dev = { (int64_t) (16 * GiB), (int64_t) (16 * GiB), (size_t) (64 * MiB), (size_t) (32 * MiB), 0 };
+    const common_params_fit_status st = common_fit_strategy_apply_impl(
+            params, &mparams, &cparams, nullptr, make_probe(&cfg));
+    expect(st == COMMON_PARAMS_FIT_STATUS_SUCCESS,
+            "maxctx must succeed when the floor context fits");
+    expect((int32_t) cparams.n_ctx >= params.fit_strategy_min_ctx,
+            "the fill headroom must never drop below the floor");
+    expect((int32_t) cparams.n_ctx <= params.n_ctx,
+            "the fill headroom must respect the upper cap");
 }
 
 static void test_maxctx_above_floor() {
@@ -892,6 +980,8 @@ static const struct test_case {
     { "preset_placement_rejected",  test_preset_placement_rejected },
     { "pool_budget_formula",        test_pool_budget_formula },
     { "rpc_device_id_validation",   test_fit_strategy_rpc_device_id_validation },
+    { "cache_partial_hit",          test_cache_partial_hit },
+    { "grow_fill_headroom",         test_grow_fill_headroom },
     { "maxctx_above_floor",         test_maxctx_above_floor },
     { "floor_unreachable_errors",   test_floor_unreachable_errors },
     { "rpc_aware_placement",        test_rpc_aware_placement },
