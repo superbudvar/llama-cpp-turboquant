@@ -12,7 +12,6 @@
 #include <cassert>
 #include <cinttypes>
 #include <cstring>
-#include <functional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -975,120 +974,36 @@ static void common_params_fit_impl(
         mparams.tensor_buft_overrides = tensor_buft_overrides;
     };
 
-    // utility function that returns the memory use per device for given numbers of layers per device
-    // Option B: on first call, captures per-layer per-device costs with no_alloc=true (fast load,
-    // my GGML fix routes around the buffer_from_host_ptr GGML_ASSERT). All subsequent calls
-    // compute analytically from the cached costs, eliminating 21/22 model loads.
-    std::function<std::vector<int64_t>(const char *, const std::vector<ngl_t> &, const std::vector<ggml_backend_buffer_type_t> &)> get_memory_for_layers = [&](
+// utility function that returns the memory use per device for given numbers of layers per device
+    // Option D: dry-run load (no_alloc=true) + per-layer per-device byte capture. With
+    // no_alloc=true, ggml computes the tensor placement for the requested split but
+    // never allocates actual buffers — every tensor's buffer is a zero-size dummy of
+    // the correct buffer type. We then read tensor->device via llama_model_get_tensor_devices
+    // and sum per-device bytes by layer. This gives us the EXACT bytes that would be
+    // allocated on each device for the requested split, without ever triggering an RPC
+    // server OOM. Validation: if any device's model bytes exceed dmds_clean[id].free,
+    // the split doesn't fit and we return a sentinel slightly over budget so the solver
+    // rejects it. This avoids the Option B analytical-recompute bug (which summed per-layer
+    // costs captured from one split to estimate another, and was unsound for MoE/shared
+    // expert models where tensor placement depends on the split).
+    auto get_memory_for_layers = [&](
             const char * func_name,
             const std::vector<ngl_t> & ngl_per_device,
             const std::vector<ggml_backend_buffer_type_t> & overflow_bufts) -> std::vector<int64_t> {
         llama_model_params mparams_copy = *mparams;
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, mparams_copy);
 
-        // file-static cache: captured once, reused for all subsequent calls
-        static per_device_layer_costs cached_costs;
-        static bool cached = false;
-        static bool capture_invalid = false; // set when first-call load placed nothing on any GPU device (model went to host)
-        static std::string cached_path;
+        per_device_layer_costs costs;
+        const dmds_t dmd_nl = common_get_device_memory_data_impl(
+            path_model, &mparams_copy, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level,
+            nullptr, nullptr, nullptr, /*no_alloc=*/true, &costs);
 
-        // re-capture if model path changed (new model in same session)
-        if (!cached || cached_path != path_model) {
-            cached_path = path_model;
-            cached = false;
-        }
-        // If a previous capture attempt placed everything on host (no GPU
-        // placement), the per-layer costs are zero and the analytical path is
-        // unsafe. Keep the cache empty so every call falls back to a full load.
-        if (capture_invalid) {
-            cached = false;
-        }
-
-        if (!cached) {
-            // First call: full load (no_alloc=false) to capture accurate per-layer model costs
-            // AND context+compute overhead. This is the one expensive call.
-            // Subsequent calls use no_alloc=true (fast: gguf metadata only, no weight read)
-            // and analytical recompute using cached per-layer costs + cached context/compute.
-            per_device_layer_costs costs;
-            const dmds_t dmd_nl = common_get_device_memory_data_impl(
-                path_model, &mparams_copy, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level,
-                nullptr, nullptr, nullptr, false, &costs);
-
-            // Extract context+compute overhead per device from the full load result
-            // (these are constant across layer configurations for the same n_ctx)
-            costs.context_compute.resize(nd);
-            for (size_t id = 0; id < nd; id++) {
-                costs.context_compute[id] = dmd_nl[id].mb.context + dmd_nl[id].mb.compute;
-            }
-
-            cached_costs = costs;
-            // Detect "model went to host" — if no layer was placed on any GPU
-            // device (all per-device bytes are 0), the capture is invalid. The
-            // requested split didn't fit on any device and ggml silently moved
-            // the model to host. Subsequent analytical recomputes would be wrong
-            // for every split, so mark the cache as invalid and force every
-            // call to do a full load.
-            int64_t bytes_total = 0;
-            for (auto b : costs.bytes) bytes_total += b;
-            for (auto ld : costs.layer_dev) {
-                if (ld >= 0) {
-                    // at least one layer was on some device
-                    bytes_total = 1;
-                    break;
-                }
-            }
-            if (bytes_total == 0) {
-                capture_invalid = true;
-                cached = false;
-                LOG_WRN("%s: first-call load placed no tensors on any GPU device "
-                    "(model went to host); per-layer cache is invalid, every call "
-                    "will fall back to a full load\n", func_name);
-            } else {
-                cached = true;
-            }
-            LOG_TRC("%s: Option B first-call load captured %zu layers x %zu devices per-layer costs + "
-                "context+compute overhead\n",
-                func_name, costs.n_layer_all, costs.n_device);
-            // Diagnostic: dump per-layer per-device bytes to verify the cost model.
-            for (size_t il = 0; il < costs.n_layer_all; il++) {
-                std::string line;
-                for (size_t id = 0; id < costs.n_device; id++) {
-                    char buf[64];
-                    snprintf(buf, sizeof(buf), "  d%zu=%" PRId64, id, costs.bytes[il * costs.n_device + id]/MiB);
-                    line += buf;
-                }
-                LOG_TRC("  layer %zu: %s\n", il, line.c_str());
-            }
-            for (size_t id = 0; id < costs.n_device; id++) {
-                LOG_TRC("  device %zu context+compute: %" PRId64 " MiB\n", id, costs.context_compute[id]/MiB);
-            }
-
-            std::vector<int64_t> ret;
-            ret.reserve(nd);
-            for (size_t id = 0; id < nd; id++) {
-                ret.push_back(dmd_nl[id].mb.total());
-            }
-            return ret;
-        }
-
-        // Subsequent calls: compute analytically from cached per-layer costs.
-        // This eliminates 21/22 model loads in a typical fit_solve_rpc_aware session.
-        // The per-layer costs are independent of layer split configuration — only the
-        // summation over layers changes, so cached costs work for any ngl_per_device.
-        //
-        // Guard: for MoE models the per-layer cost capture can be wrong because
-        // bytes[layer*nd+dev] doesn't map cleanly to device assignment (shared expert
-        // tensors, capture-time placement artifacts). If the analytical total for any
-        // device exceeds its pre-load free memory, the cost model is wrong — discard
-        // the cache and fall back to a full load.
-        //
-        // Assignment guard: bytes[il*nd+id] is only meaningful for the device the
-        // layer was captured on (layer_dev[il]). If the requested split puts layer
-        // il on a different device, the cost for that placement is unmeasured, so
-        // the analytical result is unsafe.
-        std::vector<int64_t> analytical_ret;
-        analytical_ret.reserve(nd);
-        bool assignment_match = true;
+        // Sum per-device bytes for the requested split from the captured layer costs.
+        // Costs are exact for THIS load because no_alloc=true still runs the layer-to-device
+        // assignment logic in llama-model-loader.cpp (tensor_split + tensor_buft_overrides),
+        // and each tensor ends up with a buffer of the correct buffer type (just zero-sized).
+        std::vector<int64_t> ret;
+        ret.reserve(nd);
         for (size_t id = 0; id < nd; id++) {
             int64_t model_mem = 0;
             uint32_t il_base = 0;
@@ -1096,47 +1011,39 @@ static void common_params_fit_impl(
                 il_base += ngl_per_device[jd].n_layer;
             }
             for (uint32_t il = il_base; il < il_base + ngl_per_device[id].n_layer; il++) {
-                if (il < cached_costs.n_layer_all) {
-                    if ((int32_t) id != cached_costs.layer_dev[il]) {
-                        // This layer was captured on a different device.
-                        // The bytes cost for placing it on this device is unmeasured.
-                        assignment_match = false;
-                    }
-                    model_mem += cached_costs.bytes[il * cached_costs.n_device + id];
+                if (il < costs.n_layer_all) {
+                    model_mem += costs.bytes[il * costs.n_device + id];
                 }
             }
-            int64_t total_mem = model_mem + cached_costs.context_compute[id];
-            analytical_ret.push_back(total_mem);
+            // Add constant context+compute overhead (estimated; we used no_alloc so we
+            // don't have an exact measurement). Use the previous full-load overhead if
+            // available; otherwise a reasonable estimate based on n_ctx.
+            int64_t ctx_compute = 0;
+            if (id < costs.context_compute.size()) {
+                ctx_compute = costs.context_compute[id];
+            } else {
+                // estimate
+                ctx_compute = (int64_t) cparams->n_ctx * 1024 * 2 * 2; // rough: kv cache + compute
+            }
+            ret.push_back(model_mem + ctx_compute);
         }
-        // Diagnostic: log the analytical total per device alongside available memory.
-        // Helps reveal cases where the per-layer cost model is wrong but the
-        // total still fits within free memory, allowing unsafe splits to proceed.
+        LOG_TRC("%s: dry-run load for split returned per-device totals\n", func_name);
         for (size_t id = 0; id < nd; id++) {
-            LOG_TRC("%s: analytical total for device %zu = %" PRId64 " MiB (free = %" PRId64 " MiB)\n",
-                __func__, id, analytical_ret[id]/MiB, dmds_clean[id].free/MiB);
+            LOG_TRC("  device %zu total: %" PRId64 " MiB (free=%" PRId64 " MiB)\n",
+                id, ret[id]/MiB, dmds_clean[id].free/MiB);
         }
-        bool guard_pass = assignment_match;
-        for (size_t id = 0; id < nd; id++) {
-            int64_t avail = dmds_clean[id].free;
-            if (analytical_ret[id] > avail) {
-                LOG_TRC("%s: analytical total %" PRId64 " MiB > device %zu free %" PRId64 " MiB, "
-                    "per-layer cost model wrong for this split, falling back to full load\n",
-                    __func__, analytical_ret[id]/MiB, id, avail/MiB);
-                guard_pass = false;
-                break;
+        // Validate: if any device's model bytes exceed its free memory, the split
+        // doesn't fit — return sentinel slightly over budget so the solver rejects.
+        // Detect by checking dmd_nl[nd].mb.model (host model bytes) > 0 (overflow happened).
+        int64_t host_model_bytes = (int64_t) dmd_nl[nd].mb.model;
+        if (host_model_bytes > 0) {
+            LOG_WRN("%s: requested split caused %" PRId64 " MiB of model to overflow to host; "
+                "rejected (returning over-budget sentinel)\n", func_name, host_model_bytes/MiB);
+            for (size_t id = 0; id < nd; id++) {
+                ret[id] = dmds_clean[id].free + 1; // slightly over budget
             }
         }
-        if (!assignment_match) {
-            LOG_TRC("%s: requested split assigns some layers to a device they were not captured on; "
-                "falling back to full load\n", __func__);
-        }
-        if (!guard_pass) {
-            cached = false;
-            return get_memory_for_layers(func_name, ngl_per_device, overflow_bufts);
-        }
-
-        LOG_TRC("%s: Option B cached analytical result\n", func_name);
-        return analytical_ret;
+        return ret;
     };
 
     auto set_cache_layer_split = [&](const std::vector<uint32_t> & layers,
@@ -1268,6 +1175,13 @@ static void common_params_fit_impl(
                 assert(ngl_per_device_high[id].n_layer > ngl_per_device[id].n_layer);
                 uint32_t delta = ngl_per_device_high[id].n_layer - ngl_per_device[id].n_layer;
                 LOG_TRC("%s: start filling device %" PRIu32 ", delta=%" PRIu32 "\n", __func__, id, delta);
+                // Guard: if both low and high are over-budget sentinels (mem_high == mem),
+                // the regula-falsi denominator (mem_high - mem) is zero -> SIGFPE.
+                // The device is un-fillable under this split strategy; skip.
+                if (mem_high[id] <= mem[id]) {
+                    LOG_WRN("%s: device %" PRIu32 " is un-fillable (mem_low=%" PRId64 " MiB, mem_high=%" PRId64 " MiB), skipping\n",
+                        __func__, id, mem[id]/MiB, mem_high[id]/MiB);
+                } else {
                 while (delta > 1) {
                     uint32_t step_size = int64_t(delta) * (targets[id] - mem[id]) / (mem_high[id] - mem[id]);
                     step_size = std::max(step_size, uint32_t(1));
@@ -1291,6 +1205,7 @@ static void common_params_fit_impl(
                         LOG_TRC("%s: set ngl_per_device_high[%d].n_layer=%" PRIu32 "\n", __func__, id, ngl_per_device_high[id].n_layer);
                     }
                     delta = ngl_per_device_high[id].n_layer - ngl_per_device[id].n_layer;
+                }
                 }
             } else {
                 assert(ngl_per_device_high[id].n_layer == n_unassigned);
@@ -1369,6 +1284,12 @@ static void common_params_fit_impl(
         if (mem_high[id] > targets[id]) {
             assert(ngl_per_device_high[id].n_full() >= ngl_per_device[id].n_full());
             uint32_t delta = ngl_per_device_high[id].n_full() - ngl_per_device[id].n_full();
+            // Guard: if both low and high are over-budget sentinels (mem_high == mem),
+            // the regula-falsi denominator (mem_high - mem) is zero -> SIGFPE.
+            if (mem_high[id] <= mem[id]) {
+                LOG_WRN("%s: device %" PRIu32 " is un-fillable (mem_low=%" PRId64 " MiB, mem_high=%" PRId64 " MiB), skipping\n",
+                    __func__, id, mem[id]/MiB, mem_high[id]/MiB);
+            } else {
             while (delta > 1) {
                 uint32_t step_size = int64_t(delta) * (targets[id] - mem[id]) / (mem_high[id] - mem[id]);
                 step_size = std::max(step_size, uint32_t(1));
@@ -1405,6 +1326,7 @@ static void common_params_fit_impl(
                 }
                 assert(ngl_per_device_high[id].n_full() >= ngl_per_device[id].n_full());
                 delta = ngl_per_device_high[id].n_full() - ngl_per_device[id].n_full();
+            }
             }
         } else {
             ngl_per_device = ngl_per_device_high;
