@@ -80,7 +80,7 @@ probe uses conservative defaults and warns, never aborts.
 `common_fit_strategy_pool_budget` computes the bounded MoE cache budget:
 
 - explicit `--moe-cache N` wins;
-- otherwise `min(clamp(remaining*3/4, max(2*working_set, 256 MiB), 64 GiB), remaining)`;
+- otherwise `min(clamp(remaining/2, max(2*working_set, 256 MiB), 4 GiB), remaining)` (see `common/fit-strategy.cpp:1807-1824`);
 - when `remaining < floor` the grant is 0 and the pool is disabled with a warning
   (a 0 budget with cache `mode=on` means unlimited, so disabling is explicit).
 
