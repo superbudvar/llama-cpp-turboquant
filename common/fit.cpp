@@ -1032,16 +1032,10 @@ static void common_params_fit_impl(
             LOG_TRC("  device %zu total: %" PRId64 " MiB (free=%" PRId64 " MiB)\n",
                 id, ret[id]/MiB, dmds_clean[id].free/MiB);
         }
-        // Validate: if any device's model bytes exceed its free memory, the split
-        // doesn't fit — return sentinel slightly over budget so the solver rejects.
-        // Detect by checking dmd_nl[nd].mb.model (host model bytes) > 0 (overflow happened).
         int64_t host_model_bytes = (int64_t) dmd_nl[nd].mb.model;
         if (host_model_bytes > 0) {
-            LOG_WRN("%s: requested split caused %" PRId64 " MiB of model to overflow to host; "
-                "rejected (returning over-budget sentinel)\n", func_name, host_model_bytes/MiB);
-            for (size_t id = 0; id < nd; id++) {
-                ret[id] = dmds_clean[id].free + 1; // slightly over budget
-            }
+            LOG_TRC("%s: requested split placed %" PRId64 " MiB of model on host (MoE overflow)\n",
+                func_name, host_model_bytes/MiB);
         }
         return ret;
     };
