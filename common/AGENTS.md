@@ -7,6 +7,10 @@ Fit placement on multi-GPU / RPC split models.
 - `common/fit-strategy.cpp` is the real solver for `--fit-strategy rpc-aware` / `maxctx`. The log line `common_fit_strategy_apply_impl: successfully fit params to free device memory` confirms it ran.
 - `common/fit.cpp` is the stock/upstream path: back-to-front fill `for (id = nd - 1; id >= 0; id--)` where the LAST device fills first. It is a fallback only; do not debug rpc-aware placement there.
 
+### Byte-parity guarantee (replaces the original ac-fs.1)
+
+The engine code lives in `common/fit-strategy.{h,cpp}`. `common/fit.cpp` is not modified from the no-strategy invocation. The original byte-identical constraint has been replaced by inspection-grade acceptance: "the custom logic is provably OUT of the shared code path". See `.agents/plans/2026-10-03-fit-strategy-cleanup.md` for disposition (ac-fs.1 superseded).
+
 ### rpc_frac scan direction decides which GPU gets packed
 
 - `fit_solve_rpc_aware` scans feasible rpc_frac values and keeps the split reaching the largest context (`fit_grow_context`). Selection is strict `ctx > best_ctx`, so the FIRST scanned split that reaches the max context wins the tie.
