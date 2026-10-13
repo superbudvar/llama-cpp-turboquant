@@ -35,7 +35,7 @@ int llama_fit_params(int argc, char ** argv) {
         const common_params_fit_status status =
             params.fit_strategy != COMMON_FIT_STRATEGY_UPSTREAM
             ? common_fit_strategy_apply(params, &mparams, &cparams)
-            : common_fit_params(params.model.path.c_str(), &mparams, &cparams,
+            : common_fit_params(params, params.model.path.c_str(), &mparams, &cparams,
                     params.tensor_split, params.tensor_buft_overrides.data(), &params.moe_cache,
                     params.fit_params_target.data(), params.fit_params_min_ctx,
                     params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);

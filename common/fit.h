@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "llama.h"
+#include "common.h"
 
 #include <cstdint>
 #include <string>
@@ -64,6 +65,7 @@ enum common_params_fit_status {
 //   - only parameters that have the same value as in llama_default_model_params are modified
 //     with the exception of the context size which is modified if and only if equal to 0
 common_params_fit_status common_fit_params(
+                  const common_params & params,
                          const char * path_model,
                  llama_model_params * mparams,
                llama_context_params * cparams,
@@ -72,7 +74,8 @@ common_params_fit_status common_fit_params(
            common_moe_cache_params * moe_cache,
                              size_t * margins,               // margins of memory to leave per device in bytes
                            uint32_t   n_ctx_min,             // minimum context size to set when trying to reduce memory use
-                     ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
+                     ggml_log_level   log_level,            // minimum log level to print during fitting, lower levels go to debug log
+                            bool       write_cache = true);  // persist the fit result to the on-disk cache for the next run
 
 // print estimated memory to stdout
 void common_fit_print(
@@ -92,8 +95,20 @@ struct common_device_memory_data {
 
 using common_device_memory_data_vec = std::vector<common_device_memory_data>;
 
-// Load a model + context with no_alloc and return the per-device memory breakdown.
+// Load a model + context with real model buffers and return the per-device memory breakdown.
 common_device_memory_data_vec common_get_device_memory_data(
+                         const char * path_model,
+           const llama_model_params * mparams,
+         const llama_context_params * cparams,
+    std::vector<ggml_backend_dev_t> & devs,
+                           uint32_t & hp_ngl,
+                           uint32_t & hp_n_ctx_train,
+                           uint32_t & hp_n_expert,
+                      ggml_log_level   log_level);
+
+// Dry-run the requested tensor placement without allocating model-weight buffers.
+// Context and compute buffers are still measured through context initialization.
+common_device_memory_data_vec common_get_device_memory_data_no_alloc(
                          const char * path_model,
            const llama_model_params * mparams,
          const llama_context_params * cparams,
@@ -120,5 +135,6 @@ common_device_memory_data_vec common_get_device_memory_data_with_parent(
     std::vector<ggml_backend_dev_t> & devs,
                            uint32_t & hp_ngl,
                            uint32_t & hp_n_ctx_train,
-                           uint32_t & hp_n_expert,
-                     ggml_log_level   log_level);
+                      uint32_t & hp_n_expert,
+                      ggml_log_level   log_level,
+                               bool   no_alloc_child = false);

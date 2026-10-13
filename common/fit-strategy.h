@@ -57,6 +57,7 @@ struct common_fit_analysis {
     bool rpc_hosts_set;   // params.rpc_hosts was non-empty at parse (cold-start signal)
     std::string model_id;
     uint32_t loader_ngl = 0; // n_layer_all: unconditional loader slot count (nextn included)
+    uint32_t n_ctx_train = 0;
 };
 
 struct common_fit_plan {
@@ -114,6 +115,7 @@ using common_fit_measure_fn = std::function<common_device_memory_data_vec(
 
 struct common_fit_probe {
     common_fit_measure_fn measure;
+    common_fit_measure_fn measure_no_alloc;
 };
 
 // Full entry point: analyze -> solve -> serialize -> validate.
@@ -141,10 +143,8 @@ common_params_fit_status common_fit_strategy_apply_impl(
 // When remaining < floor: grant = 0 (caller must WRN).
 size_t common_fit_strategy_pool_budget(size_t working_set_bytes, size_t remaining_vram, size_t user_budget_mib);
 
-// Probe the warm (post-model-load, pre-KV-init) ceiling on all devices.
-// unlike fit_probe_ceiling which uses analysis.devices (frozen before model load),
-// this reads live free via ggml_backend_dev_memory after model weights are loaded.
-// indexed by device id matching common_fit_analysis.devices order (same as llama_model_get_device(i)).
+// Compatibility entry point. Active warm OOM allocation probes are disabled
+// for safety; this returns an empty ceiling vector.
 std::vector<int64_t> common_fit_probe_ceiling_warm(llama_model * model, const common_params & params);
 
 // Activation profile schema (Issue 3, schema + sink only - no decode-path hooks in v1).

@@ -1,6 +1,7 @@
 #include "fit.h"
 
 #include "common.h"
+#include "fit-cache.h"
 #include "fit-stats.h"
 #include "log.h"
 
@@ -305,6 +306,7 @@ struct per_device_layer_costs {
     size_t n_layer_all = 0;
     size_t n_device = 0;
     std::vector<int64_t> bytes;          // [layer][device] = model bytes, row-major
+    std::vector<int64_t> model_bytes;    // all model tensor bytes by device, host last
     std::vector<int64_t> context_compute; // [device] = context + compute overhead
     std::vector<int32_t> layer_dev;      // [layer] = device id the layer was captured on, or -1 for unassigned
 };
@@ -312,7 +314,7 @@ struct per_device_layer_costs {
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const char * path_model,
         const llama_model_params * mparams,
-        const llama_context_params * cparams,
+        const llama_context_params * cparams_in,
         std::vector<ggml_backend_dev_t> & devs,
         uint32_t & hp_ngl,
         uint32_t & hp_n_ctx_train,
@@ -324,6 +326,15 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         bool no_alloc = false,
         per_device_layer_costs * per_layer_costs = nullptr) {
     common_fit_logger_guard logger_guard(log_level);
+
+    // stack-local cparams: the linear-interpolation branch below mutates
+    // cparams->n_ctx to probe the model at min_ctx and at an interpolated
+    // value. the caller's cparams would leak that mutation back, leaving
+    // params.n_ctx = 4096 for every subsequent probe and the post-fit real
+    // load. take a copy here and use it everywhere; the caller's cparams
+    // is never written through.
+    llama_context_params cparams_local = *cparams_in;
+    llama_context_params * cparams = &cparams_local;
 
     llama_model_params mparams_copy = *mparams;
     mparams_copy.no_alloc  = no_alloc;
@@ -351,6 +362,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         per_layer_costs->n_layer_all = llama_model_n_layer(model.get()) + llama_model_n_layer_nextn(model.get());
         per_layer_costs->n_device = nd;
         per_layer_costs->bytes.assign(per_layer_costs->n_layer_all * per_layer_costs->n_device, 0);
+        per_layer_costs->model_bytes.assign(nd + 1, 0);
         per_layer_costs->context_compute.assign(nd, 0);
         per_layer_costs->layer_dev.assign(per_layer_costs->n_layer_all, -1);
         const size_t count = llama_model_get_tensor_devices(model.get(), nullptr, 0);
@@ -371,6 +383,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
                     }
                 }
             }
+            per_layer_costs->model_bytes[dev_id] += (int64_t) ti.bytes;
             if (layer >= 0 && (size_t)layer < per_layer_costs->n_layer_all && dev_id < nd) {
                 per_layer_costs->bytes[layer * nd + dev_id] += ti.bytes;
                 per_layer_costs->layer_dev[layer] = (int32_t) dev_id;
@@ -399,6 +412,12 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
                 ret[i].mb.compute += mb.compute;
                 break;
             }
+        }
+    }
+
+    if (per_layer_costs) {
+        for (size_t i = 0; i < ret.size() && i < per_layer_costs->model_bytes.size(); i++) {
+            ret[i].mb.model = (size_t) per_layer_costs->model_bytes[i];
         }
     }
 
@@ -489,6 +508,31 @@ common_device_memory_data_vec common_get_device_memory_data(
     return ret;
 }
 
+common_device_memory_data_vec common_get_device_memory_data_no_alloc(
+        const char * path_model,
+        const llama_model_params * mparams,
+        const llama_context_params * cparams,
+        std::vector<ggml_backend_dev_t> & devs,
+        uint32_t & hp_ngl,
+        uint32_t & hp_n_ctx_train,
+        uint32_t & hp_n_expert,
+        ggml_log_level log_level) {
+    per_device_layer_costs costs;
+    std::vector<llama_device_memory_data> impl = common_get_device_memory_data_impl(
+            path_model, mparams, cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert,
+            log_level, nullptr, nullptr, nullptr, true, &costs);
+
+    common_device_memory_data_vec ret(impl.size());
+    for (size_t i = 0; i < impl.size(); i++) {
+        ret[i].total   = impl[i].total;
+        ret[i].free    = impl[i].free;
+        ret[i].model   = impl[i].mb.model;
+        ret[i].context = impl[i].mb.context;
+        ret[i].compute = impl[i].mb.compute;
+    }
+    return ret;
+}
+
 common_device_memory_data_vec common_get_device_memory_data_with_parent(
         const char * path_model,
         const llama_model_params * mparams,
@@ -500,7 +544,8 @@ common_device_memory_data_vec common_get_device_memory_data_with_parent(
         uint32_t & hp_ngl,
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
-        ggml_log_level log_level) {
+        ggml_log_level log_level,
+        bool no_alloc_child) {
     common_fit_logger_guard logger_guard(log_level);
 
     llama_model_params mparams_parent_copy = *mparams_parent;
@@ -519,7 +564,7 @@ common_device_memory_data_vec common_get_device_memory_data_with_parent(
 
     std::vector<llama_device_memory_data> impl = common_get_device_memory_data_impl(
             path_model, mparams, cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert,
-            log_level, nullptr, ctx_parent.get(), nullptr, false);
+            log_level, nullptr, ctx_parent.get(), nullptr, no_alloc_child);
 
     common_device_memory_data_vec ret(impl.size());
     for (size_t i = 0; i < impl.size(); i++) {
@@ -1610,6 +1655,7 @@ static void common_params_fit_impl(
 }
 
 enum common_params_fit_status common_fit_params(
+        const common_params & params,
         const char * path_model,
         llama_model_params * mparams,
         llama_context_params * cparams,
@@ -1618,12 +1664,47 @@ enum common_params_fit_status common_fit_params(
         common_moe_cache_params * moe_cache,
         size_t * margins,
         uint32_t n_ctx_min,
-        ggml_log_level log_level) {
+        ggml_log_level log_level,
+        bool write_cache) {
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     try {
         common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, moe_cache, margins, n_ctx_min, log_level);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
+        // save the fit result to the disk cache so subsequent runs hit the
+        // 1-probe validation path. reconstruct a minimal analysis from the
+        // current backends (same approach as common_fit_cache_refresh_deltas
+        // at fit-cache.cpp:787-802). n_ctx comes from cparams (the post-fit
+        // n_ctx chosen by the linear interpolation branch); n_gpu_layers from
+        // mparams. role_devices defaults to all backends in order, which is
+        // a valid synthetic plan that the cache validator can probe at load.
+        if (write_cache) {
+            common_fit_analysis analysis;
+            analysis.devices.reserve(ggml_backend_dev_count());
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                common_fit_device info;
+                info.id = (int) i;
+                info.dev = dev;
+                info.is_rpc = std::string(ggml_backend_dev_name(dev)).find("RPC") != std::string::npos;
+                size_t total = 0, free = 0;
+                ggml_backend_dev_memory(dev, &free, &total);
+                info.total_bytes = (int64_t) total;
+                info.free_bytes = (int64_t) free;
+                info.link_bw_mbps = 0;
+                info.link_latency_us = 0;
+                analysis.devices.push_back(info);
+            }
+            common_fit_plan plan;
+            plan.n_gpu_layers = mparams->n_gpu_layers;
+            plan.n_ctx = cparams->n_ctx;
+            for (size_t i = 0; i < analysis.devices.size(); i++) {
+                plan.role_devices.push_back((int) i);
+            }
+            const bool saved = common_fit_cache_save(params, path_model, analysis, plan);
+            LOG_INF("%s: fit cache save %s for %s\n", __func__,
+                    saved ? "succeeded" : "failed", path_model);
+        }
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());
         status = COMMON_PARAMS_FIT_STATUS_FAILURE;

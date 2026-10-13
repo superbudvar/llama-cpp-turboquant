@@ -1247,8 +1247,7 @@ struct common_init_result::impl {
     std::vector<int64_t> delta_free_ema;
     std::vector<int64_t> model_size_error;
     std::string model_path;
-    // warm ceiling: populated by common_fit_probe_ceiling_warm after model load, consumed
-    // by common_fit_strategy_apply on the NEXT invocation to improve fit accuracy
+    // Legacy warm ceiling field retained for old cache records.
     std::vector<int64_t> ceiling_free_warm;
 };
 
@@ -1279,6 +1278,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.fit_strategy != COMMON_FIT_STRATEGY_UPSTREAM
             ? common_fit_strategy_apply(params, &mparams, &cparams, nullptr, &fit_plan)
             : common_fit_params(
+                params,
                 params.model.path.c_str(), &mparams, &cparams,
                 params.tensor_split,
                 params.tensor_buft_overrides.data(),
@@ -1303,6 +1303,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 ? nullptr : params.tensor_buft_overrides.data();
         } else {
             // fit succeeded: store projected_free and delta_free_ema for post-MODEL READY delta update
+            pimpl->params = params; // retain the selected reservation/shed state for the cache key
             this->set_fit_projections(fit_plan.projected_free, fit_plan.delta_free_ema);
             this->set_model_path(params.model.path);
         }
@@ -1343,6 +1344,46 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     pimpl->model.reset(model);
+
+    // post-load margin check: catches stale projections (model grew, warm ceiling
+    // drifted, or device baseline shifted) before KV init allocates. aborts on
+    // breach so the caller doesn't waste time on a placement that can't succeed.
+    if (!pimpl->projected_free.empty()) {
+        const size_t nd_p = pimpl->projected_free.size();
+        const size_t nd_m = llama_model_n_devices(model);
+        const size_t nd = std::min(nd_p, nd_m);
+        bool margin_breach = false;
+        for (size_t i = 0; i < nd; i++) {
+            ggml_backend_dev_t dev = llama_model_get_device(model, i);
+            if (!dev) continue;
+            size_t free_m = 0, total_m = 0;
+            ggml_backend_dev_memory(dev, &free_m, &total_m);
+            int64_t margin = 0;
+            if (i < params.fit_params_target.size() && params.fit_params_target[i] > 0) {
+                margin = (int64_t) params.fit_params_target[i];
+            }
+            const int64_t free_signed = (int64_t) free_m;
+            const int64_t proj_free = pimpl->projected_free[i];
+            if (free_signed < margin) {
+                COM_ERR("post-model-load margin breach on device %zu %s: free=%lld MiB < margin=%lld MiB (projected=%lld MiB); fit projection was stale. Aborting before KV init.\n",
+                        i, ggml_backend_dev_name(dev),
+                        (long long) free_signed / (1024*1024),
+                        (long long) margin / (1024*1024),
+                        (long long) proj_free / (1024*1024));
+                margin_breach = true;
+            } else if (free_signed < proj_free / 2) {
+                LOG_WRN("%s: device %zu %s: actual free=%lld MiB is much less than projected=%lld MiB; margin=%lld MiB may be at risk when KV is allocated\n",
+                        __func__, i, ggml_backend_dev_name(dev),
+                        (long long) free_signed / (1024*1024),
+                        (long long) proj_free / (1024*1024),
+                        (long long) margin / (1024*1024));
+            }
+        }
+        if (margin_breach) {
+            pimpl->model.reset();
+            return;
+        }
+    }
 
     if (model_only) {
         return;
@@ -1423,7 +1464,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     LOG_TMPL(GGML_LOG_LEVEL_INFO, LOG_LEVEL_INFO, "MODEL READY - device memory breakdown for '%s':", params.model.path.c_str());
     common_memory_breakdown_print(lctx);
 
-    this->update_fit_delta();
+    if (!params.fit_defer_delta_update) {
+        this->update_fit_delta();
+    }
 }
 
 llama_model * common_init_result::model() {
@@ -1464,7 +1507,8 @@ const std::string & common_init_result::model_path() const {
     return pimpl->model_path;
 }
 
-void common_init_result::update_fit_delta() {
+void common_init_result::update_fit_delta(
+        const std::vector<std::pair<ggml_backend_dev_t, int64_t>> & expected_companion_bytes) {
     if (pimpl->projected_free.empty() || !pimpl->model || !pimpl->context) {
         LOG_INF("%s: skipped: projected_free.size=%zu model=%p context=%p\n",
                 __func__, pimpl->projected_free.size(),
@@ -1483,6 +1527,51 @@ void common_init_result::update_fit_delta() {
     }
     llama_model * model = pimpl->model.get();
     constexpr float alpha = 0.75f;
+    constexpr size_t max_samples = 7;
+    constexpr int64_t settle_threshold = 128ll * 1024 * 1024;
+    constexpr size_t settle_window = 3;
+    constexpr auto sample_interval = std::chrono::milliseconds(200);
+    std::vector<std::vector<int64_t>> free_samples(nd);
+    size_t sample_count = 0;
+    bool settled = false;
+    for (; sample_count < max_samples; sample_count++) {
+        for (size_t i = 0; i < nd; i++) {
+            ggml_backend_dev_t dev = llama_model_get_device(model, i);
+            if (!dev) {
+                continue;
+            }
+            size_t free = 0, total = 0;
+            ggml_backend_dev_memory(dev, &free, &total);
+            free_samples[i].push_back((int64_t) free);
+            LOG_DBG("%s: sample %zu device=%s free=%lld MiB\n", __func__, sample_count + 1,
+                    ggml_backend_dev_name(dev), (long long) (free / (1024 * 1024)));
+        }
+        if (sample_count + 1 >= settle_window) {
+            settled = true;
+            for (const auto & values : free_samples) {
+                if (values.size() < settle_window) {
+                    continue;
+                }
+                const auto first = values.end() - settle_window;
+                const auto [minimum, maximum] = std::minmax_element(first, values.end());
+                if (*maximum - *minimum > settle_threshold) {
+                    settled = false;
+                    break;
+                }
+            }
+            if (settled) {
+                sample_count++;
+                break;
+            }
+        }
+        if (sample_count + 1 < max_samples) {
+            std::this_thread::sleep_for(sample_interval);
+        }
+    }
+    LOG_INF("%s: sampled device memory %zu times; readings %s\n",
+            __func__, sample_count, settled ? "settled" : "did not settle");
+
+    std::vector<int64_t> projected_free_settled = pimpl->projected_free;
     LOG_INF("%s: updating EMA for %zu devices (alpha=%.2f)\n", __func__, nd, alpha);
     for (size_t i = 0; i < nd; i++) {
         ggml_backend_dev_t dev = llama_model_get_device(model, i);
@@ -1490,10 +1579,21 @@ void common_init_result::update_fit_delta() {
             LOG_INF("%s:   device %zu: no dev\n", __func__, i);
             continue;
         }
-        size_t free, total;
-        ggml_backend_dev_memory(dev, &free, &total);
-        int64_t actual_free = (int64_t) free;
-        int64_t proj_free = pimpl->projected_free[i];
+        const auto & samples = free_samples[i];
+        if (samples.empty()) {
+            continue;
+        }
+        const size_t window = settled ? std::min(settle_window, samples.size()) : samples.size();
+        const auto first = samples.end() - window;
+        const int64_t actual_free = *std::min_element(first, samples.end());
+        int64_t expected_extra = 0;
+        for (const auto & [reserved_dev, bytes] : expected_companion_bytes) {
+            if (reserved_dev == dev) {
+                expected_extra += std::max<int64_t>(0, bytes);
+            }
+        }
+        const int64_t proj_free = pimpl->projected_free[i] - expected_extra;
+        projected_free_settled[i] = proj_free;
         int64_t actual_delta = actual_free - proj_free;
         int64_t old_ema = pimpl->delta_free_ema[i];
         int64_t new_ema = (int64_t)(alpha * actual_delta + (1 - alpha) * old_ema);
@@ -1503,9 +1603,9 @@ void common_init_result::update_fit_delta() {
         // negative, the model was larger than projected, so the margin must increase.
         // Applied as margins -= delta (which increases margin when delta < 0).
         pimpl->model_size_error[i] = actual_delta;
-        LOG_INF("%s:   device %zu: dev=%s actual_free=%lld proj_free=%lld delta=%lld old_ema=%lld new_ema=%lld model_size_error=%lld\n",
+        LOG_INF("%s:   device %zu: dev=%s actual_free=%lld proj_free=%lld companion=%lld delta=%lld old_ema=%lld new_ema=%lld model_size_error=%lld\n",
                 __func__, i, ggml_backend_dev_name(dev),
-                (long long) actual_free, (long long) proj_free,
+                (long long) actual_free, (long long) proj_free, (long long) expected_extra,
                 (long long) actual_delta, (long long) old_ema, (long long) new_ema,
                 (long long) pimpl->model_size_error[i]);
     }
@@ -1513,18 +1613,41 @@ void common_init_result::update_fit_delta() {
     if (!pimpl->model_path.empty() && !pimpl->delta_free_ema.empty()) {
         LOG_INF("%s: refreshing cache for model_path=%s (%zu devices)\n",
                 __func__, pimpl->model_path.c_str(), pimpl->delta_free_ema.size());
+        common_fit_analysis analysis;
+        const size_t n_devices = llama_model_n_devices(model);
+        analysis.devices.reserve(n_devices);
+        for (size_t i = 0; i < n_devices; i++) {
+            ggml_backend_dev_t dev = llama_model_get_device(model, (int32_t) i);
+            common_fit_device info;
+            info.id = (int) i;
+            info.dev = dev;
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
+            info.is_rpc = reg_name && std::strstr(reg_name, "RPC") != nullptr;
+            size_t free = 0, total = 0;
+            ggml_backend_dev_memory(dev, &free, &total);
+            info.free_bytes = (int64_t) free;
+            info.total_bytes = (int64_t) total;
+            info.link_bw_mbps = 0;
+            info.link_latency_us = 0;
+            analysis.devices.push_back(info);
+        }
         std::string cache_path;
         bool refreshed = common_fit_cache_refresh_deltas(
-                pimpl->params, pimpl->model_path, pimpl->delta_free_ema, &cache_path);
+                pimpl->params, pimpl->model_path, analysis, pimpl->delta_free_ema, &cache_path);
         // Also save the full plan with model_size_error so next load has the margin correction.
         // Pass the path that refresh_deltas wrote to so we update the SAME file, avoiding
         // directory-scan path mismatch when multiple cache entries exist.
-        if (!pimpl->projected_free.empty() && !pimpl->model_size_error.empty()) {
+        if (refreshed && !cache_path.empty() && !pimpl->projected_free.empty() && !pimpl->model_size_error.empty()) {
             common_fit_plan plan;
-            common_fit_cache_save_with_model_size_error(
+            const bool saved = common_fit_cache_save_with_model_size_error(
                     pimpl->params, pimpl->model_path, plan,
                     pimpl->projected_free, pimpl->model_size_error,
                     pimpl->ceiling_free_warm, &cache_path);
+            LOG_INF("%s: discrepancy feedback cache save %s: %s\n", __func__,
+                    saved ? "succeeded" : "failed", cache_path.c_str());
+        } else {
+            LOG_WRN("%s: discrepancy feedback was not persisted (fit-plan cache entry unavailable)\n", __func__);
         }
         (void)refreshed;
     }

@@ -12,6 +12,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 #include <map>
 #include <algorithm>
@@ -517,6 +518,7 @@ struct common_params {
     common_fit_strategy fit_strategy       = COMMON_FIT_STRATEGY_UPSTREAM; // selectable fit engine
     int32_t             fit_strategy_min_ctx = 0; // strategy floor, 0 = unset -> required for non-upstream
     bool                fit_cache_clear    = false; // discard the disk fit result cache for this model before fitting
+    bool                fit_defer_delta_update = false; // server updates fit feedback after companion contexts load
     bool                fit_params_no_context_reserve = false; // honor --fit-target as explicit margin, ignore 2 GiB context_reserve floor
     bool                fit_params_probe_ceiling = false; // probe device ceiling and clamp reported free to measured maximum
 
@@ -996,7 +998,7 @@ struct common_init_result {
     void set_fit_projections(std::vector<int64_t> projected_free, std::vector<int64_t> delta_free_ema);
     void set_model_path(const std::string & path);
     void set_ceiling_free_warm(std::vector<int64_t> ceiling_free_warm);
-    void update_fit_delta();
+    void update_fit_delta(const std::vector<std::pair<ggml_backend_dev_t, int64_t>> & expected_companion_bytes = {});
     const std::vector<int64_t> & model_size_error() const;
     const std::vector<int64_t> & ceiling_free_warm() const;
 

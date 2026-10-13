@@ -58,6 +58,8 @@ static void test_skip(const char * reason) {
 
 struct fake_probe_ctx {
     int n_calls = 0;
+    int actual_measure_calls = 0;
+    int no_alloc_measure_calls = 0;
     int soft_rejects = 0;
     int hard_rejects = 0;
     std::vector<int> actions;       // per call: 0 return, 1 soft reject, 2 hard error
@@ -141,7 +143,8 @@ static common_device_memory_data_vec fake_measure(
 
 static common_fit_probe make_probe(fake_probe_ctx * cfg) {
     common_fit_probe probe;
-    probe.measure = [cfg](const char * path_model,
+    auto make_measure = [cfg](bool no_alloc) -> common_fit_measure_fn {
+        return [cfg, no_alloc](const char * path_model,
             const llama_model_params * mparams,
             const llama_context_params * cparams,
             std::vector<ggml_backend_dev_t> & devs,
@@ -149,9 +152,17 @@ static common_fit_probe make_probe(fake_probe_ctx * cfg) {
             uint32_t & hp_n_ctx_train,
             uint32_t & hp_n_expert,
             ggml_log_level log_level) {
+        if (no_alloc) {
+            cfg->no_alloc_measure_calls++;
+        } else {
+            cfg->actual_measure_calls++;
+        }
         return fake_measure(path_model, mparams, cparams, devs, hp_ngl,
                 hp_n_ctx_train, hp_n_expert, log_level, cfg);
+        };
     };
+    probe.measure = make_measure(false);
+    probe.measure_no_alloc = make_measure(true);
     return probe;
 }
 
@@ -230,6 +241,29 @@ static void test_measurement_contract() {
     // margin would have been rejected, not fitted
     expect(cfg.seen_n_ctx.back() == 8192,
             "the plan context must be serialized into the measurement");
+}
+
+static void test_no_alloc_measurement_counts_model_weights() {
+    if (g_model.empty()) {
+        test_skip("no model available");
+        return;
+    }
+    common_params params;
+    params.model.path = g_model;
+    llama_model_params mparams = common_model_params_to_llama(params);
+    llama_context_params cparams = common_context_params_to_llama(params);
+    cparams.n_ctx = 1024;
+    std::vector<ggml_backend_dev_t> devs;
+    uint32_t hp_ngl = 0, hp_n_ctx_train = 0, hp_n_expert = 0;
+    const common_device_memory_data_vec memory = common_get_device_memory_data_no_alloc(
+            g_model.c_str(), &mparams, &cparams, devs,
+            hp_ngl, hp_n_ctx_train, hp_n_expert, GGML_LOG_LEVEL_ERROR);
+    size_t model_bytes = 0;
+    for (size_t i = 0; i < devs.size() && i < memory.size(); i++) {
+        model_bytes += memory[i].model;
+    }
+    expect(model_bytes > 0, "no-alloc measurement must include exact placed tensor bytes");
+    expect(devs.size() > 0, "no-alloc measurement must return the model device list");
 }
 
 static void test_preset_placement_rejected() {
@@ -452,6 +486,44 @@ static void test_rpc_aware_placement() {
     expect(cparams.n_ctx == 1024, "rpc-aware must preserve the requested context");
     expect(params.tensor_split[0] == 1.0f,
             "all weight must land on device 0, the local main device");
+    expect(cfg.no_alloc_measure_calls > 0,
+            "candidate and final fit validation must use the no-allocation measurement");
+    expect(cfg.actual_measure_calls == 0,
+            "fit search must not allocate the full candidate model before selection");
+}
+
+static void test_rpc_aware_uses_no_alloc_probes() {
+    if (g_model.empty()) {
+        test_skip("no model available");
+        return;
+    }
+    const char * old_cache = std::getenv("LLAMA_FIT_CACHE");
+    const std::string old_cache_value = old_cache ? old_cache : "";
+    const std::string test_cache = "/tmp/opencode/fit-noalloc-" + std::to_string(llama_time_us());
+    setenv("LLAMA_FIT_CACHE", test_cache.c_str(), 1);
+
+    common_params params;
+    params.fit_strategy = COMMON_FIT_STRATEGY_RPC_AWARE;
+    params.n_ctx = 1024;
+    params.model.path = g_model;
+    llama_model_params mparams = common_model_params_to_llama(params);
+    llama_context_params cparams = common_context_params_to_llama(params);
+    fake_probe_ctx cfg;
+    cfg.default_dev = { (int64_t) (16 * GiB), (int64_t) (16 * GiB), (size_t) (64 * MiB), (size_t) (32 * MiB), 0 };
+    const common_params_fit_status st = common_fit_strategy_apply_impl(
+            params, &mparams, &cparams, nullptr, make_probe(&cfg));
+
+    if (old_cache) {
+        setenv("LLAMA_FIT_CACHE", old_cache_value.c_str(), 1);
+    } else {
+        unsetenv("LLAMA_FIT_CACHE");
+    }
+    expect(st == COMMON_PARAMS_FIT_STATUS_SUCCESS,
+            "rpc-aware no-allocation candidate search must produce a valid plan");
+    expect(cfg.no_alloc_measure_calls > 0,
+            "rpc-aware candidate search must use the no-allocation measurement");
+    expect(cfg.actual_measure_calls == 0,
+            "rpc-aware candidate search must not materialize model-weight buffers");
 }
 
 static void test_rpc_cold_start() {
@@ -977,6 +1049,7 @@ static const struct test_case {
     void (*fn)();
 } g_tests[] = {
     { "measurement_contract",       test_measurement_contract },
+    { "no_alloc_measurement",        test_no_alloc_measurement_counts_model_weights },
     { "preset_placement_rejected",  test_preset_placement_rejected },
     { "pool_budget_formula",        test_pool_budget_formula },
     { "rpc_device_id_validation",   test_fit_strategy_rpc_device_id_validation },
@@ -985,6 +1058,7 @@ static const struct test_case {
     { "maxctx_above_floor",         test_maxctx_above_floor },
     { "floor_unreachable_errors",   test_floor_unreachable_errors },
     { "rpc_aware_placement",        test_rpc_aware_placement },
+    { "rpc_aware_no_alloc_probes",  test_rpc_aware_uses_no_alloc_probes },
     { "rpc_cold_start",             test_rpc_cold_start },
     { "shed_reserve_order",         test_shed_reserve_order },
     { "exception_classification",   test_exception_classification },

@@ -39,6 +39,18 @@ RE_RS = re.compile(r"llama_memory_recurrent:\s*(.+?) RS buffer size\s*=\s*([\d.]
 RE_MOE = re.compile(r"sched_reserve: MoE cache requested=(\w+) resolved=(\w+)")
 RE_SPEC = re.compile(r"common_speculative_init_result: (loading draft model|creating MTP draft context) '?([^'\n]+)")
 RE_EVAL_TIMING = re.compile(r"slot print_timing:.*?task \d+\s*\|\s*(prompt eval|eval) time\s*=\s*([\d.]+)\s*ms\s*/\s*(\d+) tokens\s*\(\s*[\d.]+ ms per token,\s*([\d.]+) tokens per second\)")
+RE_UPSTREAM_FIT_OK = re.compile(r"common_fit_params: successfully fit params to free device memory")
+RE_UPSTREAM_FIT_TIME = re.compile(r"common_fit_params: fitting params to free memory took ([\d.]+) seconds")
+RE_RPC_FIT_START = re.compile(r"\[FITDBG\] rpc-aware entered nd=(\d+) local=(\d+) loader_ngl=(\d+) min_ctx=(\d+)")
+RE_RPC_FRAC = re.compile(r"fit_solve_rpc_aware: rpc_frac=([\d.]+) measure=(\d+) devs=(\d+) margin=(\d+) -> (FEASIBLE|rejected)")
+RE_GROW_RESULT = re.compile(r"grow fits n_ctx=(\d+) measure=(\d+) margins=(\d+) -> (ok|FAIL)")
+RE_CANDIDATE_REJECT = re.compile(r"fit_solve_rpc_aware: candidate (.+?) cannot fit even the minimum context, skipping")
+RE_CANDIDATE_SELECTED = re.compile(r"selected (?:best )?candidate(?:=\S+)? .*?n_ctx=(\d+).*?split_size=(\d+)")
+RE_MARGIN = re.compile(r"common_fit_strategy_apply_impl: device\[(\d+)\]=(\S+) fit-target=(-?\d+) MiB base-margin=(-?\d+) MiB")
+RE_STRATEGY_RESULT = re.compile(r"common_fit_strategy_apply_impl: (successfully fit params|failed to fit params|encountered an error).*")
+RE_EXIT = re.compile(r"instance name=(\S+) exited with status (\d+)")
+RE_LOAD_PROGRESS = re.compile(r'cmd_child_to_router:state:\{"state":"(\w+)","payload":\{"stages":\[.*?\],"current":"(\w+)","value":([\d.]+)\}\}')
+RE_CACHE_EVENT = re.compile(r"fit cache (?:miss|hit)|selected fit cache save|fit cache save|saved cache:|fit_delta_refresh: (?:no cache|found|refreshed)|discrepancy feedback cache save|updating EMA|skipped: projected_free", re.IGNORECASE)
 
 runs = []
 cur = None
@@ -59,6 +71,8 @@ def new_run(name="run", port="?"):
         "served_n_ctx": None, "nctxs": [], "n_ctx_train": None,
         "kv": {}, "rs": {}, "moe_requested": None, "moe_resolved": None,
         "spec": None, "model_ready": {}, "sysfs": {}, "timing": [],
+        "upstream_fit_attempts": [], "rpc_fit": None, "load_status": "incomplete",
+        "load_progress": None, "cache_events": [], "fit_margins": [],
     }
     return cur
 
@@ -67,10 +81,6 @@ def flush():
     global cur
     if cur is None:
         return
-    if cur["served_n_ctx"] is None and cur["nctxs"]:
-        mx = max(cur["nctxs"])
-        candidates = [v for v in cur["nctxs"] if v < mx]
-        cur["served_n_ctx"] = max(candidates) if candidates else mx
     runs.append(cur)
 
 
@@ -81,6 +91,8 @@ for line in open(LOG, encoding="utf-8", errors="replace"):
     if m:
         flush()
         new_run(m.group(1), m.group(2))
+        last_n_ctx = None
+        capture_breakdown_for = None
         continue
 
     # start a run for a direct (non-router) single-model load
@@ -88,6 +100,71 @@ for line in open(LOG, encoding="utf-8", errors="replace"):
         new_run("direct-%d" % (run_counter + 1))
     if cur is None:
         continue
+
+    if RE_CACHE_EVENT.search(line):
+        cur["cache_events"].append(line.strip())
+
+    m = RE_MARGIN.search(line)
+    if m:
+        device, name, target, margin = m.groups()
+        cur["fit_margins"].append((int(device), name, int(target), int(margin)))
+        continue
+
+    m = RE_LOAD_PROGRESS.search(line)
+    if m:
+        cur["load_progress"] = (m.group(1), m.group(2), float(m.group(3)))
+        cur["load_status"] = m.group(1)
+        continue
+
+    m = RE_UPSTREAM_FIT_OK.search(line)
+    if m:
+        cur["upstream_fit_attempts"].append({"result": "success", "seconds": None})
+        continue
+    m = RE_UPSTREAM_FIT_TIME.search(line)
+    if m:
+        seconds = float(m.group(1))
+        if cur["upstream_fit_attempts"] and cur["upstream_fit_attempts"][-1]["seconds"] is None:
+            cur["upstream_fit_attempts"][-1]["seconds"] = seconds
+        else:
+            cur["upstream_fit_attempts"].append({"result": "no success marker", "seconds": seconds})
+        continue
+    m = RE_RPC_FIT_START.search(line)
+    if m:
+        cur["rpc_fit"] = {
+            "min_ctx": int(m.group(4)), "rpc_fracs": [], "grow": [],
+            "rejected_candidates": [], "selected": None, "result": "in progress",
+        }
+        continue
+    if cur["rpc_fit"] is not None:
+        m = RE_RPC_FRAC.search(line)
+        if m:
+            frac, measured, devices, margin, verdict = m.groups()
+            cur["rpc_fit"]["rpc_fracs"].append({
+                "frac": float(frac), "measured": int(measured), "devices": int(devices),
+                "margin_ok": int(margin), "verdict": verdict,
+            })
+            continue
+        m = RE_GROW_RESULT.search(line)
+        if m:
+            n_ctx, measured, margins_ok, verdict = m.groups()
+            cur["rpc_fit"]["grow"].append({
+                "n_ctx": int(n_ctx), "measured": int(measured),
+                "margins_ok": int(margins_ok), "verdict": verdict,
+            })
+            continue
+        m = RE_CANDIDATE_REJECT.search(line)
+        if m:
+            cur["rpc_fit"]["rejected_candidates"].append(m.group(1))
+            continue
+        m = RE_CANDIDATE_SELECTED.search(line)
+        if m:
+            cur["rpc_fit"]["selected"] = {"n_ctx": int(m.group(1)), "split_size": int(m.group(2))}
+            cur["rpc_fit"]["result"] = "selected"
+            continue
+        m = RE_STRATEGY_RESULT.search(line)
+        if m:
+            cur["rpc_fit"]["result"] = m.group(1)
+            continue
 
     mv = RE_VALUE.search(line)
 
@@ -187,8 +264,14 @@ for line in open(LOG, encoding="utf-8", errors="replace"):
     m = RE_MODELREADY.search(line)
     if m:
         cur["served_n_ctx"] = last_n_ctx
+        cur["load_status"] = "MODEL READY"
         capture_breakdown_for = m.group(1)
         cur["model_ready"].setdefault(capture_breakdown_for, {})
+        continue
+
+    m = RE_EXIT.search(line)
+    if m and m.group(1) == cur["name"]:
+        cur["load_status"] = "exited with status %s" % m.group(2)
         continue
 
     if capture_breakdown_for is not None:
@@ -245,11 +328,50 @@ for r in runs:
         offload_str += f" ({r['offload_transformer']} trans + {r['offload_output']} out)"
     print(f"  offload   : {offload_str} layers to GPU")
     print(f"  train ctx : {r['n_ctx_train']}")
-    print(f"  served ctx: {r['served_n_ctx']}")
+    max_probed_ctx = max(r["nctxs"]) if r["nctxs"] else None
+    print(f"  load state: {r['load_status']}")
+    print(f"  served ctx: {r['served_n_ctx'] if r['served_n_ctx'] is not None else 'unconfirmed'}")
+    print(f"  max probed: {max_probed_ctx}")
+    over_train_ctx = sorted(set(n for n in r["nctxs"] if r["n_ctx_train"] and n > r["n_ctx_train"]))
+    if over_train_ctx:
+        print(f"  over-train probes: {', '.join(map(str, over_train_ctx))}")
+    if r["load_progress"]:
+        state, stage, value = r["load_progress"]
+        print(f"  progress  : {state} / {stage} {value:.1%}")
+    for i, attempt in enumerate(r["upstream_fit_attempts"], 1):
+        elapsed = "?" if attempt["seconds"] is None else "%.2fs" % attempt["seconds"]
+        print(f"  upstream fit #{i}: {attempt['result']} ({elapsed})")
+    if r["rpc_fit"] is not None:
+        fit = r["rpc_fit"]
+        print(f"  rpc-aware : {fit['result']} (floor={fit['min_ctx']}, split probes={len(fit['rpc_fracs'])}, context probes={len(fit['grow'])})")
+        if fit["rpc_fracs"]:
+            print("    rpc_frac attempts:")
+            for i, probe in enumerate(fit["rpc_fracs"], 1):
+                print(f"      #{i}: {probe['frac']:.4f} {probe['verdict']} (measure={probe['measured']}, devices={probe['devices']}, margins={probe['margin_ok']})")
+        if fit["grow"]:
+            print("    context attempts:")
+            for i, probe in enumerate(fit["grow"], 1):
+                print(f"      #{i}: n_ctx={probe['n_ctx']} {probe['verdict']} (measure={probe['measured']}, margins={probe['margins_ok']})")
+        if fit["rejected_candidates"]:
+            print(f"    min-ctx rejects: {', '.join(fit['rejected_candidates'])}")
+        if fit["selected"]:
+            print(f"    selected  : n_ctx={fit['selected']['n_ctx']} split_size={fit['selected']['split_size']}")
+    if r["fit_margins"]:
+        print("  fit margins:")
+        for device, name, target, margin in r["fit_margins"]:
+            print(f"    device[{device}] {name}: fit-target={target} MiB base-margin={margin} MiB")
+    if r["cache_events"]:
+        print("  cache/feedback events:")
+        for event in r["cache_events"]:
+            print(f"    {event}")
+    else:
+        print("  cache/feedback events: none logged")
     if r["kv"] or r["rs"]:
-        print(f"  KV buffer : {', '.join(f'{d}={v:.0f}' for d, v in sorted(r['kv'].items()))}")
+        suffix = " (last observed; may be a fit probe)" if r["served_n_ctx"] is None else ""
+        print(f"  KV buffer : {', '.join(f'{d}={v:.0f}' for d, v in sorted(r['kv'].items()))}{suffix}")
     if r["rs"]:
-        print(f"  RS buffer : {', '.join(f'{d}={v:.0f}' for d, v in sorted(r['rs'].items()))}")
+        suffix = " (last observed; may be a fit probe)" if r["served_n_ctx"] is None else ""
+        print(f"  RS buffer : {', '.join(f'{d}={v:.0f}' for d, v in sorted(r['rs'].items()))}{suffix}")
     if r["moe_requested"]:
         print(f"  MoE cache : requested={r['moe_requested']} resolved={r['moe_resolved']}")
     if r["spec"]:

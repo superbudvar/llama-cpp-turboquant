@@ -13,10 +13,11 @@ The engine code lives in `common/fit-strategy.{h,cpp}`. `common/fit.cpp` is not 
 
 ### rpc_frac scan direction decides which GPU gets packed
 
-- `fit_solve_rpc_aware` scans feasible rpc_frac values and keeps the split reaching the largest context (`fit_grow_context`). Selection is strict `ctx > best_ctx`, so the FIRST scanned split that reaches the max context wins the tie.
+- `fit_solve_rpc_aware` compares candidates by achieved context. If a margin-valid candidate reaches the absolute cap (trained context or explicit `--ctx-size`), later candidates cannot improve the primary objective and the solver accepts it immediately. Otherwise it keeps searching and returns the best context across splits.
 - Scanning top-down (largest rpc_frac first) packs the RPC device to the brim while the local device stays half-idle (observed: RPC 0 MiB free, ROCm 4 GiB free). Scanning bottom-up keeps the smallest RPC share that still reaches the same max context and packs the local device first (observed: ROCm 611 MiB free, RPC 4 GiB free). See the loop at fit-strategy.cpp:~764.
 - Context is the primary objective: a split that reaches a higher context always beats a smaller rpc_frac at lower context. Tie-break (scan direction) only applies among splits at the same max context.
-- Selection tiers (dense): (1) local-only offload reaching min-ctx wins immediately on the main GPU; (2) the local+RPC split keeps growing to its max context and wins when it reaches min-ctx - CPU spill is never considered in case 2; (3) only when tier 2 fails does the CPU-spill phase run, and its base is the RPC-split candidate kept inside the loop (`have_rpc_spill`), so the spill stays rocm+rpc+cpu. A local-only spill base only remains when no RPC device is usable.
+- Candidate order starts local-only to preserve decode locality, then considers local+RPC. Candidate measurements use no-allocation tensor placement plus context/compute measurement; model weight buffers are not allocated during the search. The final real load is the physical check.
+- CPU spill runs only after every reservation-shed level fails to reach the minimum; its base is the RPC-split candidate kept inside the loop (`have_rpc_spill`), so the spill stays rocm+rpc+cpu. A local-only spill base only remains when no RPC device is usable.
 - CPU-spill rpc-split re-brackets rpc_frac per n_gpu_layers (`fit_spill_split_at_ngl`): the old spill reused the full-offload ceiling (the max RPC fraction), which overflows nothing once layers move to CPU and fills RPC first while the local device stays half-idle. A spill must re-scan the split at each layer count and pack the local device first. The coarse 0.05 scan catches windows wider than the step; a bisection handles narrower windows straddled by the scan. See fit-strategy.cpp:~587.
 
 ### Companion reservations shed before CPU spill
@@ -32,6 +33,8 @@ The engine code lives in `common/fit-strategy.{h,cpp}`. `common/fit.cpp` is not 
 - During the fit probe phase (`load_mode = none`) every device prints `model buffer size = 0.00 MiB` and `offloaded N/N layers`, and the breakdown `unaccounted` column can go negative (reported free includes other processes, e.g. the desktop session on ROCm). These lines are measurement artifacts.
 - The real placement only appears in the final `MODEL READY - device memory breakdown` line.
 - `n_ctx_seq < n_ctx_train` warnings during probing are expected; the final context is printed right after MODEL READY.
+- `--fit-target` values are indexed by the model device order used by `fit_analyze`, not by the intuitive local-then-RPC order. Check the new per-device margin log before interpreting a comma-separated target list.
+- `--fit-probe-ceiling` no longer allocates near the OOM threshold. Active cold and warm OOM probes are disabled; use the reported free memory and explicit margins.
 
 ### Config semantics
 

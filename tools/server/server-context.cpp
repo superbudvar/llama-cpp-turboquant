@@ -10,6 +10,7 @@
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
+#include "fit-cache.h"
 #include "fit-strategy.h"
 #include "llama.h"
 #include "log.h"
@@ -1371,7 +1372,9 @@ private:
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
+        params_base.fit_defer_delta_update = spec_mtp;
         const server_shared_draft_device_config shared_draft_devices = server_prepare_shared_draft_devices(params_base);
+        std::vector<std::pair<ggml_backend_dev_t, int64_t>> fit_expected_companion_bytes;
 
         auto make_params_dft = [&]() {
             common_params params_dft = common_base_params_to_speculative(params_base);
@@ -1485,8 +1488,37 @@ private:
                     bool have_fit = false;
                     const char * path_dft = spec_mtp ? params_base.model.path.c_str() : params_dft.model.path.c_str();
 
-                    if (spec_mtp) {
-                        const size_t max_iterations = 4;
+                    if (spec_mtp && params_base.fit_strategy != COMMON_FIT_STRATEGY_UPSTREAM) {
+                        common_params params_prefit = params_base;
+                        llama_model_params mparams_prefit = common_model_params_to_llama(params_prefit);
+                        llama_context_params cparams_prefit = common_context_params_to_llama(params_prefit);
+                        common_fit_plan plan_prefit;
+                        const common_params_fit_status fit_status = common_fit_strategy_apply(
+                                params_prefit, &mparams_prefit, &cparams_prefit, nullptr, &plan_prefit);
+                        if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+                            throw std::runtime_error("no safe target placement is available for MTP preflight");
+                        }
+
+                        cparams_tgt.n_ctx = plan_prefit.n_ctx;
+                        cparams_dft.n_ctx = plan_prefit.n_ctx;
+                        mparams_fit = mparams_prefit;
+                        tensor_split_fit = plan_prefit.tensor_split;
+                        tensor_buft_overrides_fit = plan_prefit.tensor_buft_overrides;
+                        mparams_fit.tensor_split = tensor_split_fit.data();
+                        mparams_fit.tensor_buft_overrides = tensor_buft_overrides_fit.data();
+                        have_fit = true;
+                        SRV_INF("[spec] noalloc target preflight selected n_ctx=%d; measuring MTP context at that context\n",
+                                plan_prefit.n_ctx);
+                    }
+
+                    if (spec_mtp && !have_fit) {
+                        // single-iter fast path: the convergence loop's spec memory
+                        // bounces between iters because the upstream fit's
+                        // ngl_per_device binary search picks a different
+                        // placement each call. 4 iters costs 4 model loads
+                        // (~16 min cold); iter 0's spec memory is good enough
+                        // for the main init's reserve sizing.
+                        const size_t max_iterations = 1;
                         const size_t convergence_threshold = 1024 * 1024; // 1 MiB
                         size_t prev_spec_bytes = 0;
 
@@ -1499,10 +1531,11 @@ private:
                             std::vector<llama_model_tensor_buft_override> tensor_buft_overrides_prefit(llama_max_tensor_buft_overrides());
                             common_moe_cache_params moe_cache_prefit = params_base.moe_cache;
                             const common_params_fit_status fit_status = common_fit_params(
-                                params_base.model.path.c_str(), &mparams_prefit, &cparams_prefit,
+                                params_base, params_base.model.path.c_str(), &mparams_prefit, &cparams_prefit,
                                 tensor_split_prefit.data(), tensor_buft_overrides_prefit.data(),
                                 &moe_cache_prefit, margins_work.data(),
-                                params_base.fit_params_min_ctx, GGML_LOG_LEVEL_ERROR);
+                                params_base.fit_strategy_min_ctx > 0 ? params_base.fit_strategy_min_ctx : params_base.fit_params_min_ctx,
+                                GGML_LOG_LEVEL_ERROR, /*write_cache=*/false);
                             if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
                                 break;
                             }
@@ -1518,7 +1551,8 @@ private:
                             auto dmd_iter = common_get_device_memory_data_with_parent(
                                 path_dft, &mparams_fit, &cparams_dft,
                                 params_base.model.path.c_str(), &mparams_fit, &cparams_tgt,
-                                devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
+                                devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR,
+                                /*no_alloc_child=*/spec_mtp);
                             size_t total_spec_bytes = 0;
                             for (size_t i = 0; i < devs.size() && i < dmd_iter.size(); i++) {
                                 total_spec_bytes += dmd_iter[i].context + dmd_iter[i].compute;
@@ -1548,7 +1582,8 @@ private:
                         auto data = common_get_device_memory_data_with_parent(
                             path_dft, &mparams_measure, &cparams_dft,
                             params_base.model.path.c_str(), &mparams_parent, &cparams_tgt,
-                            measured_devs, measured_ngl, measured_nct, measured_nex, GGML_LOG_LEVEL_ERROR);
+                            measured_devs, measured_ngl, measured_nct, measured_nex, GGML_LOG_LEVEL_ERROR,
+                            /*no_alloc_child=*/spec_mtp);
                         // The MTP context allocates its own compute buffer; only the
                         // target's model weights are shared via the parent context,
                         // so the measured data already reflects the true reservation.
@@ -1556,8 +1591,9 @@ private:
                     };
 
                     const llama_model_params & mparams_measure = spec_mtp ? (have_fit ? mparams_fit : mparams_tgt) : mparams_dft;
+                    const llama_model_params & mparams_parent = spec_mtp && have_fit ? mparams_fit : mparams_tgt;
                     auto dmd = measure_spec_memory(
-                        mparams_measure, mparams_tgt, devs, hp_ngl, hp_nct, hp_nex);
+                        mparams_measure, mparams_parent, devs, hp_ngl, hp_nct, hp_nex);
 
                     std::vector<std::pair<ggml_backend_dev_t, size_t>> reservations;
                     auto add_reservations = [&](const common_device_memory_data_vec & data,
@@ -1638,6 +1674,7 @@ private:
                                     SRV_INF("[spec] reserving %.2f MiB on %s for the MTP context\n",
                                             bytes / (1024.0 * 1024.0), ggml_backend_dev_name(device));
                                     params_base.fit_params_target[i] += bytes;
+                                    fit_expected_companion_bytes.emplace_back(device, (int64_t) bytes);
                                 }
                                 break;
                             }
@@ -1953,6 +1990,10 @@ prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, 
 
         // restore the disk prompt cache (no-op when disabled or already populated)
         prompt_cache_disk_load();
+
+        if (spec_mtp && llama_init) {
+            llama_init->update_fit_delta(fit_expected_companion_bytes);
+        }
 
         // propagate new defaults back to the initial caller
         if (!is_resume) {

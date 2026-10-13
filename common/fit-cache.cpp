@@ -316,6 +316,37 @@ key += "model=";
     key += "n_ctx=";
     key += std::to_string(params.n_ctx);
     key += "\n";
+    // KV layout affects the projected and actual memory layout; a placement
+    // measured for q8_0 KV is not safe to reuse for turbo4 KV (different
+    // bytes per token) or for a different FA mode (different scratch size).
+    // All fields that change the actual KV or compute footprint on the
+    // device must be in the key; otherwise a fit may validate against a
+    // memory budget that does not match the run that needs the cache.
+    key += "kv=ctk=";
+    key += std::to_string((int) params.cache_type_k);
+    key += ",ctv=";
+    key += std::to_string((int) params.cache_type_v);
+    key += ",fa=";
+    key += std::to_string((int) params.flash_attn_type);
+    key += ",kvu=";
+    key += std::to_string(params.kv_unified ? 1 : 0);
+    key += ",kvsa=";
+    key += std::to_string(params.kv_stream_arena_mib);
+    key += ",nb=";
+    key += std::to_string(params.n_batch);
+    key += ",nub=";
+    key += std::to_string(params.n_ubatch);
+    key += ",np=";
+    key += std::to_string(params.n_parallel);
+    key += ",nkvo=";
+    key += std::to_string(params.no_kv_offload ? 1 : 0);
+    key += ",noopo=";
+    key += std::to_string(params.no_op_offload ? 1 : 0);
+    key += ",dctk=";
+    key += std::to_string((int) params.speculative.draft.cache_type_k);
+    key += ",dctv=";
+    key += std::to_string((int) params.speculative.draft.cache_type_v);
+    key += "\n";
 
     std::string rpc;
     for (const auto & h : params.rpc_hosts) {
@@ -741,6 +772,7 @@ bool common_fit_cache_save(
 bool common_fit_cache_refresh_deltas(
         const common_params & params,
         const std::string & path_model,
+        const common_fit_analysis & analysis,
         const std::vector<int64_t> & new_delta_free_ema,
         std::string * cache_path_out) {
     {
@@ -751,60 +783,9 @@ bool common_fit_cache_refresh_deltas(
         }
         LOG_INF("%s: ENTRY: new_delta_ema=[%s] path_model=%s\n", __func__, ema_str.c_str(), path_model.c_str());
     }
-    // Reconstruct a minimal analysis for the cache key: enumerate backends.
-    // This must match what fit_strategy_apply_impl used when the cache was saved.
-    common_fit_analysis analysis;
-    analysis.devices.reserve(ggml_backend_dev_count());
-    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        common_fit_device info;
-        info.id = (int)i;
-        info.dev = dev;
-        info.is_rpc = std::string(ggml_backend_dev_name(dev)).find("RPC") != std::string::npos;
-        size_t total, free;
-        ggml_backend_dev_memory(dev, &free, &total);
-        info.total_bytes = (int64_t) total;
-        info.free_bytes = (int64_t) free;
-        info.link_bw_mbps = 0;
-        info.link_latency_us = 0;
-        analysis.devices.push_back(info);
-    }
-
-    // Find the existing cache file by scanning for any CTIF cache entry that
-    // matches this model path. The model path + size is the stable identifier;
-    // we scan rather than recompute the hash because the analysis passed to
-    // this function has empty role_devices and may have different free_bytes
-    // (live vs cold memory state), producing a different hash than the save.
-    const uint64_t model_size = file_size_bytes(path_model);
-    std::string cache_path;
-    {
-        std::error_code ec;
-        fs::directory_iterator it(cache_root_dir(), ec);
-        if (!ec) {
-            for (const auto & entry : it) {
-                if (entry.status().type() != fs::file_type::regular) continue;
-                const std::string fp = entry.path().string();
-                std::ifstream f(fp, std::ios::binary);
-                if (!f.is_open()) continue;
-                std::vector<uint8_t> fb((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-                if (fb.size() < 64) continue;
-                if (fb[0] != 'C' || fb[1] != 'T' || fb[2] != 'I' || fb[3] != 'F') continue;
-                // Verify model size matches: body offset 28 has n_roles, but we need
-                // to walk the body to find the model size field used in the key hash.
-                // Instead: compute sha256(model_path + ":size:" + model_size) as the
-                // stable path key, matching how common_fit_cache_save stores it.
-                // But we don't store the model size separately - it's embedded in the hash.
-                // Simpler: just use the first CTIF file since there's only ever one
-                // cache entry per model on this system (fit cache is model-specific).
-                cache_path = fp;
-                break;
-            }
-        }
-    }
-    if (cache_path.empty()) {
-        LOG_INF("fit_delta_refresh: no cache file found in %s\n", cache_root_dir().c_str());
-        return false;
-    }
+    // Free-memory values are not part of the key, so the reconstructed device
+    // list from the measured model resolves the exact configuration entry.
+    const std::string cache_path = cache_file_path(params, path_model, analysis);
     LOG_INF("fit_delta_refresh: found cache file: %s\n", cache_path.c_str());
     std::ifstream in(cache_path, std::ios::binary);
     if (!in.is_open()) {
@@ -835,7 +816,7 @@ bool common_fit_cache_refresh_deltas(
     reader r{buf.data(), buf.size(), 0};
     (void)get_u32(r); // magic
     (void)get_u32(r); // version (v6 only)
-    uint64_t stored_key = get_u64(r); // unused but kept for header size
+    uint64_t stored_key = get_u64(r);
     uint64_t timestamp = get_u64(r);
     uint32_t body_size = get_u32(r);
 
@@ -866,65 +847,7 @@ bool common_fit_cache_refresh_deltas(
     size_t delta_count_pos = pos;
     uint32_t n_delta = 0;
     for (int i = 0; i < 4; i++) n_delta |= ((uint32_t)buf[pos + i] << (8*i));
-    pos += 4; // skip delta_free_ema count
-    if (n_delta != new_delta_free_ema.size()) {
-        LOG_WRN("%s: delta count mismatch: file has %u entries, caller passed %zu — deleting incompatible file and saving new\n",
-                __func__, n_delta, new_delta_free_ema.size());
-        std::error_code ec;
-        fs::remove(cache_path, ec);
-        // Reconstruct full plan from buffer and save with stored key so a new
-        // correct-format file is created instead of silently doing nothing.
-        // Reader starting at offset 28 (skip 28-byte CTIF header).
-        reader rr{buf.data(), buf.size(), 28};
-        common_fit_plan plan;
-        int32_t n_roles = get_u32(rr);
-        if (n_roles > 0 && (size_t)n_roles <= MAX_ROLES && rr.pos + 4 * (size_t)n_roles < rr.n) {
-            plan.role_devices.resize(n_roles);
-            for (int32_t i = 0; i < n_roles; i++) plan.role_devices[i] = get_u32(rr);
-            plan.n_gpu_layers = get_u32(rr);
-            int32_t split_len = get_u32(rr);
-            if (split_len >= 0 && (size_t)split_len <= MAX_SPLIT && rr.pos + 4 * (size_t)split_len + 4 + 8 < rr.n) {
-                plan.tensor_split.resize(split_len);
-                for (int32_t i = 0; i < split_len; i++) {
-                    uint32_t u = get_u32(rr); memcpy(&plan.tensor_split[i], &u, sizeof(float));
-                }
-                plan.n_ctx = get_u32(rr);
-                plan.pool_grant_mib = (size_t)get_u64(rr);
-                int32_t n_shed = get_u32(rr);
-                if (n_shed >= 0 && (size_t)n_shed <= MAX_SPLIT) {
-                    for (int32_t i = 0; i < n_shed; i++) {
-                        int32_t tag_len = get_u32(rr);
-                        if (tag_len >= 0 && tag_len <= 63 && rr.pos + tag_len <= rr.n) {
-                            plan.shed_reserves.emplace_back((const char *)(rr.p + rr.pos), tag_len);
-                            rr.pos += tag_len;
-                        }
-                    }
-                }
-                plan.delta_free_ema = new_delta_free_ema;
-                common_fit_analysis analysis;
-                analysis.devices.reserve(ggml_backend_dev_count());
-                for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-                    ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-                    common_fit_device dinfo;
-                    dinfo.id = (int)i;
-                    dinfo.dev = dev;
-                    dinfo.is_rpc = std::string(ggml_backend_dev_name(dev)).find("RPC") != std::string::npos;
-                    size_t total, free;
-                    ggml_backend_dev_memory(dev, &free, &total);
-                    dinfo.total_bytes = (int64_t)total;
-                    dinfo.free_bytes = (int64_t)free;
-                    dinfo.link_bw_mbps = 0;
-                    dinfo.link_latency_us = 0;
-                    analysis.devices.push_back(dinfo);
-                }
-                common_fit_cache_save(params, path_model, analysis, plan, stored_key);
-                if (cache_path_out) {
-                    *cache_path_out = cache_file_path(params, path_model, analysis);
-                }
-            }
-        }
-        return false;
-    }
+    pos += 4; // skip old delta_free_ema count
     pos += 8 * n_delta; // skip old delta_free_ema values (use file's count, not caller's)
     size_t proj_count_pos = pos; // projected_free starts here
     // v6: projected_free is per-device, read n_proj from file (NOT from new_delta_free_ema.size())
@@ -955,7 +878,7 @@ bool common_fit_cache_refresh_deltas(
         for (size_t i = 0; i < new_delta_free_ema.size(); i++) {
             if (i > 0) { old_s += ","; new_s += ","; }
             int64_t old_val = 0;
-            if (delta_count_pos + 4 + i * 8 + 8 <= buf.size()) {
+            if (i < n_delta && delta_count_pos + 4 + i * 8 + 8 <= buf.size()) {
                 for (int j = 0; j < 8; j++) old_val |= ((int64_t)buf[delta_count_pos + 4 + i * 8 + j] << (8 * j));
             }
             old_s += std::to_string(old_val / 1024 / 1024) + "MiB";
@@ -965,16 +888,13 @@ bool common_fit_cache_refresh_deltas(
                 __func__, delta_count_pos, old_s.c_str(), new_s.c_str());
     }
 
-    // Build new body = prefix + new_delta + suffix
-    // suffix starts after projected_with_delta (count+values+flags of projected_free already in file)
-    // and includes ceiling, mse, and warm ceiling fields
+    // Build new body = prefix + new_delta + the remaining body.
     std::vector<uint8_t> new_body;
     new_body.insert(new_body.end(), buf.begin() + 28, buf.begin() + delta_count_pos);
     app_i32(new_body, (int32_t)new_delta_free_ema.size());
     for (int64_t d : new_delta_free_ema) app_i64(new_body, d);
-    // after_proj: skip past projected_free count + n_proj values + projected_with_delta
-    size_t after_proj = proj_count_pos + 4 + 8 * n_proj + 4;
-    new_body.insert(new_body.end(), buf.begin() + after_proj, buf.begin() + buf.size());
+    const size_t after_delta = delta_count_pos + 4 + 8 * n_delta;
+    new_body.insert(new_body.end(), buf.begin() + after_delta, buf.begin() + buf.size());
 
     // Build new file: header + new_body
     std::vector<uint8_t> out;
@@ -1028,31 +948,17 @@ bool common_fit_cache_save_with_model_size_error(
         const std::vector<int64_t> & model_size_error,
         const std::vector<int64_t> & ceiling_free_warm,
         const std::string * cache_path_in) {
-    // Use caller-provided path if available (same file that fit_delta_refresh wrote).
-    // Otherwise fall back to directory scan.
+    (void) params; // the cache key is preserved from the selected entry
+    (void) plan;
+    // Use the exact entry that fit_delta_refresh updated. Never patch an
+    // arbitrary cache entry when the selected plan could not be identified.
     std::string cache_path = cache_path_in ? *cache_path_in : std::string();
     if (cache_path.empty()) {
-        std::error_code ec;
-        fs::directory_iterator it(cache_root_dir(), ec);
-        if (!ec) {
-            for (const auto & entry : it) {
-                if (entry.status().type() != fs::file_type::regular) continue;
-                const std::string fp = entry.path().string();
-                std::ifstream f(fp, std::ios::binary);
-                if (!f.is_open()) continue;
-                std::vector<uint8_t> fb((std::istreambuf_iterator<char>(f)),
-                                         std::istreambuf_iterator<char>());
-                if (fb.size() < 64) continue;
-                if (fb[0] != 'C' || fb[1] != 'T' || fb[2] != 'I' || fb[3] != 'F') continue;
-                cache_path = fp;
-                break;
-            }
-        }
-    }
-    if (cache_path.empty()) {
-        LOG_WRN("%s: no cache file found\n", __func__);
+        LOG_WRN("%s: exact cache path is unavailable; refusing to update an arbitrary entry\n", __func__);
         return false;
     }
+    LOG_INF("%s: updating feedback for model %s in %s\n",
+            __func__, path_model.c_str(), cache_path.c_str());
     // Load existing plan via common_fit_cache_load using the file's embedded key.
     // To do this we reconstruct an analysis matching the saved state by reading
     // device identity from the cache key itself.  Fall back to directory scan +
@@ -1153,24 +1059,6 @@ bool common_fit_cache_save_with_model_size_error(
         }
     }
 
-    // Build analysis for save (model path + device identity only, free memory not used in key)
-    common_fit_analysis analysis;
-    analysis.devices.reserve(ggml_backend_dev_count());
-    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        common_fit_device info;
-        info.id = (int)i;
-        info.dev = dev;
-        info.is_rpc = std::string(ggml_backend_dev_name(dev)).find("RPC") != std::string::npos;
-        size_t total, free;
-        ggml_backend_dev_memory(dev, &free, &total);
-        info.total_bytes = (int64_t)total;
-        info.free_bytes = (int64_t)free;
-        info.link_bw_mbps = 0;
-        info.link_latency_us = 0;
-        analysis.devices.push_back(info);
-    }
-
     common_fit_plan updated = existing;
     updated.model_size_error  = model_size_error;
     updated.projected_free    = projected_free;
@@ -1207,8 +1095,7 @@ bool common_fit_cache_save_with_model_size_error(
     out.insert(out.end(), 'C'); out.insert(out.end(), 'T');
     out.insert(out.end(), 'I'); out.insert(out.end(), 'F');
     app_u32(out, (uint32_t) CACHE_VERSION);
-    const uint64_t key = common_fit_cache_key_hash(params, path_model, analysis);
-    app_u64(out, key);
+    app_u64(out, stored_key);
     app_u64(out, (uint64_t) std::time(nullptr));
     app_u32(out, (uint32_t) body.size());
     out.insert(out.end(), body.begin(), body.end());

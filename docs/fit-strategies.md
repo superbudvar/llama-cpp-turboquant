@@ -10,6 +10,7 @@ sets the context floor for the strategies that need one.
 | --- | --- | --- |
 | `--fit-strategy` | `upstream` \| `rpc-aware` \| `maxctx` | Fit engine to use. Default `upstream` (stock byte-identical fit). |
 | `--fit-strategy-min-ctx` | int | Context floor the strategy must reach. Required for `rpc-aware` and `maxctx`. |
+| `--fit-probe-ceiling` | bool | Reuse a cached ceiling if present. Active allocation-to-OOM probes are disabled for safety. |
 
 Rules:
 
@@ -59,6 +60,15 @@ weights are placed, selected by interconnect quality. Rules:
   with `budget_mib=0` would otherwise mean "unlimited" in the cache layer.
 - Explicit `--moe-cache N` wins over the strategy budget. Explicit `--moe-cache off`
   is never overridden.
+- Candidate search uses a no-allocation tensor-placement pass to count exact
+  per-device model bytes, while context and compute buffers are measured. It
+  rejects candidates that miss a device margin before allocating model weights.
+- The first candidate that reaches the absolute context cap with all margins
+  satisfied is accepted immediately. If no candidate reaches the cap, the solver
+  compares candidates and keeps the largest margin-valid context.
+- `--fit-target` values follow model-device order. Logs name each device and its
+  effective margin; do not assume the first value is the local GPU when RPC is
+  enumerated first.
 
 The server margin accounting (`fit_params_target`) is re-attributed to the
 strategy's effective main GPU before the candidate loop, so reserved margins

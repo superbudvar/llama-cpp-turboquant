@@ -6324,7 +6324,7 @@ static const char * ggml_backend_cuda_device_get_description(ggml_backend_dev_t 
     return ctx->description.c_str();
 }
 
-#if defined(__linux__)
+#if defined(__linux__) && !defined(GGML_USE_HIP)
 // Helper function to get available memory from /proc/meminfo for UMA systems
 static bool ggml_backend_cuda_get_available_uma_memory(long * available_memory_kb, long * free_swap_kb) {
     FILE * meminfo_file = nullptr;
@@ -6400,6 +6400,49 @@ static bool ggml_backend_cuda_get_available_uma_memory(long * available_memory_k
 }
 #endif // defined(__linux__)
 
+#if defined(__linux__) && defined(GGML_USE_HIP)
+static bool ggml_backend_hip_get_vram_memory(const std::string & pci_bus_id, size_t * free, size_t * total) {
+    if (pci_bus_id.empty() || free == nullptr || total == nullptr) {
+        return false;
+    }
+
+    std::string physical_bus_id = pci_bus_id;
+    const size_t virtual_suffix = physical_bus_id.find("-v");
+    if (virtual_suffix != std::string::npos) {
+        physical_bus_id.resize(virtual_suffix);
+    }
+
+    char path[256];
+    unsigned long long used_bytes = 0;
+    unsigned long long total_bytes = 0;
+    snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/mem_info_vram_used", physical_bus_id.c_str());
+    FILE * used_file = fopen(path, "r");
+    if (used_file == nullptr) {
+        return false;
+    }
+    const bool read_used = fscanf(used_file, "%llu", &used_bytes) == 1;
+    fclose(used_file);
+    if (!read_used) {
+        return false;
+    }
+
+    snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/mem_info_vram_total", physical_bus_id.c_str());
+    FILE * total_file = fopen(path, "r");
+    if (total_file == nullptr) {
+        return false;
+    }
+    const bool read_total = fscanf(total_file, "%llu", &total_bytes) == 1;
+    fclose(total_file);
+    if (!read_total || total_bytes == 0) {
+        return false;
+    }
+
+    *total = (size_t) total_bytes;
+    *free = used_bytes < total_bytes ? (size_t) (total_bytes - used_bytes) : 0;
+    return true;
+}
+#endif
+
 static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
     ggml_cuda_set_device(ctx->device);
@@ -6412,8 +6455,25 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
         return;
     }
 
+#if defined(__linux__) && defined(GGML_USE_HIP)
+    const size_t hip_free = *free;
+    const size_t hip_total = *total;
+    size_t drm_free = 0;
+    size_t drm_total = 0;
+    if (ggml_backend_hip_get_vram_memory(ctx->pci_bus_id, &drm_free, &drm_total)) {
+        GGML_LOG_DEBUG("%s: device=%s hip_free=%zu MiB hip_total=%zu MiB drm_vram_free=%zu MiB drm_vram_total=%zu MiB\n",
+                __func__, ctx->pci_bus_id.c_str(), hip_free / (1024 * 1024), hip_total / (1024 * 1024),
+                drm_free / (1024 * 1024), drm_total / (1024 * 1024));
+        *free = drm_free;
+        *total = drm_total;
+    } else {
+        GGML_LOG_WARN("%s: DRM VRAM counters unavailable for %s; using hipMemGetInfo (%zu/%zu MiB free/total)\n",
+                __func__, ctx->pci_bus_id.c_str(), hip_free / (1024 * 1024), hip_total / (1024 * 1024));
+    }
+#endif
+
 // ref: https://github.com/ggml-org/llama.cpp/pull/17368
-#if defined(__linux__)
+#if defined(__linux__) && !defined(GGML_USE_HIP)
     // Check if this is a UMA (Unified Memory Architecture) system
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, ggml_cuda_get_physical_device(ctx->device)));

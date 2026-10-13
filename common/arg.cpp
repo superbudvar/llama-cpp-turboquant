@@ -3027,9 +3027,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_FIT_NO_CONTEXT_RESERVE"));
     add_opt(common_arg(
         {"--fit-probe-ceiling"},
-        "probe each device to find the maximum allocatable memory before OOM, "
-        "then clamp the reported free memory to this ceiling on all subsequent runs. "
-        "makes fit predictions more stable when free memory fluctuates due to driver overhead. "
+        "reuse a previously recorded free-memory ceiling; active OOM allocation probes "
+        "are disabled to avoid consuming nearly all device memory. "
         "default: off",
         [](common_params & params) {
             params.fit_params_probe_ceiling = true;
