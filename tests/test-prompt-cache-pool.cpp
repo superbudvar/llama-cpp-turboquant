@@ -119,12 +119,12 @@ int main(int argc, char ** argv) {
         // B wrote 0.6 MiB recently (never hit A's entry)
         write_file(dirB / "b.dpc", 600u * 1024, now - std::chrono::minutes(1));
 
-        // fingerprints pre-seeded so neither save clears its dir
+        // fingerprints pre-seeded so neither cache treats the entries as stale
         write_meta(dirA, fingerprint);
         write_meta(dirB, fingerprint);
 
-        // B saves -> its exit prune scans the whole root
-        B.save_to_disk(dirB.string(), fingerprint);
+        // B's exit prune scans the whole root.
+        B.prune_disk_budget(dirB.string());
 
         // (a) pool is back under budget (only B's .dpc remains: 0.6 MiB)
         check(pool_dpc_bytes(root) <= budget_mib * 1024 * 1024, "s1: used <= disk_max_size after prune");
@@ -156,8 +156,8 @@ int main(int argc, char ** argv) {
         write_meta(dirA, fingerprint);
         write_meta(dirB, fingerprint);
 
-        // A saves -> its exit prune counts its OWN .ccn and evicts oldest first
-        A.save_to_disk(dirA.string(), fingerprint);
+        // A's exit prune counts its OWN .ccn and evicts oldest first
+        A.prune_disk_budget(dirA.string());
 
         // oldest in the pool is A's .ccn (same hour as a.dpc, but a.dpc was
         // written first in this scenario -> tie broken by file order is not
@@ -247,9 +247,8 @@ int main(int argc, char ** argv) {
         write_meta(dirA, fingerprint);
         write_meta(dirB, fingerprint);
 
-        // A saves -> its exit prune must count the 0.6 MiB of store files
-        // toward the 1 MiB budget and evict A's own .dpc to fit
-        A.save_to_disk(dirA.string(), fingerprint);
+        // The pool prune counts store bytes and evicts the oldest .dpc to fit.
+        A.disk_prune_dpc(dirA.string(), nullptr);
 
         std::error_code ec4;
         uint64_t store_bytes = 0;
@@ -312,7 +311,7 @@ int main(int argc, char ** argv) {
         setenv("TURBO_DISK_CHUNK_STORE", "0", 1);
 
         const size_t n_idx = A.load_disk_index(dirC.string(), fingerprint);
-        check(n_idx == 1, "s5: legacy .dpc still indexed after rollback prune");
+        check(n_idx == 0, "s5: legacy .dpc is not indexed by the DTS-only loader");
         check(!file_exists(dirC / "cache.dcp"),     "s5: cache.dcp pruned (rollback)");
         check(!file_exists(dirC / "cache.dci"),     "s5: cache.dci pruned (rollback)");
         check(!file_exists(dirC / "stale.dts"),     "s5: .dts sidecar pruned (rollback)");
@@ -622,9 +621,9 @@ int main(int argc, char ** argv) {
         fs::create_directories(dirA);
         fs::create_directories(dirB);
 
-        // header constants mirror prune_pool's .dts parse (server-task.cpp)
+        // header constants mirror the current DTS v4 parser in server-task.cpp
         constexpr uint32_t DTS_MAGIC   = 0x31535444; // "DTS1"
-        constexpr uint32_t DTS_VERSION = 1;
+        constexpr uint32_t DTS_VERSION = 4;
 
         // pool is far under the 1 MiB budget: ~64 KiB of cache files total
         const auto a_dpc = dirA / "oldest.dpc";
@@ -642,8 +641,7 @@ int main(int argc, char ** argv) {
         write_file(a_ccn, 2u * 1024,  now - std::chrono::hours(1));
         write_file(b_ccn, 2u * 1024,  now - std::chrono::hours(1));
 
-        // a valid .dts sidecar: magic, version, n_tokens, 20 bytes of lengths,
-        // then n_tokens int32 token ids (the fingerprint is a hash of them)
+        // a valid .dts v4 sidecar: header, tokens, checkpoint metadata.
         {
             constexpr uint32_t N_TOK = 8;
             uint32_t hdr[3] = { DTS_MAGIC, DTS_VERSION, N_TOK };
@@ -653,6 +651,8 @@ int main(int argc, char ** argv) {
             uint32_t n_ckpt = 0;
             out.write((const char *) len, sizeof(len));
             out.write((const char *) &n_ckpt, sizeof(n_ckpt));
+            uint64_t last_access = 0;
+            out.write((const char *) &last_access, sizeof(last_access));
             for (uint32_t i = 0; i < N_TOK; i++) {
                 int32_t t = (int32_t) (100 + i);
                 out.write((const char *) &t, sizeof(t));
@@ -707,6 +707,8 @@ int main(int argc, char ** argv) {
             uint32_t n_ckpt = 0;
             out.write((const char *) len, sizeof(len));
             out.write((const char *) &n_ckpt, sizeof(n_ckpt));
+            uint64_t last_access = 0;
+            out.write((const char *) &last_access, sizeof(last_access));
             for (uint32_t i = 0; i < N_TOK; i++) {
                 int32_t t = (int32_t) (tok_offset + i);
                 out.write((const char *) &t, sizeof(t));
@@ -740,22 +742,18 @@ int main(int argc, char ** argv) {
     }
 
     //
-    //  scenario 9 (B4): last-resort .dcp/.dci eviction when pool is massively
-    //  over budget (>120% of disk_max_size) and all .dts candidates are exhausted.
-    //  this is the escape valve when a single store is so large that even evicting
-    //  all its .dts cannot bring the pool under control.
+    //  scenario 9: chunk-store files are not pool-eviction candidates, even when
+    //  the store alone exceeds the shared pool budget.
     //
     if (only.empty() || only == "s9") {
-        fprintf(stderr, "\n== scenario 9: last-resort .dcp/.dci eviction ==\n");
+        fprintf(stderr, "\n== scenario 9: chunk-store files are retained ==\n");
 
         fs::remove_all(root / "preset-A");
         fs::remove_all(root / "preset-B");
         fs::create_directories(dirA);
         fs::create_directories(dirB);
 
-        // pool budget = 1 MiB. create a store of 0.8 MiB in dirA, no .dts.
-        // pool used = 0.8 MiB > 120% * 1 MiB = 1.2 MiB? no, 0.8 < 1.2.
-        // Need store > 1.2 MiB. Let's make it 1.4 MiB (over budget alone).
+        // The store alone exceeds the 1 MiB pool budget.
         const auto dcp = dirA / "cache.dcp";
         const auto dci = dirA / "cache.dci";
         write_file(dcp, 700u * 1024, now - std::chrono::hours(1));
@@ -763,12 +761,35 @@ int main(int argc, char ** argv) {
 
         write_meta(dirA, fingerprint);
 
-        // pool used = 1.4 MiB > 1.2 MiB (120% of 1 MiB budget), no .dts candidates
-        // -> last-resort eviction should trigger
+        // The policy prunes .dpc/.dts entries but never deletes the append-only
+        // store files. The store can remain over budget until its own compaction.
         A.disk_prune_dpc(dirA.string(), nullptr);
 
-        check(!file_exists(dcp), "s9: .dcp deleted as last-resort eviction");
-        check(!file_exists(dci), "s9: .dci deleted as last-resort eviction");
+        check(file_exists(dcp), "s9: .dcp is retained by pool pruning");
+        check(file_exists(dci), "s9: .dci is retained by pool pruning");
+    }
+
+    if (only.empty() || only == "s10") {
+        fprintf(stderr, "\n== scenario 10: cache save outcome distinguishes RAM from queued disk ==\n");
+        const fs::path dir = root / "save-outcome";
+        fs::create_directories(dir);
+        const llama_tokens token_ids = { 1, 2, 3 };
+        server_prompt prompt;
+        prompt.tokens = server_tokens(token_ids, false);
+
+        server_prompt_cache ram_cache(4, 0);
+        auto * ram_state = ram_cache.alloc(prompt, 1024, 0);
+        check(ram_state != nullptr, "s10: RAM state allocated");
+        check(ram_cache.commit_disk_state(ram_state) == server_prompt_cache_save_result::stored_in_ram,
+              "s10: RAM state reports stored");
+
+        server_prompt_cache disk_cache(1, 0, 32);
+        disk_cache.load_disk_index(dir.string(), fingerprint);
+        auto * disk_state = disk_cache.alloc(prompt, 2u * 1024 * 1024, 0);
+        check(disk_state != nullptr, "s10: oversized state allocated for write-through");
+        check(disk_cache.commit_disk_state(disk_state) == server_prompt_cache_save_result::queued_to_disk,
+              "s10: write-through reports queue admission, not durable storage");
+        disk_cache.drain_disk_writes();
     }
 
     fs::remove_all(tmp, ec_tmp);

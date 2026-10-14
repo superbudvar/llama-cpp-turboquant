@@ -476,9 +476,9 @@ struct server_slot {
     // logged one time instead of on every request.
     mutable bool state_save_unsupported = false;
 
-    bool prompt_save(server_prompt_cache & prompt_cache) const {
+    server_prompt_cache_save_result prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0 || state_save_unsupported) {
-            return false;
+            return server_prompt_cache_save_result::not_stored;
         }
 
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
@@ -490,7 +490,7 @@ struct server_slot {
         if (cur_size_tgt == 0) {
             SRV_WRN("%s", "prompt cache disabled: this context cannot save KV cache state\n");
             state_save_unsupported = true;
-            return false;
+            return server_prompt_cache_save_result::not_stored;
         }
 
         const size_t cur_size = cur_size_tgt + cur_size_dft;
@@ -500,7 +500,7 @@ struct server_slot {
 
         auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
         if (cur == nullptr) {
-            return false;
+            return server_prompt_cache_save_result::not_stored;
         }
 
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
@@ -2382,13 +2382,17 @@ prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, 
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
+                const auto save_result = ret->prompt_save(*prompt_cache);
+                const bool saved = save_result == server_prompt_cache_save_result::stored_in_ram;
+                const bool loaded = ret->prompt_load(*prompt_cache, task.tokens);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                if (saved && !loaded) {
                     ret->prompt_clear();
                 }
 
-                prompt_cache->update();
+                if (saved || loaded) {
+                    prompt_cache->update();
+                }
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
@@ -3184,11 +3188,11 @@ prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, 
     // so a slot's spill file is stable across conversations and new spills of old
     // buffers simply truncate it
     std::string server_ckpt_spill_path_for(const server_slot & slot, const server_prompt_cache * cache) {
-        if (!cache || cache->disk_dir_.empty()) {
+        if (!cache || !cache->has_disk_tier()) {
             return "";
         }
         std::string slot_path = "ckpt-" + std::to_string(slot.id) + ".ccn";
-        return (std::filesystem::path(cache->disk_dir_) / slot_path).string();
+        return (std::filesystem::path(cache->disk_dir()) / slot_path).string();
     }
 
     // effective minimum spacing between context checkpoints.
@@ -3251,10 +3255,20 @@ prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, 
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
+        if (cur.empty()) {
+            SLT_WRN(slot, "dropping empty context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ") - context cannot serialize KV state\n",
+                    cur.pos_min, cur.pos_max, cur.n_tokens);
+            slot.prompt.checkpoints.pop_back();
+            if (!slot.prompt.checkpoint_spill_path.empty()) {
+                server_ckpt_spill_compact(slot.prompt, slot.prompt.checkpoint_spill_path);
+            }
+            return;
+        }
+
         // move the payload of the new checkpoint onto the disk tier when it is
         // active; the metadata (n_tokens/pos_min/pos_max) stays in RAM so the
         // eviction and restore logic is unchanged
-        if (prompt_cache && !prompt_cache->disk_dir_.empty()) {
+        if (prompt_cache && prompt_cache->has_disk_tier()) {
             if (slot.prompt.checkpoint_spill_path.empty()) {
                 slot.prompt.checkpoint_spill_path = server_ckpt_spill_path_for(slot, prompt_cache.get());
             }
@@ -3341,12 +3355,13 @@ prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, 
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
 
-                                if (slot.prompt_save(*prompt_cache)) {
+                                const bool saved = slot.prompt_save(*prompt_cache) == server_prompt_cache_save_result::stored_in_ram;
+                                if (saved) {
                                     SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
                                     prompt_cache->update();
                                 }
 
-                                if (params_base.kv_unified) {
+                                if (params_base.kv_unified && saved) {
                                     // [TAG_IDLE_SLOT_CLEAR]
                                     slot.prompt_clear();
                                 }

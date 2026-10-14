@@ -27,6 +27,24 @@
 #include <unistd.h>
 #include <vector>
 
+#ifdef TEST_WRAP_PWRITE
+#include <cerrno>
+#include <sys/types.h>
+
+static bool g_fail_next_pwrite = false;
+
+extern "C" ssize_t __real_pwrite(int fd, const void * buf, size_t count, off_t offset);
+extern "C" ssize_t __wrap_pwrite(int fd, const void * buf, size_t count, off_t offset);
+extern "C" ssize_t __wrap_pwrite(int fd, const void * buf, size_t count, off_t offset) {
+    if (g_fail_next_pwrite) {
+        g_fail_next_pwrite = false;
+        errno = EIO;
+        return -1;
+    }
+    return __real_pwrite(fd, buf, count, offset);
+}
+#endif
+
 namespace fs = std::filesystem;
 
 static int g_failures = 0;
@@ -991,6 +1009,40 @@ check(back.size() == cell.size() && memcmp(back.data(), cell.data(), cell.size()
         fclose(f);
     }
 
+    if (only.empty() || only == "s19") {
+        fprintf(stderr, "\n== s19: corrupt index is rejected and rebuilt ==\n");
+        const fs::path dir = tmp / "s19";
+        std::array<uint8_t, 32> fp{};
+        memcpy(fp.data(), "index-rebuild", 13);
+        {
+            prompt_cache_chunk_store cs;
+            check(cs.open(dir.string(), BASE), "s19: open");
+            const std::vector<uint8_t> payload(512, 0x5a);
+            const auto key = key_of(0, 0, 0, 1, 71);
+            check(cs.begin_commit(), "s19: begin");
+            const int64_t id = cs.put_chunk(key, payload.data(), payload.size());
+            prompt_cache_chunk_store::state_ref st;
+            st.fp = fp;
+            st.n_tokens = 32;
+            st.chunks = { (uint64_t) id };
+            check(cs.put_state(st), "s19: put state");
+            check(cs.commit(), "s19: commit");
+            cs.close();
+        }
+        {
+            std::fstream index(dir / "cache.dci", std::ios::binary | std::ios::in | std::ios::out);
+            index.seekp(32, std::ios::beg);
+            const uint32_t impossible_count = 0xffffffffu;
+            index.write((const char *) &impossible_count, sizeof(impossible_count));
+        }
+        prompt_cache_chunk_store reopened;
+        check(reopened.open(dir.string(), BASE), "s19: reopen after corrupt index");
+        prompt_cache_chunk_store::state_ref got;
+        check(reopened.get_state(fp, got), "s19: state recovered from authoritative log");
+        check(got.chunks.size() == 1, "s19: recovered chunk reference");
+        reopened.close();
+    }
+
     //  scenario 16: n_live == 0 triggers compact even when ratio gate is meaningless.
     //  compact_if_stale() must compact when all chunks are dead (n_dead > 0, n_live==0)
     //  even though n_dead*100/n_live would division-by-zero or 0*100/0 = 0 <= 35.
@@ -1421,8 +1473,9 @@ check(back.size() == cell.size() && memcmp(back.data(), cell.data(), cell.size()
         }
 
         const uint64_t last_access_written = 1720000000ull;
-        disk_write_token_index(s18tmp.string(), fp_hex,
-                              tokens, len_main, len_drft, ckpts, last_access_written);
+        check(disk_write_token_index(s18tmp.string(), fp_hex,
+                                     tokens, len_main, len_drft, ckpts, last_access_written),
+              "s18: sidecar publication succeeds");
 
         auto r = disk_read_token_index(dts_path.string());
         check(r.hdr.ok,             "s18: disk_read_token_index succeeded");
@@ -1456,6 +1509,58 @@ check(back.size() == cell.size() && memcmp(back.data(), cell.data(), cell.size()
         }
 
         fs::remove(dts_path, ec);
+    }
+
+    if (only.empty() || only == "s20") {
+        fprintf(stderr, "\n== s20: sidecar publication failure is reported ==\n");
+        const fs::path dir = tmp / "s20";
+        fs::create_directories(dir / "blocked.dts", ec_tmp);
+        const llama_tokens tokens;
+        const std::list<common_prompt_checkpoint> checkpoints;
+        check(!disk_write_token_index(dir.string(), "blocked", tokens, 0, 0, checkpoints),
+              "s20: rename collision reports failure");
+    }
+
+#ifdef TEST_WRAP_PWRITE
+    if (only.empty() || only == "s21") {
+        fprintf(stderr, "\n== s21: failed generation-header write aborts commit ==\n");
+        const fs::path dir = tmp / "s21";
+        prompt_cache_chunk_store cs;
+        check(cs.open(dir.string(), BASE), "s21: open");
+        check(cs.begin_commit(), "s21: begin");
+        const std::vector<uint8_t> payload(64, 0x31);
+        const auto key = key_of(0, 0, 0, 1, 83);
+        check(cs.put_chunk(key, payload.data(), payload.size()) >= 0, "s21: append chunk");
+        g_fail_next_pwrite = true;
+        check(!cs.commit(), "s21: failed header rewrite rejects commit");
+        check(!g_fail_next_pwrite, "s21: injected failure was consumed by header rewrite");
+        check(cs.generation() == 0, "s21: generation stays uncommitted");
+        cs.close();
+        prompt_cache_chunk_store reopened;
+        check(reopened.open(dir.string(), BASE), "s21: reopen");
+        check(reopened.get_stats().n_chunks == 0, "s21: aborted chunk is absent after reopen");
+        reopened.close();
+    }
+#endif
+
+    if (only.empty() || only == "s22") {
+        fprintf(stderr, "\n== s22: checkpoint spill round-trip ==\n");
+        const fs::path path = tmp / "s22.ccn";
+        common_prompt_checkpoint ckpt;
+        ckpt.n_tokens = 128;
+        ckpt.pos_min = 12;
+        ckpt.pos_max = 127;
+        ckpt.data_tgt = { 1, 2, 3, 4 };
+        ckpt.data_dft = { 5, 6, 7 };
+        ckpt.data_spec = { 8, 9 };
+        check(server_ckpt_spill_store(ckpt, path.string(), true) == 0, "s22: spill write succeeds");
+        check(ckpt.spilled(), "s22: payload is marked spilled");
+        check(ckpt.data_tgt.empty() && ckpt.data_dft.empty() && ckpt.data_spec.empty(), "s22: payload leaves RAM");
+        check(server_ckpt_spill_load(ckpt, path.string()), "s22: spill restore succeeds");
+        check(ckpt.data_tgt == std::vector<uint8_t>({ 1, 2, 3, 4 }), "s22: target payload restored");
+        check(ckpt.data_dft == std::vector<uint8_t>({ 5, 6, 7 }), "s22: draft payload restored");
+        check(ckpt.data_spec == std::vector<uint8_t>({ 8, 9 }), "s22: speculative payload restored");
+        check(!ckpt.spilled(), "s22: spill reference cleared after restore");
     }
 
     fs::remove_all(tmp, ec_tmp);

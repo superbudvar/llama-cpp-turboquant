@@ -680,6 +680,8 @@ public:
     static constexpr uint32_t DCP_MAGIC   = 0x54514331; // "TQC1"
     static constexpr uint32_t DCI_MAGIC   = 0x31494344; // "DCI1"
     static constexpr uint32_t FORMAT_VER  = 3;
+    // Independent, checksummed index snapshot version; older snapshots rescan DCP.
+    static constexpr uint32_t DCI_FORMAT_VER = 1;
 
     // TURBO_DISK_CHUNK_STORE=0 disables the store entirely (legacy .dpc writer,
     // one-pass rollback prune of store files at boot). read once per process.
@@ -920,7 +922,7 @@ struct disk_token_index_result {
 
 // full .dts v4 sidecar writer: header(40B) + tokens + ckpt_meta.
 // exposed for round-trip testing via test-chunk-store s16/s17/s18.
-void disk_write_token_index(const std::string & dir, const std::string & fp_hex,
+bool disk_write_token_index(const std::string & dir, const std::string & fp_hex,
                            const llama_tokens & tokens, uint64_t len_main, uint64_t len_drft,
                            const std::list<common_prompt_checkpoint> & checkpoints,
                            uint64_t last_access = 0);
@@ -944,27 +946,85 @@ struct server_prompt_cache_state {
     }
 };
 
-struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, size_t disk_max_mib = 0, size_t disk_store_mib = 0) {
+enum class server_prompt_cache_save_result {
+    not_stored,
+    stored_in_ram,
+    queued_to_disk,
+};
+
+// Owns persistent prompt-cache storage, its writer and vacuum threads.
+struct server_prompt_cache_disk {
+    server_prompt_cache_disk(size_t disk_max_mib, size_t disk_store_mib);
+    ~server_prompt_cache_disk();
+
+    struct disk_entry {
+        std::string fname;
+        std::string path;
+        server_tokens tokens;
+        size_t byte_size = 0;
+    };
+
+    struct disk_write_job {
+        enum class type { state, sidecar } kind = type::state;
+        std::unique_ptr<server_prompt_cache_state> state;
+        std::string dir;
+        std::string fingerprint;
+        std::string path;
+        std::vector<uint8_t> bytes;
+    };
+
+    const std::string & disk_dir() const { return disk_dir_; }
+    bool has_disk_tier() const { return !disk_dir_.empty(); }
+    bool save_to_disk(const std::string & dir, const std::string & fingerprint) const;
+    size_t load_disk_index(const std::string & dir, const std::string & fingerprint);
+    server_prompt_cache_save_result commit_disk_state(server_prompt_cache_state * state);
+    bool enqueue_sidecar(const std::string & path, std::vector<uint8_t> bytes);
+    void drain_disk_writes();
+    void prune_disk_budget(const std::string & dir, uint64_t min_free = 0) const;
+    void disk_prune_dpc(const std::string & dir, std::vector<std::array<uint8_t, 32>> * evicted = nullptr, uint64_t min_free = 0) const;
+    void prune_pool(const std::string & root, const std::string & own_dir, bool include_own_ccn,
+                    std::vector<std::array<uint8_t, 32>> * evicted = nullptr, uint64_t min_free = 0) const;
+
+protected:
+    size_t disk_max_size = 0;
+    size_t disk_max_store_size = 0;
+    std::vector<disk_entry> disk_entries;
+    bool disk_index_valid = false;
+    std::unique_ptr<server_prompt_cache_state> disk_state_;
+    std::string disk_dir_;
+    std::string disk_fingerprint_;
+    std::unique_ptr<prompt_cache_chunk_store> disk_store_;
+    std::mutex disk_store_mtx_;
+    std::mutex disk_index_mtx_;
+    mutable bool disk_no_limit_warned_ = false;
+
+private:
+    bool disk_store_write(disk_write_job & job, const llama_tokens & tokens);
+    void start_disk_thread();
+    void disk_thread_main();
+    void disk_run_state_job(disk_write_job & job);
+    void disk_run_sidecar_job(disk_write_job & job);
+    void start_vacuum_thread();
+    void vacuum_sweep_all();
+    std::thread disk_thread_;
+    std::mutex disk_jobs_mtx_;
+    std::condition_variable disk_jobs_cv_;
+    std::deque<disk_write_job> disk_jobs_;
+    bool disk_thread_stop_ = false;
+    std::thread vacuum_thread_;
+    std::mutex vacuum_mtx_;
+    std::condition_variable vacuum_cv_;
+    std::atomic<bool> vacuum_stop_{false};
+};
+
+struct server_prompt_cache : server_prompt_cache_disk {
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, size_t disk_max_mib = 0, size_t disk_store_mib = 0)
+        : server_prompt_cache_disk(disk_max_mib, disk_store_mib) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
-        this->disk_max_size = 1024ull*1024ull*disk_max_mib;
-        // knob B: a .dcp store may use at most this many bytes before prune_pool
-        // evicts its own .dts sidecars first. defaults to 60% of the pool budget;
-        // 0 disables the store-cap pass (only the shared-pool budget applies).
-        this->disk_max_store_size = disk_store_mib > 0 ? 1024ull*1024ull*disk_store_mib
-                                                       : (this->disk_max_size * 6) / 10;
-        start_vacuum_thread();
     }
 
-    ~server_prompt_cache() {
-        drain_disk_writes();
-        if (vacuum_thread_.joinable()) {
-            vacuum_stop_.store(true, std::memory_order_relaxed);
-            vacuum_cv_.notify_one();
-            vacuum_thread_.join();
-        }
-    }
+    ~server_prompt_cache() = default;
 
     std::list<server_prompt_cache_state> states;
 
@@ -973,46 +1033,6 @@ struct server_prompt_cache {
 
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
-
-    // decoupled disk tier.
-    // the disk is an independent pool: it is indexed at load time (tokens + sizes
-    // only, no KV blobs in RAM) and entries are kept after they leave the RAM tier,
-    // so the disk capacity is not tied to the --cache-ram budget. a RAM load miss
-    // searches the disk index and either promotes the entry into the RAM tier (when
-    // it fits the budget) or restores it directly from disk.
-    struct disk_entry {
-        std::string fname;
-        std::string path;
-        server_tokens tokens;
-        size_t byte_size = 0;
-    };
-
-    // in bytes, 0 = no limit
-    size_t disk_max_size = 0;
-
-    // knob B: bytes a .dcp store may use before prune_pool evicts its own
-    // .dts sidecars first (defaults to 60% of disk_max_size); 0 = no store-cap
-    size_t disk_max_store_size = 0;
-
-    std::vector<disk_entry> disk_entries;
-    bool disk_index_valid = false;
-
-    // write-through scratch for a state too large for the RAM budget: it is
-    // committed to the disk pool immediately after the caller fills in the KV
-    // data and is never held in the RAM tier
-    std::unique_ptr<server_prompt_cache_state> disk_state_;
-
-    // disk location + fingerprint for in-run write-through and index updates
-    std::string disk_dir_;
-    std::string disk_fingerprint_;
-
-    // chunk store writer (cache.dcp): opened lazily on the disk writer thread
-    // and owned by the pool for its whole run. when it is open and the state
-    // blob is sliceable, write-through states bypass the .dpc writer entirely.
-    // disk_store_mtx_ guards the first open only (a reader-thread restore may
-    // race the writer's first save); per-call ops take the store's own io_mtx_.
-    std::unique_ptr<prompt_cache_chunk_store> disk_store_;
-    std::mutex disk_store_mtx_;
 
     size_t size() const;
 
@@ -1032,97 +1052,11 @@ struct server_prompt_cache {
 
     void update();
 
-    // persist/restore the cache to a directory of <sha256-of-tokens>.dpc files.
-    // save_to_disk writes a meta file carrying the caller-provided fingerprint and
-    // enforces the independent disk budget (oldest-mtime entries are removed first);
-    // it does not delete entries that left the in-memory cache.
-    // load_disk_index builds the token-only index of entries that match the stored
-    // fingerprint, without reading any KV blobs into RAM.
-    bool save_to_disk(const std::string & dir, const std::string & fingerprint) const;
-    size_t load_disk_index(const std::string & dir, const std::string & fingerprint);
-
-    // commit a single state to the disk pool immediately (write-through); a no-op
-    // for states that are not the pending disk scratch
-    bool commit_disk_state(server_prompt_cache_state * state);
-
-    // background disk writer: all disk I/O from commit_disk_state and slot save
-    // sidecars is serialized here so the decode loop never blocks on storage.
-    // the writer owns all .dpc files, metadata, and sidecar writes; the main
-    // thread owns .ccn spill files (create/rehydrate/compact).
-    struct disk_write_job {
-        enum class type { state, sidecar } kind = type::state;
-
-        // kind == state: write-through .dpc + prune .dpc + index update + meta
-        std::unique_ptr<server_prompt_cache_state> state;
-        std::string dir;
-        std::string fingerprint;
-
-        // kind == sidecar: slot checkpoint sidecar (.ckpt)
-        std::string path;
-        std::vector<uint8_t> bytes;
-    };
-
-    // enqueue a slot checkpoint sidecar write (bytes already serialized)
-    bool enqueue_sidecar(const std::string & path, std::vector<uint8_t> bytes);
-
-    // drain the writer queue and stop the background thread; no-op when idle
-    void drain_disk_writes();
-
-    // chunk-store write-through for one state job; returns true only when the
-    // batch committed durably. fails (and leaves the job untouched) when the
-    // state is not sliceable or the store cannot take it
-    bool disk_store_write(disk_write_job & job, const llama_tokens & tokens);
-
-    // enforce the shared pool budget by oldest-mtime eviction; iterates every
-    // preset dir under the cache root. .ccn files of foreign dirs are never
-    // selected nor counted (they belong to the owning worker). only touches the
-    // filesystem, the in-memory index is synced by the (non-const) callers
-    void prune_disk_budget(const std::string & dir, uint64_t min_free = 0) const;
-
-    // prune .dpc files only (writer thread); .ccn are budgeted at exit.
-    // when evicted is non-null, fingerprints of evicted .dts files are appended
-    // so the caller can drop them from the chunk store.
-    // min_free > 0 additionally evicts oldest .dpc/.dts until the volume has at
-    // least that many free bytes, even when the pool is under its budget.
-    void disk_prune_dpc(const std::string & dir, std::vector<std::array<uint8_t, 32>> * evicted = nullptr, uint64_t min_free = 0) const;
-
-    // shared pool prune: root is the cache root holding one dir per preset;
-    // own_dir is this worker's dir. include_own_ccn lets the exit-time budget
-    // still count this worker's own .ccn spill. min_free > 0 adds the
-    // free-space eviction pass (see disk_prune_dpc).
-    void prune_pool(const std::string & root, const std::string & own_dir, bool include_own_ccn,
-                    std::vector<std::array<uint8_t, 32>> * evicted = nullptr, uint64_t min_free = 0) const;
-
 private:
     bool restore_state(server_prompt & prompt, server_prompt_cache_state & state, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     bool load_from_disk_tier(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
-    // background writer thread lifecycle
-    void start_disk_thread();
-    void disk_thread_main();
-    void disk_run_state_job(disk_write_job & job);
-    void disk_run_sidecar_job(disk_write_job & job);
-
-    std::thread disk_thread_;
-    std::mutex  disk_jobs_mtx_;
-    std::condition_variable disk_jobs_cv_;
-    std::deque<disk_write_job> disk_jobs_;
-    bool disk_thread_stop_ = false;
-
-    // vacuum thread: sweeps all model cache dirs every 5 min and compacts .dcp stores
-    void start_vacuum_thread();
-    void vacuum_sweep_all();
-    std::thread vacuum_thread_;
-    std::mutex vacuum_mtx_;
-    std::condition_variable vacuum_cv_;
-    std::atomic<bool> vacuum_stop_{false};
-
-    // guards disk_entries and disk_index_valid between the loop thread and the writer
-    std::mutex disk_index_mtx_;
-
-    // set once a 0-budget worker sees a non-empty shared root (warn, no assert)
-    mutable bool disk_no_limit_warned_ = false;
 };
 
 // used exclusively by router mode

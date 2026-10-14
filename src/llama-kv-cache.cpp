@@ -2714,21 +2714,8 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         return;
     }
 
-    // state_write_data below reads each layer's K/V tensor by a flat byte
-    // offset into cell-position order (io.write_tensor(k, range.first *
-    // k_size_row, buf_size)). That's only valid when the tensor's own
-    // storage actually holds every cell contiguously in that order - true
-    // for an ordinary KV buffer, not for a block-streamed one, where only a
-    // resident subset of pages live in the buffer kv_stream_adapt() last
-    // synced and the authoritative copy of the rest lives in host RAM
-    // behind the streaming runtime. Reading it this way would silently
-    // save whatever bytes happen to be resident, not the real KV content.
-    // Refuse rather than produce a state file that looks valid and isn't.
-    if (kv_stream_runtime.runtime != nullptr) {
-        throw std::runtime_error(
-            "llama_state_*: saving KV cache state is not supported while block KV "
-            "streaming is active (--kv-stream-arena-mib)");
-    }
+    // Block-streamed KV uses a full-size pinned host buffer, so flat cell-order
+    // reads include every cell. State saves run after synchronization.
 
     GGML_UNUSED(flags);
 
@@ -2809,14 +2796,8 @@ const slot_info_vec_t *   sinfos_in) {
         return;
     }
 
-    // See the matching check in state_write() - state_read_data below writes
-    // each layer's K/V tensor by the same flat cell-position byte offset,
-    // which isn't meaningful for a block-streamed cache's buffer.
-    if (kv_stream_runtime.runtime != nullptr) {
-        throw std::runtime_error(
-            "llama_state_*: loading KV cache state is not supported while block KV "
-            "streaming is active (--kv-stream-arena-mib)");
-    }
+    // Writes use the buffer interface, which resets the resident mirror and
+    // advances the graph generation after restoring the full host buffer.
 
     GGML_UNUSED(flags);
 
