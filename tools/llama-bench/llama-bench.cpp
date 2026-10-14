@@ -2574,7 +2574,7 @@ int llama_bench(int argc, char ** argv) {
             // the bench doesn't use a full common_params, so pass a default-constructed
             // one. write_cache=false: bench results are not real production fits and
             // must not pollute the fit cache.
-            static const common_params bench_default_params{};
+            static const common_params bench_default_params;
             const common_params_fit_status fit_status = common_fit_params(
                 bench_default_params,
                 inst.model.c_str(), &mparams, &cparams,
