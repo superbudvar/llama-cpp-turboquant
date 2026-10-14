@@ -2858,6 +2858,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         LLAMA_EXAMPLE_FIT_PARAMS,
     }).set_env("LLAMA_ARG_FIT_STRATEGY_MIN_CTX"));
     add_opt(common_arg(
+        {"--fit-max-attempts"}, "N",
+        string_format("maximum measured probes without improving a feasible --fit-strategy plan (default: %" PRIu32 ", 0 = unlimited)",
+            params.fit_max_attempts),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--fit-max-attempts must be zero or positive");
+            }
+            params.fit_max_attempts = (uint32_t) value;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_FIT_PARAMS })
+     .set_env("LLAMA_ARG_FIT_MAX_ATTEMPTS"));
+    add_opt(common_arg(
         {"--fit-cache-clear"},
         "discard the disk fit result cache for this model before fitting, forcing a fresh probe suite",
         [](common_params & params) {

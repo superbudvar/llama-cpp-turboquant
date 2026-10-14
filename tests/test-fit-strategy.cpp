@@ -393,6 +393,8 @@ static void test_cache_partial_hit() {
     // missing file by emitting size=-1 / mtime=-1. The temp dir under
     // LLAMA_FIT_CACHE keeps this test from touching the user's real cache.
     const std::string tmp_root = "/tmp/opencode/fit-cache-test";
+    const char * old_cache = std::getenv("LLAMA_FIT_CACHE");
+    const std::string old_cache_value = old_cache ? old_cache : "";
     std::error_code ec;
     fs::remove_all(tmp_root, ec);
     fs::create_directories(tmp_root, ec);
@@ -439,6 +441,13 @@ static void test_cache_partial_hit() {
     common_fit_plan plan_tampered;
     expect(!common_fit_cache_load(params, "/nonexistent/other-model.gguf", analysis, plan_tampered),
             "cache_load must refuse a tampered path_model key");
+
+    if (old_cache) {
+        setenv("LLAMA_FIT_CACHE", old_cache_value.c_str(), 1);
+    } else {
+        unsetenv("LLAMA_FIT_CACHE");
+    }
+    fs::remove_all(tmp_root, ec);
 }
 
 static void test_grow_fill_headroom() {
@@ -532,8 +541,9 @@ static void test_rpc_aware_placement() {
     llama_context_params cparams = common_context_params_to_llama(params);
     fake_probe_ctx cfg;
     cfg.default_dev = { (int64_t) (16 * GiB), (int64_t) (16 * GiB), (size_t) (64 * MiB), (size_t) (32 * MiB), 0 };
+    common_fit_search_session search_session;
     const common_params_fit_status st = common_fit_strategy_apply_impl(
-            params, &mparams, &cparams, nullptr, make_probe(&cfg));
+            params, &mparams, &cparams, nullptr, make_probe(&cfg), nullptr, &search_session);
     expect(st == COMMON_PARAMS_FIT_STATUS_SUCCESS,
             "rpc-aware must fit on local devices without aborting");
     expect(mparams.n_gpu_layers == 7, "rpc-aware must offload all layers to the local device");
@@ -544,6 +554,9 @@ static void test_rpc_aware_placement() {
             "candidate and final fit validation must use the no-allocation measurement");
     expect(cfg.actual_measure_calls == 0,
             "fit search must not allocate the full candidate model before selection");
+    expect(search_session.has_incumbent && search_session.fit_key != 0 &&
+           search_session.incumbent.n_ctx == (int32_t) cparams.n_ctx,
+            "fit search session retains the validated incumbent for MTP preflight iterations");
 }
 
 static void test_rpc_aware_uses_no_alloc_probes() {
@@ -664,8 +677,8 @@ static void test_exception_classification() {
         test_skip("no model available");
         return;
     }
-    // soft reject: the confirmation measure cannot create a context, the
-    // engine falls back to the measured floor plan and still succeeds
+    // soft reject: one context probe cannot create a context; the engine treats
+    // it as a non-fit bound and continues searching for a larger safe context
     common_params params;
     params.fit_strategy = COMMON_FIT_STRATEGY_MAXCTX;
     params.fit_strategy_min_ctx = 1024;
@@ -677,7 +690,7 @@ static void test_exception_classification() {
     cfg.default_dev = { (int64_t) (16 * GiB), (int64_t) (16 * GiB), (size_t) (64 * MiB), (size_t) (32 * MiB), 0 };
     // call 1: upper context misses the 1 GiB margin
     // call 2: floor context fits
-    // call 3: interpolated confirmation soft-rejects -> fall back to the floor
+    // call 3: an interpolated context soft-rejects; later probes use default_dev
     cfg.actions = { 0, 0, 1 };
     cfg.dev_data = {
         { (int64_t) (16 * GiB), (int64_t) (16 * GiB), (size_t) (8 * GiB), (size_t) (7680 * MiB), 0 },
@@ -688,9 +701,11 @@ static void test_exception_classification() {
             params, &mparams, &cparams, nullptr, make_probe(&cfg));
     expect(st == COMMON_PARAMS_FIT_STATUS_SUCCESS,
             "a soft reject must be recovered, not surfaced as an error");
-    expect(cparams.n_ctx == 1024, "the soft-reject fallback must use the floor context");
+    expect((int32_t) cparams.n_ctx > params.fit_strategy_min_ctx &&
+           (int32_t) cparams.n_ctx < params.n_ctx,
+            "the soft-reject search must continue above the floor without exceeding the cap");
     expect(cfg.soft_rejects >= 1, "the soft reject must have been exercised");
-    expect(cfg.n_calls == 4, "solve (3) plus the final validation measure");
+    expect(cfg.n_calls >= 5, "the solver must probe again after a soft reject and validate the selected plan");
 
     // hard error: any other runtime_error escapes to the outer contract as ERROR
     common_params params2;
@@ -1183,10 +1198,23 @@ int main(int argc, char ** argv) {
         if (!filter.empty() && std::string(t.name).find(filter) == std::string::npos) {
             continue;
         }
+        const char * old_cache = std::getenv("LLAMA_FIT_CACHE");
+        const std::string old_cache_value = old_cache ? old_cache : "";
+        const std::string test_cache = std::string("/tmp/opencode/fit-strategy-tests/") + t.name;
+        std::error_code ec;
+        fs::remove_all(test_cache, ec);
+        fs::create_directories(test_cache, ec);
+        setenv("LLAMA_FIT_CACHE", test_cache.c_str(), 1);
         g_skipped = false;
         g_skip_reason.clear();
         const int before = failures;
         t.fn();
+        if (old_cache) {
+            setenv("LLAMA_FIT_CACHE", old_cache_value.c_str(), 1);
+        } else {
+            unsetenv("LLAMA_FIT_CACHE");
+        }
+        fs::remove_all(test_cache, ec);
         if (g_skipped) {
             std::printf("SKIP: %s (%s)\n", t.name, g_skip_reason.c_str());
             continue;

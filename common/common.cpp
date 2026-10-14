@@ -1632,24 +1632,11 @@ void common_init_result::update_fit_delta(
             info.link_latency_us = 0;
             analysis.devices.push_back(info);
         }
-        std::string cache_path;
-        bool refreshed = common_fit_cache_refresh_deltas(
-                pimpl->params, pimpl->model_path, analysis, pimpl->delta_free_ema, &cache_path);
-        // Also save the full plan with model_size_error so next load has the margin correction.
-        // Pass the path that refresh_deltas wrote to so we update the SAME file, avoiding
-        // directory-scan path mismatch when multiple cache entries exist.
-        if (refreshed && !cache_path.empty() && !pimpl->projected_free.empty() && !pimpl->model_size_error.empty()) {
-            common_fit_plan plan;
-            const bool saved = common_fit_cache_save_with_model_size_error(
-                    pimpl->params, pimpl->model_path, plan,
-                    pimpl->projected_free, pimpl->model_size_error,
-                    pimpl->ceiling_free_warm, &cache_path);
-            LOG_INF("%s: discrepancy feedback cache save %s: %s\n", __func__,
-                    saved ? "succeeded" : "failed", cache_path.c_str());
-        } else {
-            LOG_WRN("%s: discrepancy feedback was not persisted (fit-plan cache entry unavailable)\n", __func__);
-        }
-        (void)refreshed;
+        const bool saved = common_fit_cache_update_feedback(
+                pimpl->params, pimpl->model_path, analysis, pimpl->delta_free_ema,
+                projected_free_settled, pimpl->model_size_error, pimpl->ceiling_free_warm);
+        LOG_INF("%s: discrepancy feedback cache update %s for %s\n", __func__,
+                saved ? "succeeded" : "failed", pimpl->model_path.c_str());
     }
 }
 

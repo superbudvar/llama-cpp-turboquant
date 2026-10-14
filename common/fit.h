@@ -85,56 +85,8 @@ void common_fit_print(
 
 void common_memory_breakdown_print(const llama_context * ctx);
 
-struct common_device_memory_data {
-    int64_t total;
-    int64_t free;
-    size_t  model;
-    size_t  context;
-    size_t  compute;
-};
-
-using common_device_memory_data_vec = std::vector<common_device_memory_data>;
-
-// Load a model + context with real model buffers and return the per-device memory breakdown.
-common_device_memory_data_vec common_get_device_memory_data(
-                         const char * path_model,
-           const llama_model_params * mparams,
-         const llama_context_params * cparams,
-    std::vector<ggml_backend_dev_t> & devs,
-                           uint32_t & hp_ngl,
-                           uint32_t & hp_n_ctx_train,
-                           uint32_t & hp_n_expert,
-                      ggml_log_level   log_level);
-
-// Dry-run the requested tensor placement without allocating model-weight buffers.
-// Context and compute buffers are still measured through context initialization.
-common_device_memory_data_vec common_get_device_memory_data_no_alloc(
-                         const char * path_model,
-           const llama_model_params * mparams,
-         const llama_context_params * cparams,
-    std::vector<ggml_backend_dev_t> & devs,
-                           uint32_t & hp_ngl,
-                           uint32_t & hp_n_ctx_train,
-                           uint32_t & hp_n_expert,
-                     ggml_log_level   log_level);
-
 // Record the post-warmup per-device VRAM overhead for model_path into the fit
 // stats cache (see fit-stats.h). Call once after the context is fully warmed
 // up, when true RSS (weights faulted, draft model + graph scratch allocated)
 // is known. Safe to call on every load; cheap (no allocation).
 void common_fit_record_stats(const std::string & model_path, const struct llama_context * ctx);
-
-// Load a parent model + context with no_alloc, then return the per-device memory breakdown of a child model + context.
-common_device_memory_data_vec common_get_device_memory_data_with_parent(
-                         const char * path_model,
-           const llama_model_params * mparams,
-         const llama_context_params * cparams,
-                         const char * path_parent,
-           const llama_model_params * mparams_parent,
-         const llama_context_params * cparams_parent,
-    std::vector<ggml_backend_dev_t> & devs,
-                           uint32_t & hp_ngl,
-                           uint32_t & hp_n_ctx_train,
-                      uint32_t & hp_n_expert,
-                      ggml_log_level   log_level,
-                               bool   no_alloc_child = false);

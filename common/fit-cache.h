@@ -15,13 +15,16 @@
 // Per-model entries are <sha256-of-key>.bin, written atomically (tmp+rename).
 //
 // Cache file format (little-endian):
-//   header (32 bytes):
+//   header (28 bytes):
 //     u32 magic      = 0x46495443 ("FITC")
-//     u32 version    = 1
+//     u32 version    = current writer version
 //     u64 key_hash   = first 8 bytes of the key SHA-256
 //     i64 timestamp  = unix seconds of the last successful fit
 //     u32 body_size
-//   body (per plan, S3 format):
+//   body: fit plan followed by versioned feedback and search-progress fields.
+//   Readers accept versions 6 through the current writer version; missing
+//   search-progress fields default to a completed search.
+//   Base fit plan:
 //     i32 n_roles
 //     i32 role_devices[n_roles]
 //     i32 n_gpu_layers
@@ -29,6 +32,7 @@
 //     f32 tensor_split[tensor_split_len]
 //     i32 n_ctx
 //     u64 pool_grant_mib
+//   Later versions append shed tags, feedback, ceilings, and RPC search state.
 //
 // The serialized plan carries no tensor_buft_overrides: the solvers never
 // populate them (only the synthetic manual-plan test path does), so cached
@@ -65,12 +69,8 @@ bool common_fit_cache_save(
         const common_fit_plan & plan,
         uint64_t override_key = 0);
 
-// Refresh just the delta_free_ema field in the exact matching cache entry.
-// Called after MODEL READY: update_fit_delta() has computed the new EMA but
-// the cache was already saved (before projected_free existed). This patches
-// the delta into the existing cache so the NEXT load applies it.
-// Never scans or patches another configuration's cache entry. Returns false if
-// no matching entry exists or refresh fails (non-fatal).
+// Refresh only delta_free_ema in the exact matching cache entry. Returns false
+// if the entry is unavailable or the atomic rewrite fails.
 bool common_fit_cache_refresh_deltas(
         const common_params & params,
         const std::string & path_model,
@@ -78,13 +78,13 @@ bool common_fit_cache_refresh_deltas(
         const std::vector<int64_t> & delta_free_ema,
         std::string * cache_path_out = nullptr);
 
-// Save/update the exact cache entry with projected_free and discrepancy data
-// after MODEL READY. The ceiling field is retained for cache compatibility.
-bool common_fit_cache_save_with_model_size_error(
+// Update all post-load feedback in one atomic cache rewrite. Search progress is
+// preserved from the validated entry.
+bool common_fit_cache_update_feedback(
         const common_params & params,
         const std::string & path_model,
-        const common_fit_plan & plan,
+        const common_fit_analysis & analysis,
+        const std::vector<int64_t> & delta_free_ema,
         const std::vector<int64_t> & projected_free,
         const std::vector<int64_t> & model_size_error,
-        const std::vector<int64_t> & ceiling_free_warm,
-        const std::string * cache_path = nullptr);
+        const std::vector<int64_t> & ceiling_free_warm);

@@ -380,6 +380,20 @@ printf("test-arg-parser: test fit-strategy flags\n\n");
         assert(fit_params.fit_strategy_min_ctx == 1024);
     }
 
+    // fit-max-attempts accepts a non-negative probe budget
+    {
+        common_params fit_params;
+        argv = {"binary_name", "-m", "model.gguf", "--fit-strategy", "rpc-aware",
+                "--fit-strategy-min-ctx", "1024", "--fit-max-attempts", "7"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), fit_params, LLAMA_EXAMPLE_CLI));
+        assert(fit_params.fit_max_attempts == 7);
+    }
+    {
+        common_params fit_params;
+        argv = {"binary_name", "--fit-max-attempts", "-1"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), fit_params, LLAMA_EXAMPLE_CLI));
+    }
+
     // no-fit-tool-ignore: the original plan called for a 5th case testing
 // that tokenize / batched-bench / export-lora accept --fit-strategy
 // but ignore it (per common/arg.cpp:1275-1285 comment). The premise

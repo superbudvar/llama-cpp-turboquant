@@ -10,6 +10,7 @@ sets the context floor for the strategies that need one.
 | --- | --- | --- |
 | `--fit-strategy` | `upstream` \| `rpc-aware` \| `maxctx` | Fit engine to use. Default `upstream` (stock byte-identical fit). |
 | `--fit-strategy-min-ctx` | int | Context floor the strategy must reach. Required for `rpc-aware` and `maxctx`. |
+| `--fit-max-attempts` | int | Maximum measured probes without improving a safe `rpc-aware` plan. Default `32`; `0` disables the limit. |
 | `--fit-probe-ceiling` | bool | Reuse a cached ceiling if present. Active allocation-to-OOM probes are disabled for safety. |
 
 Rules:
@@ -66,6 +67,11 @@ weights are placed, selected by interconnect quality. Rules:
 - The first candidate that reaches the absolute context cap with all margins
   satisfied is accepted immediately. If no candidate reaches the cap, the solver
   compares candidates and keeps the largest margin-valid context.
+- Once a margin-valid plan exists, `--fit-max-attempts` bounds further no-improvement
+  probes. At the limit the best safe plan is loaded, and its search cursor is cached
+  so a later load can continue. The cached plan is remeasured against current device
+  memory before it is reused; a changed baseline restarts the search. If no safe plan
+  is found, fitting does not fall back to an unreserved plan.
 - `--fit-target` values follow model-device order. Logs name each device and its
   effective margin; do not assume the first value is the local GPU when RPC is
   enumerated first.

@@ -1544,6 +1544,7 @@ private:
                         std::vector<size_t> reserve_max(base_margins.size(), 0);
                         common_fit_plan previous_plan;
                         bool have_previous_plan = false;
+                        common_fit_search_session fit_search_session;
                         bool converged = false;
                         constexpr size_t max_iterations = 4;
 
@@ -1555,11 +1556,13 @@ private:
                                 }
                                 params_prefit.fit_params_target[i] = base_margins[i] + reserve_max[i];
                             }
+                            params_prefit.fit_cache_defer_save = true;
                             llama_model_params mparams_prefit = common_model_params_to_llama(params_prefit);
                             llama_context_params cparams_prefit = common_context_params_to_llama(params_prefit);
                             common_fit_plan plan_prefit;
                             const common_params_fit_status fit_status = common_fit_strategy_apply(
-                                    params_prefit, &mparams_prefit, &cparams_prefit, nullptr, &plan_prefit);
+                                    params_prefit, &mparams_prefit, &cparams_prefit, nullptr, &plan_prefit,
+                                    &fit_search_session);
                             if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
                                 throw std::runtime_error("no safe target placement is available for MTP preflight");
                             }

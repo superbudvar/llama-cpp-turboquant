@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "fit.h"
+#include "fit-probe.h"
 
 #include <functional>
 #include <string>
@@ -12,7 +13,7 @@
 //
 // MEASUREMENT-IS-THE-ORACLE: every allocation-affecting param is serialized
 // into candidate mparams/cparams and measured with common_get_device_memory_data
-// (fit.h:96), not modeled. The probe seam below lets synthetic tests override
+// (fit-probe.h), not modeled. The probe seam below lets synthetic tests override
 // the measurement itself.
 
 enum common_fit_role {
@@ -60,6 +61,20 @@ struct common_fit_analysis {
     uint32_t n_ctx_train = 0;
 };
 
+struct common_fit_search_progress {
+    bool complete = true;
+    uint32_t policy_version = 0;
+    int32_t shed_level = 0;
+    int32_t candidate_cursor = 0;
+    int32_t best_split_size = 0;
+    float best_rpc_frac = -1.0f;
+    std::vector<int64_t> baseline_free;
+    int32_t rpc_stage = 0;
+    float rpc_frac_next = -1.0f;
+    float rpc_frac_low = -1.0f;
+    float rpc_frac_high = -1.0f;
+};
+
 struct common_fit_plan {
     // explicit per-role device assignment (device ids from common_fit_analysis.devices)
     std::vector<int> role_devices; // indexed by common_fit_role
@@ -99,9 +114,17 @@ struct common_fit_plan {
     // this is the dominant component of delta_free_ema but converges slowly via EMA.
     // storing it directly avoids the multi-load convergence lag. version 5+: cached.
     std::vector<int64_t> model_size_error;
+    common_fit_search_progress search;
 };
 
-// Measure seam: mirrors the common_get_device_memory_data signature (fit.h:96).
+struct common_fit_search_session {
+    size_t probes_without_improvement = 0;
+    bool has_incumbent = false;
+    uint64_t fit_key = 0;
+    common_fit_plan incumbent;
+};
+
+// Measure seam: mirrors the common_get_device_memory_data signature (fit-probe.h).
 // The public apply() uses the real function; synthetic tests override it.
 using common_fit_measure_fn = std::function<common_device_memory_data_vec(
     const char * path_model,
@@ -127,7 +150,8 @@ common_params_fit_status common_fit_strategy_apply(
         llama_model_params * mparams,
         llama_context_params * cparams,
         const common_fit_plan * plan = nullptr,
-        common_fit_plan * plan_out = nullptr);
+        common_fit_plan * plan_out = nullptr,
+        common_fit_search_session * search_session = nullptr);
 
 // Internal overload with an injectable measure seam (used by tests).
 common_params_fit_status common_fit_strategy_apply_impl(
@@ -136,7 +160,8 @@ common_params_fit_status common_fit_strategy_apply_impl(
         llama_context_params * cparams,
         const common_fit_plan * plan,
         const common_fit_probe & probe,
-        common_fit_plan * plan_out = nullptr);
+        common_fit_plan * plan_out = nullptr,
+        common_fit_search_session * search_session = nullptr);
 
 // Bounded MoE pool budget. user_budget_mib != 0 wins.
 // Else: min(clamp(remaining/2, max(2*working_set, 256 MiB), 4 GiB), remaining).
