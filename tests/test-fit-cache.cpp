@@ -94,6 +94,21 @@ int main() {
     check(hit, "identical config hits the cache");
     check(hit && plan_equal(plan, loaded), "loaded plan matches the saved plan");
 
+    common_params params_external_mtp = params;
+    params_external_mtp.skip_infile_mtp = true;
+    common_fit_plan replacement_plan = make_plan();
+    replacement_plan.n_ctx = 49152;
+    check(common_fit_cache_save(params_external_mtp, model_path, analysis, replacement_plan),
+            "save a fit that skips target in-file MTP tensors");
+    common_fit_plan replacement_loaded;
+    check(common_fit_cache_load(params_external_mtp, model_path, analysis, replacement_loaded) &&
+          replacement_loaded.n_ctx == replacement_plan.n_ctx,
+            "replacement-MTP cache configuration hits its own plan");
+    common_fit_plan base_plan_still_loaded;
+    check(common_fit_cache_load(params, model_path, analysis, base_plan_still_loaded) &&
+          base_plan_still_loaded.n_ctx == plan.n_ctx,
+            "in-file-MTP and external-MTP replacement plans use separate cache entries");
+
     common_params params_other = params;
     params_other.fit_strategy = COMMON_FIT_STRATEGY_MAXCTX;
     common_fit_plan other_plan = make_plan();

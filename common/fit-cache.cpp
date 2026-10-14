@@ -379,6 +379,9 @@ key += "model=";
         key += "none";
     }
     key += "\n";
+    if (params.skip_infile_mtp) {
+        key += "skip_infile_mtp=1\n";
+    }
     key += "mmproj=";
     if (!params.mmproj.empty() && !params.no_mmproj) {
         key += params.mmproj.path;

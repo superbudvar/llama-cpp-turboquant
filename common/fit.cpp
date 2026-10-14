@@ -562,9 +562,11 @@ common_device_memory_data_vec common_get_device_memory_data_with_parent(
         throw std::runtime_error("failed to create parent llama_context");
     }
 
+    per_device_layer_costs child_costs;
     std::vector<llama_device_memory_data> impl = common_get_device_memory_data_impl(
             path_model, mparams, cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert,
-            log_level, nullptr, ctx_parent.get(), nullptr, no_alloc_child);
+            log_level, nullptr, ctx_parent.get(), nullptr, no_alloc_child,
+            no_alloc_child ? &child_costs : nullptr);
 
     common_device_memory_data_vec ret(impl.size());
     for (size_t i = 0; i < impl.size(); i++) {

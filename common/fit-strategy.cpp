@@ -1821,6 +1821,14 @@ common_params_fit_status common_fit_strategy_apply_impl(
         } else {
             // manual plan: measure it once, a conflict is a hard error
             final_plan = *plan;
+            const std::vector<int64_t> & cached_correction = !final_plan.delta_free_ema.empty()
+                ? final_plan.delta_free_ema : final_plan.model_size_error;
+            for (size_t id = 0; id < margins.size() && id < cached_correction.size(); id++) {
+                const int64_t adjusted = margins[id] - cached_correction[id];
+                margins[id] = params.fit_params_no_context_reserve
+                    ? std::max<int64_t>(0, adjusted)
+                    : std::max<int64_t>(context_reserve, adjusted);
+            }
             for (int id : final_plan.role_devices) {
                 if (id >= (int) analysis.devices.size()) {
                     throw std::runtime_error("manual plan references unknown device id " + std::to_string(id));

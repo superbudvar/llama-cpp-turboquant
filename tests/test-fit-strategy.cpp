@@ -13,6 +13,7 @@
 #include "fit-strategy.h"
 #include "fit-cache.h"
 #include "common.h"
+#include "speculative.h"
 #include "../src/llama-ext.h" // llama_model_n_devices, llama_model_get_device, ...
 
 #include <nlohmann/json.hpp>
@@ -36,6 +37,7 @@ static int failures = 0;
 static bool g_skipped = false;
 static std::string g_skip_reason;
 static std::string g_model;
+static std::string g_draft_model;
 
 static void expect(bool condition, const char * message) {
     if (!condition) {
@@ -264,6 +266,58 @@ static void test_no_alloc_measurement_counts_model_weights() {
     }
     expect(model_bytes > 0, "no-alloc measurement must include exact placed tensor bytes");
     expect(devs.size() > 0, "no-alloc measurement must return the model device list");
+
+    std::vector<ggml_backend_dev_t> child_devs;
+    uint32_t child_ngl = 0, child_n_ctx_train = 0, child_n_expert = 0;
+    const common_device_memory_data_vec child_memory = common_get_device_memory_data_with_parent(
+            g_model.c_str(), &mparams, &cparams, g_model.c_str(), &mparams, &cparams,
+            child_devs, child_ngl, child_n_ctx_train, child_n_expert, GGML_LOG_LEVEL_ERROR,
+            /*no_alloc_child=*/true);
+    size_t child_model_bytes = 0;
+    for (size_t i = 0; i < child_devs.size() && i < child_memory.size(); i++) {
+        child_model_bytes += child_memory[i].model;
+    }
+    expect(child_model_bytes > 0,
+            "no-alloc child-with-parent measurement must include external model tensor bytes");
+}
+
+static void test_external_mtp_child_measurement() {
+    if (g_model.empty() || g_draft_model.empty()) {
+        test_skip("target or external draft model not provided");
+        return;
+    }
+    common_params target_params;
+    target_params.model.path = g_model;
+    target_params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+    target_params.skip_infile_mtp = true;
+    llama_model_params mparams_target = common_model_params_to_llama(target_params);
+    llama_context_params cparams_target = common_context_params_to_llama(target_params);
+    cparams_target.n_ctx = 4096;
+
+    common_params draft_params = target_params;
+    draft_params.model.path = g_draft_model;
+    draft_params.skip_infile_mtp = false;
+    llama_model_params mparams_draft = common_model_params_to_llama(draft_params);
+    llama_context_params cparams_draft = common_context_params_to_llama(draft_params);
+    cparams_draft.n_ctx = 4096;
+    cparams_draft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+
+    std::vector<ggml_backend_dev_t> devs;
+    uint32_t hp_ngl = 0, hp_n_ctx_train = 0, hp_n_expert = 0;
+    const common_device_memory_data_vec memory = common_get_device_memory_data_with_parent(
+            g_draft_model.c_str(), &mparams_draft, &cparams_draft,
+            g_model.c_str(), &mparams_target, &cparams_target,
+            devs, hp_ngl, hp_n_ctx_train, hp_n_expert, GGML_LOG_LEVEL_ERROR,
+            /*no_alloc_child=*/true);
+    int64_t draft_model_bytes = 0;
+    int64_t draft_context_compute_bytes = 0;
+    for (size_t i = 0; i < devs.size() && i < memory.size(); i++) {
+        draft_model_bytes += memory[i].model;
+        draft_context_compute_bytes += memory[i].context + memory[i].compute;
+    }
+    expect(draft_model_bytes > 0, "external MTP preflight counts draft model bytes without allocation");
+    expect(draft_context_compute_bytes > 0,
+            "external MTP preflight measures child context and compute against the target parent");
 }
 
 static void test_preset_placement_rejected() {
@@ -1044,12 +1098,29 @@ static void test_mtp_load_mtp_false() {
             "mtp load_mtp=false: plan must still succeed using loader_ngl for n_gpu_layers");
 }
 
+static void test_external_mtp_replaces_infile_weights() {
+    common_params params;
+    params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+    expect(common_model_params_to_llama(params).load_mtp,
+            "in-file MTP stays loaded when no external draft is selected");
+
+    params.skip_infile_mtp = true;
+    expect(!common_model_params_to_llama(params).load_mtp,
+            "target in-file MTP weights are skipped for an external replacement");
+
+    params.speculative.draft.mparams.path = "external-mtp.gguf";
+    common_params params_dft = common_base_params_to_speculative(params);
+    expect(!params_dft.skip_infile_mtp && common_model_params_to_llama(params_dft).load_mtp,
+            "external draft still loads its own MTP weights");
+}
+
 static const struct test_case {
     const char * name;
     void (*fn)();
 } g_tests[] = {
     { "measurement_contract",       test_measurement_contract },
     { "no_alloc_measurement",        test_no_alloc_measurement_counts_model_weights },
+    { "external_mtp_child_measurement", test_external_mtp_child_measurement },
     { "preset_placement_rejected",  test_preset_placement_rejected },
     { "pool_budget_formula",        test_pool_budget_formula },
     { "rpc_device_id_validation",   test_fit_strategy_rpc_device_id_validation },
@@ -1072,6 +1143,7 @@ static const struct test_case {
     { "mtp_external_draft_unchanged", test_mtp_external_draft_unchanged },
     { "mtp_full_offload_now_feasible", test_mtp_full_offload_now_feasible },
     { "mtp_load_mtp_false",          test_mtp_load_mtp_false },
+    { "external_mtp_replacement",    test_external_mtp_replaces_infile_weights },
 };
 
 int main(int argc, char ** argv) {
@@ -1082,6 +1154,10 @@ int main(int argc, char ** argv) {
         if (a == "-m" || a == "--model") {
             if (i + 1 < argc) {
                 model = argv[++i];
+            }
+        } else if (a == "--draft-model") {
+            if (i + 1 < argc) {
+                g_draft_model = argv[++i];
             }
         } else if (!a.empty() && a[0] == '-') {
             // ignore other flags

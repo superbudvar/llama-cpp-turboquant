@@ -1251,7 +1251,7 @@ struct common_init_result::impl {
     std::vector<int64_t> ceiling_free_warm;
 };
 
-common_init_result::common_init_result(common_params & params, bool model_only) :
+common_init_result::common_init_result(common_params & params, bool model_only, const common_fit_plan * fit_plan_in) :
     pimpl(new impl{}) {
     pimpl->params = params; // copy for cache refresh after MODEL READY
     auto mparams = common_model_params_to_llama(params);
@@ -1276,7 +1276,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         common_fit_plan fit_plan;
         const common_params_fit_status fit_status =
             params.fit_strategy != COMMON_FIT_STRATEGY_UPSTREAM
-            ? common_fit_strategy_apply(params, &mparams, &cparams, nullptr, &fit_plan)
+            ? common_fit_strategy_apply(params, &mparams, &cparams, fit_plan_in, &fit_plan)
             : common_fit_params(
                 params,
                 params.model.path.c_str(), &mparams, &cparams,
@@ -1661,8 +1661,8 @@ const std::vector<int64_t> & common_init_result::ceiling_free_warm() const {
     return pimpl->ceiling_free_warm;
 }
 
-common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
-    common_init_result_ptr res(new common_init_result(params, model_only));
+common_init_result_ptr common_init_from_params(common_params & params, bool model_only, const common_fit_plan * fit_plan_in) {
+    common_init_result_ptr res(new common_init_result(params, model_only, fit_plan_in));
 
     llama_model * model = res->model();
     if (model == NULL) {
@@ -1944,8 +1944,9 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
-    mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end() ||
-                                          std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != params.speculative.types.end();
+    mparams.load_mtp                    = !params.skip_infile_mtp &&
+                                          (std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end() ||
+                                           std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != params.speculative.types.end());
 
     return mparams;
 }

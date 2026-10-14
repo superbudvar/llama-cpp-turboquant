@@ -518,7 +518,8 @@ struct common_params {
     common_fit_strategy fit_strategy       = COMMON_FIT_STRATEGY_UPSTREAM; // selectable fit engine
     int32_t             fit_strategy_min_ctx = 0; // strategy floor, 0 = unset -> required for non-upstream
     bool                fit_cache_clear    = false; // discard the disk fit result cache for this model before fitting
-    bool                fit_defer_delta_update = false; // server updates fit feedback after companion contexts load
+    bool                fit_defer_delta_update = false; // server updates fit feedback after companion models load
+    bool                skip_infile_mtp = false; // external MTP draft replaces target in-file MTP tensors
     bool                fit_params_no_context_reserve = false; // honor --fit-target as explicit margin, ignore 2 GiB context_reserve floor
     bool                fit_params_probe_ceiling = false; // probe device ceiling and clamp reported free to measured maximum
 
@@ -978,10 +979,11 @@ bool tty_can_use_colors();
 //
 
 struct common_sampler;
+struct common_fit_plan;
 
 // note: defines the model, context, samplers, ets. lifetimes
 struct common_init_result {
-    common_init_result(common_params & params, bool model_only = false);
+    common_init_result(common_params & params, bool model_only = false, const common_fit_plan * fit_plan = nullptr);
     ~common_init_result();
 
     llama_model * model();
@@ -1011,7 +1013,8 @@ private:
 
 using common_init_result_ptr = std::unique_ptr<common_init_result>;
 
-common_init_result_ptr common_init_from_params(common_params & params, bool model_only = false);
+common_init_result_ptr common_init_from_params(
+        common_params & params, bool model_only = false, const common_fit_plan * fit_plan = nullptr);
 
 struct llama_model_params     common_model_params_to_llama  (      common_params & params);
 struct llama_context_params   common_context_params_to_llama(const common_params & params);

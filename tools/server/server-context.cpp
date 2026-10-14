@@ -1372,9 +1372,14 @@ private:
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
-        params_base.fit_defer_delta_update = spec_mtp;
+        params_base.skip_infile_mtp = spec_mtp && has_draft;
+        params_base.fit_defer_delta_update = has_draft || spec_mtp || (has_mmproj && params_base.mmproj_use_gpu);
         const server_shared_draft_device_config shared_draft_devices = server_prepare_shared_draft_devices(params_base);
         std::vector<std::pair<ggml_backend_dev_t, int64_t>> fit_expected_companion_bytes;
+        std::vector<std::pair<ggml_backend_dev_t, int64_t>> fit_expected_spec_bytes;
+        std::vector<std::pair<ggml_backend_dev_t, int64_t>> fit_expected_mmproj_bytes;
+        common_fit_plan target_mtp_fit_plan;
+        bool has_target_mtp_fit_plan = false;
 
         auto make_params_dft = [&]() {
             common_params params_dft = common_base_params_to_speculative(params_base);
@@ -1436,34 +1441,45 @@ private:
             int64_t t_elapsed = ggml_time_us() - t_start;
             if (!mmproj_mem.empty()) {
                 size_t total = 0;
-                for (auto & [dev, size] : mmproj_mem) {
-                    total += size;
-                }
-                SRV_TRC("[mtmd] estimated worst-case memory usage of mmproj is %.2f MiB (took %.2f ms)\n", total / (1024.0 * 1024.0), t_elapsed / 1000.0);
-                GGML_ASSERT(!params_base.fit_params_target.empty());
+                bool reserved_gpu = false;
+                bool unmatched_gpu = false;
                 const std::vector<ggml_backend_dev_t> target_fit_devices = server_target_fit_devices_for(params_base, fit_main_gpu);
                 for (auto & [dev, size] : mmproj_mem) {
+                    total += size;
+                    if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                        continue;
+                    }
+                    bool matched = false;
                     for (size_t i = 0; i < target_fit_devices.size(); i++) {
                         if (target_fit_devices[i] == dev) {
                             GGML_ASSERT(i < params_base.fit_params_target.size());
                             SRV_DBG("[mtmd] adding %.2f MiB as a sheddable fit reserve for device %s\n", size / (1024.0 * 1024.0), ggml_backend_dev_name(dev));
                             // soft reserve: the vision model sheds first (priority 0)
                             params_base.fit_params_reserves.push_back({ (int) i, size, 0, "mmproj" });
+                            fit_expected_mmproj_bytes.emplace_back(dev, (int64_t) size);
+                            reserved_gpu = true;
+                            matched = true;
                             break;
                         }
                     }
+                    unmatched_gpu = unmatched_gpu || !matched;
+                }
+                SRV_TRC("[mtmd] estimated worst-case memory usage of mmproj is %.2f MiB (took %.2f ms)\n", total / (1024.0 * 1024.0), t_elapsed / 1000.0);
+                if (mparams.use_gpu && (!reserved_gpu || unmatched_gpu)) {
+                    SRV_ERR("%s", "[mtmd] GPU memory estimate did not match every fit device; refusing an unreserved GPU load\n");
+                    return false;
                 }
             } else {
                 SRV_ERR("%s", "[mtmd] failed to get memory usage of mmproj\n");
+                if (mparams.use_gpu) {
+                    return false;
+                }
             }
         }
 
-        // optionally reserve VRAM for the draft / MTP context before fitting the target model
+        // reserve companion VRAM before fitting the target model
         if (params_base.fit_params) {
             if (has_spec) {
-                // MTP draft context lives on the target model, only context+compute are new
-                bool measure_model_bytes = has_draft;
-
                 common_params params_dft = make_params_dft();
 
                 auto mparams_dft = common_model_params_to_llama(params_dft);
@@ -1486,29 +1502,154 @@ private:
                     std::vector<float> tensor_split_fit(llama_max_devices(), 0.0f);
                     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides_fit(llama_max_tensor_buft_overrides());
                     bool have_fit = false;
-                    const char * path_dft = spec_mtp ? params_base.model.path.c_str() : params_dft.model.path.c_str();
+                    const char * path_dft = has_draft ? params_dft.model.path.c_str() : params_base.model.path.c_str();
+                    const std::vector<ggml_backend_dev_t> tgt_devices = server_target_fit_devices_for(params_base, fit_main_gpu);
+                    std::vector<std::pair<ggml_backend_dev_t, size_t>> reservations;
+                    bool mtp_reserve_preapplied = false;
+                    std::vector<size_t> mtp_preflight_reserve_max;
+
+                    auto add_reservations = [&](const common_device_memory_data_vec & data,
+                                                const std::vector<ggml_backend_dev_t> & devices) {
+                        GGML_ASSERT(data.size() >= devices.size());
+                        for (size_t i = 0; i < devices.size(); i++) {
+                            const size_t bytes = (has_draft ? (size_t) std::max<int64_t>(0, data[i].model) : 0) +
+                                    (size_t) std::max<int64_t>(0, data[i].context) +
+                                    (size_t) std::max<int64_t>(0, data[i].compute);
+                            auto found = std::find_if(reservations.begin(), reservations.end(), [&](const auto & entry) {
+                                return entry.first == devices[i];
+                            });
+                            if (found == reservations.end()) {
+                                reservations.emplace_back(devices[i], bytes);
+                            } else {
+                                found->second = std::max(found->second, bytes);
+                            }
+                        }
+                    };
+
+                    auto measure_spec_memory = [&](const llama_model_params & mparams_measure,
+                                                   const llama_model_params & mparams_parent,
+                                                   std::vector<ggml_backend_dev_t> & measured_devs,
+                                                   uint32_t & measured_ngl,
+                                                   uint32_t & measured_nct,
+                                                   uint32_t & measured_nex) {
+                        return common_get_device_memory_data_with_parent(
+                                path_dft, &mparams_measure, &cparams_dft,
+                                params_base.model.path.c_str(), &mparams_parent, &cparams_tgt,
+                                measured_devs, measured_ngl, measured_nct, measured_nex, GGML_LOG_LEVEL_ERROR,
+                                /*no_alloc_child=*/has_draft || spec_mtp);
+                    };
 
                     if (spec_mtp && params_base.fit_strategy != COMMON_FIT_STRATEGY_UPSTREAM) {
-                        common_params params_prefit = params_base;
-                        llama_model_params mparams_prefit = common_model_params_to_llama(params_prefit);
-                        llama_context_params cparams_prefit = common_context_params_to_llama(params_prefit);
-                        common_fit_plan plan_prefit;
-                        const common_params_fit_status fit_status = common_fit_strategy_apply(
-                                params_prefit, &mparams_prefit, &cparams_prefit, nullptr, &plan_prefit);
-                        if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
-                            throw std::runtime_error("no safe target placement is available for MTP preflight");
-                        }
+                        const std::vector<size_t> base_margins = params_base.fit_params_target;
+                        std::vector<size_t> reserve_max(base_margins.size(), 0);
+                        common_fit_plan previous_plan;
+                        bool have_previous_plan = false;
+                        bool converged = false;
+                        constexpr size_t max_iterations = 4;
 
-                        cparams_tgt.n_ctx = plan_prefit.n_ctx;
-                        cparams_dft.n_ctx = plan_prefit.n_ctx;
-                        mparams_fit = mparams_prefit;
-                        tensor_split_fit = plan_prefit.tensor_split;
-                        tensor_buft_overrides_fit = plan_prefit.tensor_buft_overrides;
-                        mparams_fit.tensor_split = tensor_split_fit.data();
-                        mparams_fit.tensor_buft_overrides = tensor_buft_overrides_fit.data();
-                        have_fit = true;
-                        SRV_INF("[spec] noalloc target preflight selected n_ctx=%d; measuring MTP context at that context\n",
-                                plan_prefit.n_ctx);
+                        for (size_t iter = 0; iter < max_iterations; iter++) {
+                            common_params params_prefit = params_base;
+                            for (size_t i = 0; i < reserve_max.size(); i++) {
+                                if (reserve_max[i] > SIZE_MAX - base_margins[i]) {
+                                    throw std::runtime_error("MTP fit reserve overflowed");
+                                }
+                                params_prefit.fit_params_target[i] = base_margins[i] + reserve_max[i];
+                            }
+                            llama_model_params mparams_prefit = common_model_params_to_llama(params_prefit);
+                            llama_context_params cparams_prefit = common_context_params_to_llama(params_prefit);
+                            common_fit_plan plan_prefit;
+                            const common_params_fit_status fit_status = common_fit_strategy_apply(
+                                    params_prefit, &mparams_prefit, &cparams_prefit, nullptr, &plan_prefit);
+                            if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+                                throw std::runtime_error("no safe target placement is available for MTP preflight");
+                            }
+
+                            cparams_tgt.n_ctx = plan_prefit.n_ctx;
+                            cparams_dft.n_ctx = plan_prefit.n_ctx;
+                            mparams_fit = mparams_prefit;
+                            tensor_split_fit = plan_prefit.tensor_split;
+                            tensor_buft_overrides_fit = plan_prefit.tensor_buft_overrides;
+                            mparams_fit.tensor_split = tensor_split_fit.data();
+                            mparams_fit.tensor_buft_overrides = tensor_buft_overrides_fit.data();
+                            have_fit = true;
+
+                            reservations.clear();
+                            const llama_model_params & mparams_measure = has_draft ? mparams_dft : mparams_fit;
+                            auto dmd = measure_spec_memory(mparams_measure, mparams_fit, devs,
+                                    hp_ngl, hp_nct, hp_nex);
+                            add_reservations(dmd, devs);
+
+                            if (mparams_tgt.split_mode != LLAMA_SPLIT_MODE_NONE && mparams_tgt.main_gpu >= 0) {
+                                llama_model_params mparams_tgt_main = mparams_tgt;
+                                mparams_tgt_main.split_mode = LLAMA_SPLIT_MODE_NONE;
+                                llama_model_tensor_buft_override mtp_overrides[2] = {};
+                                mtp_overrides[0] = {
+                                    common_moe_cache_tensor_override_pattern(), ggml_backend_cpu_buffer_type() };
+                                mparams_tgt_main.tensor_buft_overrides = mtp_overrides;
+                                mparams_tgt_main.use_extra_bufts = false;
+                                const llama_model_params & mparams_measure_main = has_draft ? mparams_dft : mparams_tgt_main;
+                                std::vector<ggml_backend_dev_t> devs_main;
+                                uint32_t hp_ngl_main = 0, hp_nct_main = 0, hp_nex_main = 0;
+                                auto dmd_main = measure_spec_memory(mparams_measure_main, mparams_tgt_main,
+                                        devs_main, hp_ngl_main, hp_nct_main, hp_nex_main);
+                                add_reservations(dmd_main, devs_main);
+                            }
+
+                            std::vector<size_t> measured_reserve(base_margins.size(), 0);
+                            for (const auto & [device, bytes] : reservations) {
+                                bool matched = false;
+                                for (size_t i = 0; i < tgt_devices.size() && i < measured_reserve.size(); i++) {
+                                    if (tgt_devices[i] == device) {
+                                        measured_reserve[i] = bytes;
+                                        matched = true;
+                                        break;
+                                    }
+                                }
+                                if (!matched && bytes > 0 && ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                                    throw std::runtime_error(std::string("MTP measurement on ") +
+                                            ggml_backend_dev_name(device) + " is outside the fit device set");
+                                }
+                            }
+
+                            bool reserve_grew = false;
+                            for (size_t i = 0; i < reserve_max.size(); i++) {
+                                if (measured_reserve[i] > reserve_max[i]) {
+                                    reserve_max[i] = measured_reserve[i];
+                                    reserve_grew = true;
+                                }
+                            }
+                            const bool same_plan = have_previous_plan &&
+                                    previous_plan.n_ctx == plan_prefit.n_ctx &&
+                                    previous_plan.n_gpu_layers == plan_prefit.n_gpu_layers &&
+                                    previous_plan.role_devices == plan_prefit.role_devices &&
+                                    previous_plan.tensor_split == plan_prefit.tensor_split &&
+                                    previous_plan.shed_reserves == plan_prefit.shed_reserves;
+                            size_t total_spec_bytes = 0;
+                            for (const auto & entry : reservations) {
+                                total_spec_bytes += entry.second;
+                            }
+                            SRV_INF("[spec] target-context preflight iter=%zu n_ctx=%d MTP=%.2f MiB reserve_grew=%d\n",
+                                    iter + 1, plan_prefit.n_ctx, total_spec_bytes / (1024.0 * 1024.0), reserve_grew);
+                            if (same_plan && !reserve_grew) {
+                                target_mtp_fit_plan = plan_prefit;
+                                has_target_mtp_fit_plan = true;
+                                converged = true;
+                                break;
+                            }
+                            previous_plan = plan_prefit;
+                            have_previous_plan = true;
+                        }
+                        if (!converged) {
+                            throw std::runtime_error("MTP target-context preflight did not converge");
+                        }
+                        mtp_preflight_reserve_max = reserve_max;
+                        for (size_t i = 0; i < reserve_max.size(); i++) {
+                            if (reserve_max[i] > SIZE_MAX - params_base.fit_params_target[i]) {
+                                throw std::runtime_error("MTP fit reserve overflowed");
+                            }
+                            params_base.fit_params_target[i] += reserve_max[i];
+                        }
+                        mtp_reserve_preapplied = true;
                     }
 
                     if (spec_mtp && !have_fit) {
@@ -1548,14 +1689,16 @@ private:
                             mparams_fit.tensor_buft_overrides = tensor_buft_overrides_fit.data();
                             have_fit = true;
 
+                            const llama_model_params & mparams_iter = has_draft ? mparams_dft : mparams_fit;
                             auto dmd_iter = common_get_device_memory_data_with_parent(
-                                path_dft, &mparams_fit, &cparams_dft,
+                                path_dft, &mparams_iter, &cparams_dft,
                                 params_base.model.path.c_str(), &mparams_fit, &cparams_tgt,
                                 devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR,
-                                /*no_alloc_child=*/spec_mtp);
+                                /*no_alloc_child=*/has_draft || spec_mtp);
                             size_t total_spec_bytes = 0;
                             for (size_t i = 0; i < devs.size() && i < dmd_iter.size(); i++) {
-                                total_spec_bytes += dmd_iter[i].context + dmd_iter[i].compute;
+                                total_spec_bytes += (has_draft ? dmd_iter[i].model : 0) +
+                                                    dmd_iter[i].context + dmd_iter[i].compute;
                             }
 
                             SRV_DBG("[spec] pre-fit iter %zu: n_ctx=%u, spec=%.2f MiB\n",
@@ -1569,87 +1712,51 @@ private:
 
                             margins_work = params_base.fit_params_target;
                             for (size_t i = 0; i < devs.size() && i < dmd_iter.size(); i++) {
-                                margins_work[i] += dmd_iter[i].context + dmd_iter[i].compute;
+                                margins_work[i] += (has_draft ? dmd_iter[i].model : 0) +
+                                                   dmd_iter[i].context + dmd_iter[i].compute;
                             }
                         }
                     }
-                    auto measure_spec_memory = [&](const llama_model_params & mparams_measure,
-                                                   const llama_model_params & mparams_parent,
-                                                   std::vector<ggml_backend_dev_t> & measured_devs,
-                                                   uint32_t & measured_ngl,
-                                                   uint32_t & measured_nct,
-                                                   uint32_t & measured_nex) {
-                        auto data = common_get_device_memory_data_with_parent(
-                            path_dft, &mparams_measure, &cparams_dft,
-                            params_base.model.path.c_str(), &mparams_parent, &cparams_tgt,
-                            measured_devs, measured_ngl, measured_nct, measured_nex, GGML_LOG_LEVEL_ERROR,
-                            /*no_alloc_child=*/spec_mtp);
-                        // The MTP context allocates its own compute buffer; only the
-                        // target's model weights are shared via the parent context,
-                        // so the measured data already reflects the true reservation.
-                        return data;
-                    };
+                    if (!mtp_reserve_preapplied) {
+                        const llama_model_params & mparams_measure = has_draft ? mparams_dft : (spec_mtp ? (have_fit ? mparams_fit : mparams_tgt) : mparams_dft);
+                        const llama_model_params & mparams_parent = spec_mtp && have_fit ? mparams_fit : mparams_tgt;
+                        auto dmd = measure_spec_memory(
+                                mparams_measure, mparams_parent, devs, hp_ngl, hp_nct, hp_nex);
+                        add_reservations(dmd, devs);
 
-                    const llama_model_params & mparams_measure = spec_mtp ? (have_fit ? mparams_fit : mparams_tgt) : mparams_dft;
-                    const llama_model_params & mparams_parent = spec_mtp && have_fit ? mparams_fit : mparams_tgt;
-                    auto dmd = measure_spec_memory(
-                        mparams_measure, mparams_parent, devs, hp_ngl, hp_nct, hp_nex);
-
-                    std::vector<std::pair<ggml_backend_dev_t, size_t>> reservations;
-                    auto add_reservations = [&](const common_device_memory_data_vec & data,
-                                                const std::vector<ggml_backend_dev_t> & devices) {
-                        GGML_ASSERT(data.size() >= devices.size());
-                        for (size_t i = 0; i < devices.size(); i++) {
-                            size_t bytes;
-                            if (spec_mtp) {
-                                bytes = (size_t) std::max<int64_t>(0, data[i].context) +
-                                        (size_t) std::max<int64_t>(0, data[i].compute);
-                            } else {
-                                bytes = (measure_model_bytes ? data[i].model : 0) +
-                                        data[i].context + data[i].compute;
+                        if ((shared_draft_devices.prepared || spec_mtp) && mparams_tgt.split_mode != LLAMA_SPLIT_MODE_NONE &&
+                            mparams_tgt.main_gpu >= 0) {
+                            try {
+                                llama_model_params mparams_tgt_main = mparams_tgt;
+                                mparams_tgt_main.split_mode = LLAMA_SPLIT_MODE_NONE;
+                                llama_model_tensor_buft_override mtp_overrides[2] = {};
+                                if (spec_mtp) {
+                                    mtp_overrides[0] = {
+                                        common_moe_cache_tensor_override_pattern(), ggml_backend_cpu_buffer_type() };
+                                    mparams_tgt_main.tensor_buft_overrides = mtp_overrides;
+                                    mparams_tgt_main.use_extra_bufts = false;
+                                }
+                                const llama_model_params & mparams_measure_main = has_draft ? mparams_dft : mparams_tgt_main;
+                                std::vector<ggml_backend_dev_t> devs_main;
+                                uint32_t hp_ngl_main = 0;
+                                uint32_t hp_nct_main = 0;
+                                uint32_t hp_nex_main = 0;
+                                const auto dmd_main = measure_spec_memory(
+                                        mparams_measure_main, mparams_tgt_main,
+                                        devs_main, hp_ngl_main, hp_nct_main, hp_nex_main);
+                                add_reservations(dmd_main, devs_main);
+                            } catch (const std::exception & e) {
+                                SRV_DBG("[spec] failed to measure main-device shared-tensor memory: %s\n", e.what());
+                                if (spec_mtp) {
+                                    SRV_ERR("%s", "[spec] required MTP shared-tensor measurement failed; refusing an unreserved GPU load\n");
+                                    return false;
+                                }
                             }
-                            auto found = std::find_if(reservations.begin(), reservations.end(), [&](const auto & entry) {
-                                return entry.first == devices[i];
-                            });
-                            if (found == reservations.end()) {
-                                reservations.emplace_back(devices[i], bytes);
-                            } else {
-                                found->second = std::max(found->second, bytes);
-                            }
-                        }
-                    };
-                    add_reservations(dmd, devs);
-
-                    if ((shared_draft_devices.prepared || spec_mtp) && mparams_tgt.split_mode != LLAMA_SPLIT_MODE_NONE &&
-                        mparams_tgt.main_gpu >= 0) {
-                        try {
-                            llama_model_params mparams_tgt_main = mparams_tgt;
-                            mparams_tgt_main.split_mode = LLAMA_SPLIT_MODE_NONE;
-                            llama_model_tensor_buft_override mtp_overrides[2] = {};
-                            if (spec_mtp) {
-                                mtp_overrides[0] = {
-                                    common_moe_cache_tensor_override_pattern(), ggml_backend_cpu_buffer_type() };
-                                mparams_tgt_main.tensor_buft_overrides = mtp_overrides;
-                                mparams_tgt_main.use_extra_bufts = false;
-                            }
-                            const llama_model_params & mparams_measure_main = has_draft ? mparams_dft : mparams_tgt_main;
-                            std::vector<ggml_backend_dev_t> devs_main;
-                            uint32_t hp_ngl_main = 0;
-                            uint32_t hp_nct_main = 0;
-                            uint32_t hp_nex_main = 0;
-                            const auto dmd_main = measure_spec_memory(
-                                mparams_measure_main, mparams_tgt_main,
-                                devs_main, hp_ngl_main, hp_nct_main, hp_nex_main);
-                            add_reservations(dmd_main, devs_main);
-                        } catch (const std::exception & e) {
-                            SRV_DBG("[spec] failed to measure main-device shared-tensor memory: %s\n", e.what());
                         }
                     }
 
                     GGML_ASSERT(!params_base.fit_params_target.empty());
                     size_t total = 0;
-
-                    const std::vector<ggml_backend_dev_t> tgt_devices = server_target_fit_devices_for(params_base, fit_main_gpu);
 
                     // the speculative footprint is a soft reserve only when the draft is a
                     // separate model (it can fall back to CPU); an MTP predictor has no CPU
@@ -1661,8 +1768,10 @@ private:
                         if (bytes == 0) {
                             continue;
                         }
+                        bool matched_fit_device = false;
                         for (size_t i = 0; i < tgt_devices.size(); i++) {
                             if (tgt_devices[i] == device) {
+                                matched_fit_device = true;
                                 if (bytes > SIZE_MAX - params_base.fit_params_target[i]) {
                                     throw std::runtime_error("speculative memory margin overflowed");
                                 }
@@ -1670,6 +1779,15 @@ private:
                                     SRV_INF("[spec] reserving %.2f MiB on %s for the speculative model and context (sheddable, priority 1)\n",
                                             bytes / (1024.0 * 1024.0), ggml_backend_dev_name(device));
                                     params_base.fit_params_reserves.push_back({ (int) i, bytes, 1, "spec" });
+                                    fit_expected_spec_bytes.emplace_back(device, (int64_t) bytes);
+                                } else if (spec_mtp && mtp_reserve_preapplied) {
+                                    if (i >= mtp_preflight_reserve_max.size() || bytes > mtp_preflight_reserve_max[i]) {
+                                        throw std::runtime_error("MTP memory grew after target-context preflight");
+                                    }
+                                    SRV_INF("[spec] MTP on %s: measured %.2f MiB at final preflight context, held %.2f MiB reserve\n",
+                                            ggml_backend_dev_name(device), bytes / (1024.0 * 1024.0),
+                                            mtp_preflight_reserve_max[i] / (1024.0 * 1024.0));
+                                    fit_expected_companion_bytes.emplace_back(device, (int64_t) bytes);
                                 } else {
                                     SRV_INF("[spec] reserving %.2f MiB on %s for the MTP context\n",
                                             bytes / (1024.0 * 1024.0), ggml_backend_dev_name(device));
@@ -1679,6 +1797,10 @@ private:
                                 break;
                             }
                         }
+                        if (!matched_fit_device && ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                            throw std::runtime_error(std::string("companion memory on ") +
+                                    ggml_backend_dev_name(device) + " is outside the fit device set");
+                        }
                     }
                     SRV_INF("[spec] estimated memory usage of %s is %.2f MiB\n",
                             has_draft ? "draft model" : "MTP context",
@@ -1686,6 +1808,7 @@ private:
                 } catch (const std::exception & e) {
                     SRV_WRN("[spec] failed to measure %s memory: %s\n",
                             has_draft ? "draft model" : "MTP context", e.what());
+                    return false;
                 }
             }
         }
@@ -1696,7 +1819,8 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
-        llama_init = common_init_from_params(params_base);
+        llama_init = common_init_from_params(params_base, /*model_only=*/false,
+                has_target_mtp_fit_plan ? &target_mtp_fit_plan : nullptr);
 
         // the fit may have shed soft reservations to keep the main model fully
         // offloaded; move the tagged companions off VRAM accordingly
@@ -1991,7 +2115,15 @@ prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, 
         // restore the disk prompt cache (no-op when disabled or already populated)
         prompt_cache_disk_load();
 
-        if (spec_mtp && llama_init) {
+        if (params_base.fit_defer_delta_update && llama_init) {
+            if (!shed_spec) {
+                fit_expected_companion_bytes.insert(fit_expected_companion_bytes.end(),
+                        fit_expected_spec_bytes.begin(), fit_expected_spec_bytes.end());
+            }
+            if (!shed_mmproj) {
+                fit_expected_companion_bytes.insert(fit_expected_companion_bytes.end(),
+                        fit_expected_mmproj_bytes.begin(), fit_expected_mmproj_bytes.end());
+            }
             llama_init->update_fit_delta(fit_expected_companion_bytes);
         }
 
