@@ -2386,6 +2386,10 @@ prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, 
                 const bool saved = save_result == server_prompt_cache_save_result::stored_in_ram;
                 const bool loaded = ret->prompt_load(*prompt_cache, task.tokens);
 
+                // try to restore a better-matching entry (also covers the case where the
+                // save failed transiently but an older entry still matches the new prompt)
+                // A queued disk write is not durable; keep the slot until its state can
+                // be restored from the cache.
                 if (saved && !loaded) {
                     ret->prompt_clear();
                 }
@@ -3255,6 +3259,9 @@ prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, 
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
+        // a context that cannot serialize its KV state reports size zero; keeping the
+        // metadata-only entry would let a later restore skip the data load while
+        // proceeding on pos/n_tokens bookkeeping. drop it instead.
         if (cur.empty()) {
             SLT_WRN(slot, "dropping empty context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ") - context cannot serialize KV state\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens);
@@ -3363,6 +3370,9 @@ prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, 
 
                                 if (params_base.kv_unified && saved) {
                                     // [TAG_IDLE_SLOT_CLEAR]
+                                    // only clear when the state actually made it into the
+                                    // prompt cache - a failed save means the cache cannot
+                                    // hold it, and clearing would destroy the only copy
                                     slot.prompt_clear();
                                 }
                             }

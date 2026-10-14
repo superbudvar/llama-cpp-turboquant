@@ -1,9 +1,9 @@
 # KV disk prompt-cache refactor plan
 
-Status: in progress. DCP/DTS integrity hardening, storage-source extraction, and
-upstream state/save safeguards are implemented locally; focused tests pass.
-Hardware validation of block-streamed state round-trip and wider integration
-checks remain outstanding.
+Status: upstream merge is integrated at `origin/feature/turboquant-kv-cache`
+`6e09de1b4`. DCP/DTS integrity hardening and storage-source extraction are
+complete; focused tests and the server build pass. Hardware validation of the
+block-streamed state round-trip remains outstanding.
 
 ## Progress
 
@@ -21,10 +21,12 @@ checks remain outstanding.
   in `server_prompt_cache_disk`; RAM prompt selection remains in
   `server_prompt_cache`.
 - Upstream `09dd093b3` state serialization, slot-preservation, and empty-checkpoint
-  safeguards were applied without merging upstream.
+  safeguards were composed with the local cache implementation during merge.
 - `test-chunk-store` and `test-prompt-cache-pool` pass. `test-save-load-state`
   builds, but its run requires a model file that is not available in this
   workspace. CUDA block-streamed runtime validation remains outstanding.
+- The merge preserved `benchmarks/results/kv-stream-pr-evidence` and its local
+  benchmark test drivers.
 
 The goal is to isolate the fork's persistent prompt-cache and per-slot
 checkpoint-spill code from the large server implementation files, then integrate
@@ -132,7 +134,7 @@ pruning entangled in `server_prompt_cache`. Probe both the low-level-only cut
 and the full disk-tier owner in disposable isolation, then keep the smallest
 cohesive boundary that materially removes those internals from `server-task`.
 
-## Merge plan
+## Merge notes
 
 The previous conflict is narrow and separate from the main disk tier. At
 `create_checkpoint`, local code spills a non-empty payload to `.ccn`
@@ -141,14 +143,15 @@ The previous conflict is narrow and separate from the main disk tier. At
 checkpoint first, otherwise spill it. Extracting `.ccn` I/O shrinks the local
 hunk, but the call site still needs this ordering.
 
-When retrying the upstream merge in an isolated worktree:
+The merge was performed in an isolated worktree. The two content conflicts were
+composed as follows:
 
-1. Preserve the local disk modules and benchmark evidence; do not take the
-   upstream `server-task` tree wholesale, which has no DPC/DTS tier.
-2. Port the `llama-kv-cache.cpp` save/load invariant and server slot/checkpoint
-   safeguards into the local architecture.
-3. Resolve the checkpoint hunk as described above and keep upstream state
-   changes independent from disk-tier ownership.
+1. Kept the local disk modules and benchmark evidence; did not take the upstream
+   `server-task` tree wholesale.
+2. Combined the full-host-buffer state save/load support with the local streamed
+   cache mirror reset and graph-generation invariants.
+3. Kept explicit `stored_in_ram` versus `queued_to_disk` semantics, and dropped
+   empty checkpoints before checkpoint spill.
 
 ## Implementation status and remaining checks
 
@@ -157,9 +160,9 @@ When retrying the upstream merge in an isolated worktree:
    chunk-store and prompt-cache-pool suites pass, and `llama-server` builds.
 2. **Still required:** run a model-backed block-streamed save/restore test on
    CUDA; the local save/load test could not run without a model file.
-3. **Next integration check:** assess the upstream merge in an isolated
-   worktree, preserve benchmark evidence, and resolve the `.ccn` checkpoint hunk.
-   Do not merge as part of this change unless separately authorized.
+3. **Remaining integration check:** run a model-backed block-streamed save/restore
+   and continuation comparison on CUDA. The current environment did not provide a
+   model fixture for `test-save-load-state`, and this validation was not run.
 
 Acceptance is unchanged RAM prompt matching, disk restore/write-through
 semantics, and on-disk format compatibility; correct state save/load under block

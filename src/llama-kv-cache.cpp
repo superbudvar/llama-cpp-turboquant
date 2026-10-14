@@ -627,13 +627,22 @@ llama_kv_cache::llama_kv_cache(
         // TurboQuant: create rotation matrix tensors (once, shared across layers)
         if (turbo_rotation == nullptr &&
             (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0)) {
-            turbo_rotation = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128);
+            // The KV-stream buffer is host-backed: WHT ops reading these tensors from it get
+            // scheduled on the CPU, round-tripping Q and the FA output over PCIe every layer.
+            ggml_context * turbo_ctx = ctx;
+            if (kv_stream_buft != nullptr && buft == kv_stream_buft) {
+                turbo_ctx = ctx_for_buft(ggml_backend_dev_buffer_type(kv_stream_dev));
+                if (!turbo_ctx) {
+                    throw std::runtime_error("failed to create ggml context for turbo rotation tensors");
+                }
+            }
+            turbo_rotation = ggml_new_tensor_2d(turbo_ctx, GGML_TYPE_F32, 128, 128);
             ggml_format_name(turbo_rotation, "turbo_rotation");  // R^T
-            turbo_rotation_inv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128);
+            turbo_rotation_inv = ggml_new_tensor_2d(turbo_ctx, GGML_TYPE_F32, 128, 128);
             ggml_format_name(turbo_rotation_inv, "turbo_rotation_inv");  // R
 
             // InnerQ: per-channel scale_inv tensor (128 floats, initialized to all 1.0)
-            turbo_innerq_scale_inv = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, INNERQ_MAX_CHANNELS);
+            turbo_innerq_scale_inv = ggml_new_tensor_1d(turbo_ctx, GGML_TYPE_F32, INNERQ_MAX_CHANNELS);
             ggml_format_name(turbo_innerq_scale_inv, "turbo_innerq_scale_inv");
         }
     }
@@ -2714,8 +2723,8 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         return;
     }
 
-    // Block-streamed KV uses a full-size pinned host buffer, so flat cell-order
-    // reads include every cell. State saves run after synchronization.
+    // Block-streamed KV uses a full-size pinned host buffer. The state API
+    // synchronizes before reading, so flat cell-order reads include every cell.
 
     GGML_UNUSED(flags);
 
@@ -2796,8 +2805,8 @@ const slot_info_vec_t *   sinfos_in) {
         return;
     }
 
-    // Writes use the buffer interface, which resets the resident mirror and
-    // advances the graph generation after restoring the full host buffer.
+    // The full-size host buffer accepts flat cell-order writes. The buffer
+    // interface resets the resident mirror and advances the graph generation.
 
     GGML_UNUSED(flags);
 
