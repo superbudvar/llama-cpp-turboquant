@@ -39,13 +39,15 @@ RE_RS = re.compile(r"llama_memory_recurrent:\s*(.+?) RS buffer size\s*=\s*([\d.]
 RE_MOE = re.compile(r"sched_reserve: MoE cache requested=(\w+) resolved=(\w+)")
 RE_SPEC = re.compile(r"common_speculative_init_result: (loading draft model|creating MTP draft context) '?([^'\n]+)")
 RE_EVAL_TIMING = re.compile(r"slot print_timing:.*?task \d+\s*\|\s*(prompt eval|eval) time\s*=\s*([\d.]+)\s*ms\s*/\s*(\d+) tokens\s*\(\s*[\d.]+ ms per token,\s*([\d.]+) tokens per second\)")
+RE_MTP_PREFLIGHT = re.compile(r"target-context preflight iter=(\d+) n_ctx=(\d+) MTP=([\d.]+) MiB reserve_grew=(\d+)")
 RE_UPSTREAM_FIT_OK = re.compile(r"common_fit_params: successfully fit params to free device memory")
 RE_UPSTREAM_FIT_TIME = re.compile(r"common_fit_params: fitting params to free memory took ([\d.]+) seconds")
 RE_RPC_FIT_START = re.compile(r"\[FITDBG\] rpc-aware entered nd=(\d+) local=(\d+) loader_ngl=(\d+) min_ctx=(\d+)")
-RE_RPC_FRAC = re.compile(r"fit_solve_rpc_aware: rpc_frac=([\d.]+) measure=(\d+) devs=(\d+) margin=(\d+) -> (FEASIBLE|rejected)")
-RE_GROW_RESULT = re.compile(r"grow fits n_ctx=(\d+) measure=(\d+) margins=(\d+) -> (ok|FAIL)")
+RE_RPC_CANDIDATES = re.compile(r"\[FITDBG\] building candidates: (\d+) dense_splits, (\d+) pool_opts, moe\.n_expert=(\d+)")
+RE_RPC_FRAC = re.compile(r"fit_solve_rpc_aware: rpc_frac=([\d.]+)(?: min_ctx)? measure=(\d+) devs=(\d+) margin=(\d+) -> (FEASIBLE|rejected)")
+RE_GROW_RESULT = re.compile(r"grow fits n_ctx=(\d+) measure=(\d+) margins=(\d+) -> (ok|FAIL)(?: \(probes=(\d+)/(\d+)\))?")
 RE_CANDIDATE_REJECT = re.compile(r"fit_solve_rpc_aware: candidate (.+?) cannot fit even the minimum context, skipping")
-RE_CANDIDATE_SELECTED = re.compile(r"selected (?:best )?candidate(?:=\S+)? .*?n_ctx=(\d+).*?split_size=(\d+)")
+RE_CANDIDATE_SELECTED = re.compile(r"fit_solve_rpc_aware: selected candidate=(.+?) n_ctx=(\d+) rpc_frac=([\d.]+) split_size=(\d+)")
 RE_MARGIN = re.compile(r"common_fit_strategy_apply_impl: device\[(\d+)\]=(\S+) fit-target=(-?\d+) MiB base-margin=(-?\d+) MiB")
 RE_STRATEGY_RESULT = re.compile(r"common_fit_strategy_apply_impl: (successfully fit params|failed to fit params|encountered an error).*")
 RE_EXIT = re.compile(r"instance name=(\S+) exited with status (\d+)")
@@ -72,7 +74,8 @@ def new_run(name="run", port="?"):
         "kv": {}, "rs": {}, "moe_requested": None, "moe_resolved": None,
         "spec": None, "model_ready": {}, "sysfs": {}, "timing": [],
         "upstream_fit_attempts": [], "rpc_fit": None, "load_status": "incomplete",
-        "load_progress": None, "cache_events": [], "fit_margins": [],
+        "rpc_fits": [], "mtp_preflights": [], "load_progress": None,
+        "cache_events": [], "fit_margins": [],
     }
     return cur
 
@@ -116,6 +119,15 @@ for line in open(LOG, encoding="utf-8", errors="replace"):
         cur["load_status"] = m.group(1)
         continue
 
+    m = RE_MTP_PREFLIGHT.search(line)
+    if m:
+        iteration, n_ctx, mtp_mib, reserve_grew = m.groups()
+        cur["mtp_preflights"].append({
+            "iteration": int(iteration), "n_ctx": int(n_ctx),
+            "mtp_mib": float(mtp_mib), "reserve_grew": bool(int(reserve_grew)),
+        })
+        continue
+
     m = RE_UPSTREAM_FIT_OK.search(line)
     if m:
         cur["upstream_fit_attempts"].append({"result": "success", "seconds": None})
@@ -130,12 +142,23 @@ for line in open(LOG, encoding="utf-8", errors="replace"):
         continue
     m = RE_RPC_FIT_START.search(line)
     if m:
+        if cur["rpc_fit"] is not None and cur["rpc_fit"]["result"] == "in progress":
+            cur["rpc_fit"]["result"] = "superseded by later fit pass"
         cur["rpc_fit"] = {
-            "min_ctx": int(m.group(4)), "rpc_fracs": [], "grow": [],
+            "min_ctx": int(m.group(4)), "dense_splits": None, "pool_opts": None,
+            "n_expert": None, "rpc_fracs": [], "grow": [],
             "rejected_candidates": [], "selected": None, "result": "in progress",
         }
+        cur["rpc_fits"].append(cur["rpc_fit"])
         continue
     if cur["rpc_fit"] is not None:
+        m = RE_RPC_CANDIDATES.search(line)
+        if m:
+            dense_splits, pool_opts, n_expert = m.groups()
+            cur["rpc_fit"]["dense_splits"] = int(dense_splits)
+            cur["rpc_fit"]["pool_opts"] = int(pool_opts)
+            cur["rpc_fit"]["n_expert"] = int(n_expert)
+            continue
         m = RE_RPC_FRAC.search(line)
         if m:
             frac, measured, devices, margin, verdict = m.groups()
@@ -146,10 +169,12 @@ for line in open(LOG, encoding="utf-8", errors="replace"):
             continue
         m = RE_GROW_RESULT.search(line)
         if m:
-            n_ctx, measured, margins_ok, verdict = m.groups()
+            n_ctx, measured, margins_ok, verdict, probes_used, probes_limit = m.groups()
             cur["rpc_fit"]["grow"].append({
                 "n_ctx": int(n_ctx), "measured": int(measured),
                 "margins_ok": int(margins_ok), "verdict": verdict,
+                "probes_used": int(probes_used) if probes_used is not None else None,
+                "probes_limit": int(probes_limit) if probes_limit is not None else None,
             })
             continue
         m = RE_CANDIDATE_REJECT.search(line)
@@ -158,7 +183,11 @@ for line in open(LOG, encoding="utf-8", errors="replace"):
             continue
         m = RE_CANDIDATE_SELECTED.search(line)
         if m:
-            cur["rpc_fit"]["selected"] = {"n_ctx": int(m.group(1)), "split_size": int(m.group(2))}
+            candidate, n_ctx, rpc_frac, split_size = m.groups()
+            cur["rpc_fit"]["selected"] = {
+                "candidate": candidate, "n_ctx": int(n_ctx),
+                "rpc_frac": float(rpc_frac), "split_size": int(split_size),
+            }
             cur["rpc_fit"]["result"] = "selected"
             continue
         m = RE_STRATEGY_RESULT.search(line)
@@ -341,21 +370,32 @@ for r in runs:
     for i, attempt in enumerate(r["upstream_fit_attempts"], 1):
         elapsed = "?" if attempt["seconds"] is None else "%.2fs" % attempt["seconds"]
         print(f"  upstream fit #{i}: {attempt['result']} ({elapsed})")
-    if r["rpc_fit"] is not None:
-        fit = r["rpc_fit"]
-        print(f"  rpc-aware : {fit['result']} (floor={fit['min_ctx']}, split probes={len(fit['rpc_fracs'])}, context probes={len(fit['grow'])})")
-        if fit["rpc_fracs"]:
-            print("    rpc_frac attempts:")
-            for i, probe in enumerate(fit["rpc_fracs"], 1):
-                print(f"      #{i}: {probe['frac']:.4f} {probe['verdict']} (measure={probe['measured']}, devices={probe['devices']}, margins={probe['margin_ok']})")
-        if fit["grow"]:
-            print("    context attempts:")
-            for i, probe in enumerate(fit["grow"], 1):
-                print(f"      #{i}: n_ctx={probe['n_ctx']} {probe['verdict']} (measure={probe['measured']}, margins={probe['margins_ok']})")
-        if fit["rejected_candidates"]:
-            print(f"    min-ctx rejects: {', '.join(fit['rejected_candidates'])}")
-        if fit["selected"]:
-            print(f"    selected  : n_ctx={fit['selected']['n_ctx']} split_size={fit['selected']['split_size']}")
+    if r["mtp_preflights"]:
+        print("  MTP preflight:")
+        for item in r["mtp_preflights"]:
+            reserve = "reserve grew" if item["reserve_grew"] else "reserve stable"
+            print(f"    #{item['iteration']}: n_ctx={item['n_ctx']} MTP={item['mtp_mib']:.2f} MiB ({reserve})")
+    if r["rpc_fits"]:
+        print(f"  rpc-aware passes: {len(r['rpc_fits'])}")
+        for fit_index, fit in enumerate(r["rpc_fits"], 1):
+            counts = "candidate counts pending"
+            if fit["dense_splits"] is not None:
+                counts = f"{fit['dense_splits']} dense splits, {fit['pool_opts']} pool options, {fit['n_expert']} experts"
+            print(f"    #{fit_index}: {fit['result']} (floor={fit['min_ctx']}, {counts}, logged split/context probes={len(fit['rpc_fracs'])}/{len(fit['grow'])})")
+            if fit["selected"]:
+                selected = fit["selected"]
+                print(f"      selected: {selected['candidate']} n_ctx={selected['n_ctx']} rpc_frac={selected['rpc_frac']:.4f} split_size={selected['split_size']}")
+            elif fit["grow"]:
+                probe = fit["grow"][-1]
+                budget = "" if probe["probes_used"] is None else f" probes={probe['probes_used']}/{probe['probes_limit']}"
+                print(f"      latest context probe: n_ctx={probe['n_ctx']} {probe['verdict']}{budget}")
+            if fit["rpc_fracs"]:
+                probe = fit["rpc_fracs"][-1]
+                print(f"      latest split probe: rpc_frac={probe['frac']:.4f} {probe['verdict']} (measure={probe['measured']}, devices={probe['devices']}, margins={probe['margin_ok']})")
+            if fit["rejected_candidates"]:
+                print(f"      min-ctx rejects: {', '.join(fit['rejected_candidates'])}")
+            if fit["result"] == "in progress" and not fit["rpc_fracs"] and not fit["grow"]:
+                print("      probe detail: no split/context probe lines found in this log")
     if r["fit_margins"]:
         print("  fit margins:")
         for device, name, target, margin in r["fit_margins"]:

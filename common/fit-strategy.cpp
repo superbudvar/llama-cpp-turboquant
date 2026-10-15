@@ -657,14 +657,17 @@ static int32_t fit_grow_context(
 
     const auto fits = [&](const common_fit_plan & p, fit_measure_result & m) -> bool {
         if (attempt_counter && attempt_limit > 0 && *attempt_counter >= attempt_limit) {
+            LOG_TRC("%s: grow fits n_ctx=%u measure=0 margins=0 -> FAIL (probe budget %zu/%zu)\n",
+                    __func__, p.n_ctx, *attempt_counter, attempt_limit);
             return false;
         }
         const bool ok_m = fit_measure_plan(decode_probe, p, mparams, cparams, path_model, m, true,
                 attempt_counter, search_session);
-        if (!ok_m) { LOG_DBG("%s: grow fits FAIL measure n_ctx=%u\n", __func__, p.n_ctx); return false; }
-        if (!fit_same_devices(m.devs, analysis)) { LOG_DBG("%s: grow fits FAIL devs n_ctx=%u\n", __func__, p.n_ctx); return false; }
-        const bool ok_fm = fit_fits_margins(m.memory, margins, analysis, nullptr, &ceiling_free, &ceiling_free_warm);
-        LOG_DBG("%s: grow fits n_ctx=%u measure=%d margins=%d -> %s\n", __func__, p.n_ctx, ok_m ? 1 : 0, ok_fm ? 1 : 0, ok_fm ? "ok" : "FAIL");
+        const bool ok_devs = ok_m && fit_same_devices(m.devs, analysis);
+        const bool ok_fm = ok_devs && fit_fits_margins(m.memory, margins, analysis, nullptr, &ceiling_free, &ceiling_free_warm);
+        LOG_TRC("%s: grow fits n_ctx=%u measure=%d margins=%d -> %s (probes=%zu/%zu)\n",
+                __func__, p.n_ctx, ok_m ? 1 : 0, ok_fm ? 1 : 0, ok_fm ? "ok" : "FAIL",
+                attempt_counter ? *attempt_counter : 0, attempt_limit);
         return ok_fm;
     };
 
@@ -1392,9 +1395,10 @@ static bool fit_solve_rpc_aware(
                 const bool ok_devs = ok_measure && fit_same_devices(floor_measure.devs, analysis);
                 const bool ok_margin = ok_devs && fit_fits_margins(floor_measure.memory, margins, analysis,
                         nullptr, &ceiling_free, &ceiling_free_warm);
-                LOG_DBG("%s: rpc_frac=%.4f min_ctx measure=%d devs=%d margin=%d -> %s\n",
+                LOG_TRC("%s: rpc_frac=%.4f min_ctx measure=%d devs=%d margin=%d -> %s (fraction=%zu/%zu probes=%zu/%zu candidate=%s)\n",
                         __func__, ftry, ok_measure ? 1 : 0, ok_devs ? 1 : 0, ok_margin ? 1 : 0,
-                        ok_margin ? "FEASIBLE" : "rejected");
+                        ok_margin ? "FEASIBLE" : "rejected", fi + 1, fractions.size(), attempt_count,
+                        attempt_limit, cand.label.c_str());
                 if (!ok_margin) continue;
                 found_floor_fit = true;
 

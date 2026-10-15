@@ -91,6 +91,10 @@ candidate set and logged.
 The interconnect link matrix (latency + bandwidth) is probed directly; a failed
 probe uses conservative defaults and warns, never aborts.
 
+RPC-aware fit progress is logged at trace verbosity (`-lv 4`).
+`tools/parse-fit-log.py` reports each fit pass separately, including repeated MTP
+preflight fits. Probe counts are lines found in the log, not inferred attempts.
+
 ## Pool budget policy
 
 `common_fit_strategy_pool_budget` computes the bounded MoE cache budget:
