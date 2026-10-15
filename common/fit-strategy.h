@@ -25,6 +25,7 @@ enum common_fit_role {
     COMMON_FIT_ROLE_EXPERT_DOWN,
     COMMON_FIT_ROLE_NORM,
     COMMON_FIT_ROLE_EMBED,
+    COMMON_FIT_ROLE_LAYER_OUTPUT,
 };
 
 struct common_fit_tensor_meta {
@@ -118,10 +119,20 @@ struct common_fit_plan {
 };
 
 struct common_fit_search_session {
-    size_t probes_without_improvement = 0;
+    size_t probes_used = 0;
+    size_t probe_cache_hits = 0;
     bool has_incumbent = false;
     uint64_t fit_key = 0;
     common_fit_plan incumbent;
+    struct probe_cache_entry {
+        std::string key;
+        common_device_memory_data_vec memory;
+        std::vector<ggml_backend_dev_t> devs;
+        uint32_t hp_ngl = 0;
+        uint32_t hp_nct = 0;
+        uint32_t hp_nex = 0;
+    };
+    std::vector<probe_cache_entry> probe_cache;
 };
 
 // Measure seam: mirrors the common_get_device_memory_data signature (fit-probe.h).
@@ -172,7 +183,7 @@ size_t common_fit_strategy_pool_budget(size_t working_set_bytes, size_t remainin
 // for safety; this returns an empty ceiling vector.
 std::vector<int64_t> common_fit_probe_ceiling_warm(llama_model * model, const common_params & params);
 
-// Activation profile schema (Issue 3, schema + sink only - no decode-path hooks in v1).
+// Activation profile counters for decode-time layer outputs.
 struct common_activation_profile {
     int version = 1;
     std::string model_id;
@@ -182,6 +193,11 @@ struct common_activation_profile {
         int64_t n_tokens;
         int64_t expert_set;
         int64_t kv_touched;
+        int32_t layer = -1;
+        std::string device_id;
+        bool is_rpc = false;
+        int64_t activation_bytes = 0;
+        int64_t n_calls = 0;
     };
     std::vector<counters_t> counters;
 };

@@ -101,6 +101,11 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
 
+    activation_profile_callback = params.activation_profile_callback;
+    activation_profile_user_data = params.activation_profile_user_data;
+    activation_profile_model_id = params.activation_profile_model_id != nullptr
+        ? params.activation_profile_model_id : model.desc();
+
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
 
@@ -796,6 +801,11 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    if (activation_profile_callback != nullptr) {
+        activation_profile_callback(activation_profile_user_data, activation_profile_model_id.c_str(),
+                -1, "", false, 0, 0, true);
+    }
 
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -3411,6 +3421,16 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_set_name(cur, name);
         }
 
+        if (activation_profile_callback != nullptr && decode_phase == LLAMA_DECODE_PHASE_GENERATION &&
+                il >= 0 && strcmp(name, "l_out") == 0) {
+            auto dev = model.dev_layer(il);
+            auto reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            activation_profile_callback(activation_profile_user_data, activation_profile_model_id.c_str(),
+                    il, dev != nullptr ? ggml_backend_dev_name(dev) : "unknown",
+                    reg != nullptr && strcmp(ggml_backend_reg_name(reg), "RPC") == 0,
+                    ubatch.n_tokens, ggml_nbytes(cur), false);
+        }
+
         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
         // FIXME: fix in ggml_backend_sched
@@ -4459,6 +4479,9 @@ llama_context_params llama_context_default_params() {
         /*.n_sampler                   =*/0,
         /*.ctx_other                   =*/nullptr,
         /*.kv_stream_arena_mib         =*/0,
+        /*.activation_profile_callback =*/nullptr,
+        /*.activation_profile_user_data=*/nullptr,
+        /*.activation_profile_model_id =*/nullptr,
     };
 
     return result;

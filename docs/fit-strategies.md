@@ -122,10 +122,15 @@ keeps the hottest experts; a fixed layer split cannot.
 
 ## Activation profile
 
-`common_activation_profile` records per-tensor decode counters (token count,
-routed expert set, KV rows touched). `common_activation_profile_sink` appends one
-JSONL row per profile to a path. v1 ships the schema and the sink only; the
-decode-path hooks that feed the profile are a follow-up.
+`LLAMA_ACTIVATION_PROFILE=/path/to/profile.jsonl` enables opt-in decode profiling
+for common clients that mark generation-phase decodes; `llama-server` does this.
+The server records each layer's `l_out` token count, output
+bytes, and assigned device during generation. The output is aggregated per layer
+and written as a versioned JSONL row when the context is destroyed. Prompt batches
+are excluded. `activation_bytes` is the accumulated layer-output size; it estimates
+the payload at a layer boundary and is not a direct measurement of RPC wire bytes.
+The profile is diagnostic only and does not affect fit selection. Keep profiles
+for the same model path and workload when comparing split candidates.
 
 ## Manual plan caveat
 

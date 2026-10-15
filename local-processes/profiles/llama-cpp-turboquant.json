@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "project": "llama-cpp-turboquant",
+  "repo_root_from_profile": "../..",
+  "libvirt_uri": "qemu:///system",
+  "domain": "win11",
+  "guest_hostname": "virtwin11",
+  "interface_mac": "52:54:00:13:c3:a7",
+  "virtiofs_tag": "turboquant",
+  "guest_repo_root": "Z:\\",
+  "guest_build_script": "Z:\\local-processes\\windows\\build.ps1",
+  "guest_profile_path": "Z:\\local-processes\\profiles\\llama-cpp-turboquant.json",
+  "ssh": {
+    "user": "simon",
+    "identity_file": "~/.ssh/llama_windows_vm",
+    "host_key_alias": "win11-build",
+    "host_key_fingerprint": "SHA256:wVzFFS03nA7J03osC/QjoLNvESCjpt16flS6agODNoE"
+  },
+  "ip_discovery": {
+    "sources": ["agent", "lease", "arp"],
+    "wait_seconds": 180,
+    "poll_seconds": 3
+  },
+  "scratch": {
+    "host_root": "/mnt/build/local-processes",
+    "size_gib": 8,
+    "reserve_bytes": 1073741824,
+    "qemu_group": "qemu",
+    "target_bus": "scsi",
+    "target": "sdb",
+    "serial_prefix": "WB",
+    "guest_drive_letter": "R"
+  },
+  "artifacts": {
+    "host_root_from_repo": "local-processes/artifacts/llama-cpp-turboquant",
+    "guest_root": "Z:\\local-processes\\artifacts\\llama-cpp-turboquant",
+    "minimum_free_bytes": 536870912,
+    "expected_executables": ["llama-server.exe", "ggml-rpc-server.exe"]
+  },
+  "windows_build": {
+    "cuda_version": "13.2",
+    "cuda_path": "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.2",
+    "cuda_architectures": "86-real",
+    "generator": "Ninja Multi-Config",
+    "configuration": "Release",
+    "jobs": 2,
+    "targets": ["llama-server", "ggml-rpc-server"],
+    "cmake_options": [
+      "-DGGML_CUDA=ON",
+      "-DGGML_CUDA_CUB_3DOT2=ON",
+      "-DLLAMA_BUILD_SERVER=ON",
+      "-DLLAMA_BUILD_EXAMPLES=ON",
+      "-DLLAMA_BUILD_TOOLS=ON",
+      "-DGGML_RPC=ON",
+      "-DGGML_BACKEND_DL=ON",
+      "-DGGML_NATIVE=OFF"
+    ]
+  },
+  "shutdown_if_started": false
+}

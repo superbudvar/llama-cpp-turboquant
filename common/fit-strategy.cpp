@@ -10,17 +10,19 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cinttypes>
 #include <climits>
 #include <cstring>
 #include <fstream>
 #include <map>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-static constexpr uint32_t COMMON_FIT_SEARCH_POLICY_VERSION = 1;
+static constexpr uint32_t COMMON_FIT_SEARCH_POLICY_VERSION = 2;
 
 // local copy of the guard exception from fit.cpp. fit.cpp's copy is private to
 // that translation unit and the probe seam never throws it, so the strategy
@@ -39,6 +41,7 @@ static const char * fit_role_name(common_fit_role role) {
         case COMMON_FIT_ROLE_EXPERT_DOWN: return "expert_down";
         case COMMON_FIT_ROLE_NORM:        return "norm";
         case COMMON_FIT_ROLE_EMBED:       return "embed";
+        case COMMON_FIT_ROLE_LAYER_OUTPUT:return "layer_output";
     }
     return "unknown";
 }
@@ -164,6 +167,50 @@ struct fit_measure_result {
     uint32_t hp_nex = 0;
 };
 
+// Margins are excluded so MTP reserve-only refits can recheck exact footprints.
+static std::string fit_measure_cache_key(
+        const std::string & path_model,
+        const llama_model_params & mparams,
+        const llama_context_params & cparams,
+        bool no_alloc) {
+    std::ostringstream key;
+    key << path_model << ':' << no_alloc << ':' << mparams.n_gpu_layers << ':'
+        << mparams.split_mode << ':' << mparams.load_mode << ':' << mparams.tensor_read_lazy << ':'
+        << mparams.main_gpu << ':' << mparams.vocab_only << ':' << mparams.check_tensors << ':'
+        << mparams.use_extra_bufts << ':' << mparams.no_host << ':' << mparams.no_alloc << ':'
+        << mparams.load_mtp << ':' << std::hexfloat;
+    if (mparams.devices) {
+        for (size_t i = 0; i < llama_max_devices(); i++) {
+            key << reinterpret_cast<uintptr_t>(mparams.devices[i]) << ',';
+            if (!mparams.devices[i]) break;
+        }
+    }
+    key << ':';
+    if (mparams.tensor_split) {
+        for (size_t i = 0; i < llama_max_devices(); i++) key << mparams.tensor_split[i] << ',';
+    }
+    key << ':';
+    if (mparams.tensor_buft_overrides) {
+        for (const auto * item = mparams.tensor_buft_overrides; item->pattern; item++) {
+            key << item->pattern << '=' << reinterpret_cast<uintptr_t>(item->buft) << ',';
+        }
+    }
+    key << ':' << cparams.n_ctx << ':' << cparams.n_batch << ':' << cparams.n_ubatch << ':'
+        << cparams.n_seq_max << ':' << cparams.n_rs_seq << ':' << cparams.gdn_replay << ':'
+        << cparams.n_outputs_max << ':' << cparams.n_threads << ':' << cparams.n_threads_batch << ':'
+        << cparams.ctx_type << ':' << cparams.rope_scaling_type << ':'
+        << cparams.pooling_type << ':' << cparams.attention_type << ':' << cparams.flash_attn_type << ':'
+        << cparams.rope_freq_base << ':' << cparams.rope_freq_scale << ':' << cparams.yarn_ext_factor << ':'
+        << cparams.yarn_attn_factor << ':' << cparams.yarn_beta_fast << ':' << cparams.yarn_beta_slow << ':'
+        << cparams.yarn_orig_ctx << ':' << cparams.defrag_thold << ':' << cparams.type_k << ':'
+        << cparams.type_v << ':' << cparams.moe_cache_mode << ':' << cparams.moe_cache_budget_mib << ':'
+        << cparams.embeddings << ':' << cparams.offload_kqv << ':' << cparams.no_perf << ':'
+        << cparams.op_offload << ':' << cparams.swa_full << ':' << cparams.kv_unified << ':'
+        << cparams.n_samplers << ':' << reinterpret_cast<uintptr_t>(cparams.samplers) << ':'
+        << reinterpret_cast<uintptr_t>(cparams.ctx_other) << ':' << cparams.kv_stream_arena_mib;
+    return key.str();
+}
+
 // measure a concrete plan through the probe seam. returns false when the
 // context cannot be created at this placement (soft reject); hard errors and
 // model-not-found rethrow.
@@ -175,7 +222,8 @@ static bool fit_measure_plan(
         const std::string & path_model,
         fit_measure_result & out,
         bool no_alloc = false,
-        size_t * attempt_counter = nullptr) {
+        size_t * attempt_counter = nullptr,
+        common_fit_search_session * search_session = nullptr) {
     const common_fit_measure_fn & measure = no_alloc && probe.measure_no_alloc
         ? probe.measure_no_alloc : probe.measure;
     if (!measure) {
@@ -194,6 +242,22 @@ static bool fit_measure_plan(
     if (plan.n_ctx > 0) {
         cc.n_ctx = plan.n_ctx;
     }
+    const std::string cache_key = search_session
+        ? fit_measure_cache_key(path_model, cp, cc, no_alloc) : std::string();
+    if (search_session) {
+        const auto found = std::find_if(search_session->probe_cache.begin(), search_session->probe_cache.end(),
+                [&](const auto & entry) { return entry.key == cache_key; });
+        if (found != search_session->probe_cache.end()) {
+            out.memory = found->memory;
+            out.devs = found->devs;
+            out.hp_ngl = found->hp_ngl;
+            out.hp_nct = found->hp_nct;
+            out.hp_nex = found->hp_nex;
+            search_session->probe_cache_hits++;
+            LOG_DBG("%s: reused exact probe for n_ctx=%u\n", __func__, cc.n_ctx);
+            return true;
+        }
+    }
     try {
         if (attempt_counter) {
             (*attempt_counter)++;
@@ -211,6 +275,13 @@ static bool fit_measure_plan(
     LOG_DBG("%s: fit_measure_plan OK n_ctx=%u split0=%.3f ndevs=%zu mode=%s\n",
             __func__, cc.n_ctx, cp.tensor_split ? cp.tensor_split[0] : -1.0f,
             out.devs.size(), no_alloc ? "no_alloc" : "alloc");
+    if (search_session) {
+        constexpr size_t probe_cache_limit = 256;
+        if (search_session->probe_cache.size() >= probe_cache_limit) {
+            search_session->probe_cache.erase(search_session->probe_cache.begin());
+        }
+        search_session->probe_cache.push_back({ cache_key, out.memory, out.devs, out.hp_ngl, out.hp_nct, out.hp_nex });
+    }
     return true;
 }
 
@@ -563,7 +634,9 @@ static int32_t fit_grow_context(
         int32_t ngl_override,
         const std::vector<int64_t> & ceiling_free,
         const std::vector<int64_t> & ceiling_free_warm,
-        size_t * attempt_counter = nullptr) {
+        size_t * attempt_counter = nullptr,
+        size_t attempt_limit = 0,
+        common_fit_search_session * search_session = nullptr) {
     // an explicit --ctx-size is a hard requirement: fit model + exactly that
     // context and never grow or shrink it. the fit then only sheds model layers
     // (n_gpu_layers) to CPU/RPC if the full offload does not fit. when only
@@ -583,7 +656,11 @@ static int32_t fit_grow_context(
     // the model's n_ctx_train. the binary search below narrows it down.
 
     const auto fits = [&](const common_fit_plan & p, fit_measure_result & m) -> bool {
-        const bool ok_m = fit_measure_plan(decode_probe, p, mparams, cparams, path_model, m, true, attempt_counter);
+        if (attempt_counter && attempt_limit > 0 && *attempt_counter >= attempt_limit) {
+            return false;
+        }
+        const bool ok_m = fit_measure_plan(decode_probe, p, mparams, cparams, path_model, m, true,
+                attempt_counter, search_session);
         if (!ok_m) { LOG_DBG("%s: grow fits FAIL measure n_ctx=%u\n", __func__, p.n_ctx); return false; }
         if (!fit_same_devices(m.devs, analysis)) { LOG_DBG("%s: grow fits FAIL devs n_ctx=%u\n", __func__, p.n_ctx); return false; }
         const bool ok_fm = fit_fits_margins(m.memory, margins, analysis, nullptr, &ceiling_free, &ceiling_free_warm);
@@ -715,7 +792,8 @@ static int32_t fit_spill_split_at_ngl(
         float & out_frac,
         const std::vector<int64_t> & ceiling_free,
         const std::vector<int64_t> & ceiling_free_warm,
-        size_t * attempt_counter = nullptr) {
+        size_t * attempt_counter = nullptr,
+        common_fit_search_session * search_session = nullptr) {
     out_frac = -1.0f;
     const int32_t min_ctx = (int32_t) (params.n_ctx > 0 ? params.n_ctx : params.fit_strategy_min_ctx);
     const float step = 0.05f;
@@ -769,7 +847,8 @@ static int32_t fit_spill_split_at_ngl(
         if (f < 0.0f) { f = 0.0f; }
         common_fit_plan plan = fit_plan_from_spec(analysis, spec, loader_ngl, min_ctx, f, ngl);
         fit_measure_result m;
-        const bool ok_measure = fit_measure_plan(probe, plan, mparams, cparams, path_model, m, true, attempt_counter);
+        const bool ok_measure = fit_measure_plan(probe, plan, mparams, cparams, path_model, m, true,
+                attempt_counter, search_session);
         const bool ok_devs    = ok_measure && fit_same_devices(m.devs, analysis);
         size_t fail = (size_t) -1;
         const bool ok_margin  = ok_devs && fit_fits_margins(m.memory, margins, analysis, &fail, &ceiling_free, &ceiling_free_warm);
@@ -858,7 +937,7 @@ static int32_t fit_spill_split_at_ngl(
         fit_measure_result m;
         const int32_t ctx = fit_grow_context(analysis, margins, params, mparams, cparams,
                 probe, spec, f, loader_ngl, path_model, plan, m, ngl, ceiling_free, ceiling_free_warm,
-                attempt_counter);
+                attempt_counter, 0, search_session);
         if (ctx < 0) { continue; }
         if (best_ctx < 0 || ctx > best_ctx) {
             best_ctx = ctx;
@@ -948,6 +1027,25 @@ static float fit_rpc_scan_hi(const common_fit_analysis & analysis, const std::ve
         total_model += t.bytes;
     }
     return total_model > 0 ? std::min(1.0f, (float) rpc_avail / (float) total_model) : 0.0f;
+}
+
+static float fit_rpc_preferred_fraction(
+        const common_fit_analysis & analysis,
+        const std::vector<int64_t> & margins,
+        const std::vector<int> & split_devices,
+        float hi) {
+    int local = -1;
+    int rpc = -1;
+    for (int id : split_devices) {
+        if (analysis.devices[id].is_rpc) rpc = id;
+        else if (local < 0) local = id;
+    }
+    if (local < 0 || rpc < 0) return hi * 0.5f;
+    const int64_t local_headroom = std::max<int64_t>(0, analysis.devices[local].free_bytes - margins[local]);
+    const int64_t rpc_headroom = std::max<int64_t>(0, analysis.devices[rpc].free_bytes - margins[rpc]);
+    const int64_t total_headroom = local_headroom + rpc_headroom;
+    if (total_headroom <= 0) return hi * 0.5f;
+    return std::min(hi, (float) rpc_headroom / (float) total_headroom);
 }
 
 // pool that is never the main_gpu device. first fit wins; returns false when no
@@ -1045,7 +1143,7 @@ static bool fit_solve_rpc_aware(
     const auto shed_levels = fit_shed_levels(reserves);
     fprintf(stderr, "[FITDBG] %zu candidates, %zu shed levels\n", candidates.size(), shed_levels.size()); fflush(stderr);
     const uint64_t fit_key = common_fit_cache_key_hash(params, path_model, analysis);
-    size_t attempt_count = search_session ? search_session->probes_without_improvement : 0;
+    size_t attempt_count = search_session ? search_session->probes_used : 0;
     const size_t attempt_limit = params.fit_max_attempts;
     common_fit_plan session_resume_plan;
     const common_fit_plan * progress_plan = resume_plan;
@@ -1131,8 +1229,8 @@ static bool fit_solve_rpc_aware(
                 best_split_size = (size_t) std::max(0, progress_plan->search.best_split_size);
                 best_rpc_frac = progress_plan->search.best_rpc_frac;
                 best_label = "cached incumbent";
-                if (fit_measure_plan(probe, best_plan, mparams, cparams, path_model, best_m, true)) {
-                    attempt_count++;
+                if (fit_measure_plan(probe, best_plan, mparams, cparams, path_model, best_m, true,
+                            &attempt_count, search_session)) {
                     if (!fit_same_devices(best_m.devs, analysis) ||
                             !fit_fits_margins(best_m.memory, margins, analysis, nullptr, &ceiling_free, &ceiling_free_warm)) {
                         best_ctx = -1;
@@ -1150,9 +1248,28 @@ static bool fit_solve_rpc_aware(
             }
         }
 
+        const auto retain_incumbent = [&](size_t candidate_cursor) {
+            search_complete = false;
+            out_plan = best_plan;
+            out_plan.search.complete = false;
+            out_plan.search.policy_version = COMMON_FIT_SEARCH_POLICY_VERSION;
+            out_plan.search.shed_level = (int32_t) li;
+            out_plan.search.candidate_cursor = (int32_t) candidate_cursor;
+            out_plan.search.best_split_size = (int32_t) best_split_size;
+            out_plan.search.best_rpc_frac = best_rpc_frac;
+            out_plan.search.baseline_free.clear();
+            for (const auto & d : analysis.devices) out_plan.search.baseline_free.push_back(d.free_bytes);
+            out_measure = best_m;
+        };
+
         for (size_t ci = first_candidate; ci < candidates.size(); ci++) {
+            if (best_ctx >= 0 && attempt_limit > 0 && attempt_count >= attempt_limit) {
+                retain_incumbent(ci);
+                LOG_INF("%s: attempt budget reached (%zu measured probes); retaining incumbent n_ctx=%d\n",
+                        __func__, attempt_count, best_ctx);
+                break;
+            }
             const auto & cand = candidates[ci];
-            const int32_t incumbent_ctx_at_start = best_ctx;
             // rpc-split candidates split the full model across local + RPC via
             // tensor_split. rpc_frac feasibility is an interval: at low rpc_frac the
             // local device overflows (too much model) and at high rpc_frac the RPC
@@ -1173,7 +1290,7 @@ static bool fit_solve_rpc_aware(
                 fit_measure_result m;
                 const int32_t ctx = fit_grow_context(analysis, margins, params, mparams, cparams,
                         probe, cand, -1.0f, loader_ngl, path_model, plan, m, ngl_hint, ceiling_free, ceiling_free_warm,
-                        &attempt_count);
+                        &attempt_count, attempt_limit, search_session);
                 if (ctx >= 0) {
                     // prefer wider split on context tie. when a later candidate
                     // reaches the same context with more devices, overwrite.
@@ -1193,9 +1310,6 @@ static bool fit_solve_rpc_aware(
                         spill_spec = cand;
                         have_spill = true;
                     }
-                }
-                if (best_ctx > incumbent_ctx_at_start) {
-                    attempt_count = 0;
                 }
                 if (best_ctx >= context_ceiling && context_ceiling > 0) {
                     LOG_INF("%s: context ceiling reached by %s at n_ctx=%d; accepting this margin-valid plan without probing later candidates\n",
@@ -1221,106 +1335,128 @@ static bool fit_solve_rpc_aware(
                 continue;
             }
 
-            // bracket the feasible rpc_frac interval at the minimum context
             const float hi = fit_rpc_scan_hi(analysis, cand.split_devices);
-
-            // coarse floor scan (step 0.05) to find feasible rpc_frac values
-            std::vector<float> feas;
             const bool resume_this_rpc = resume_rpc_stage &&
                     li == (size_t) progress_plan->search.shed_level &&
                     ci == (size_t) std::max(0, progress_plan->search.candidate_cursor);
-            if (!resume_this_rpc) {
-                for (float f = hi; f >= 0.0f; f -= 0.05f) {
-                    common_fit_plan plan = fit_plan_from_spec(analysis, cand, loader_ngl, (int32_t) params.fit_strategy_min_ctx, f);
-                    fit_measure_result m;
-                    const bool ok_measure = fit_measure_plan(probe, plan, mparams, cparams, path_model, m, true, &attempt_count);
-                    const bool ok_devs    = ok_measure && fit_same_devices(m.devs, analysis);
-                    const bool ok_margin  = ok_devs && fit_fits_margins(m.memory, margins, analysis, nullptr, &ceiling_free, &ceiling_free_warm);
-                    LOG_DBG("%s: rpc_frac=%.4f measure=%d devs=%d margin=%d -> %s\n",
-                            __func__, f, ok_measure ? 1 : 0, ok_devs ? 1 : 0, ok_margin ? 1 : 0,
-                            ok_margin ? "FEASIBLE" : "rejected");
-                    if (ok_margin) {
-                        feas.push_back(f);
-                    }
-                }
+            // Start near the headroom balance and grow the first safe split before
+            // spending probes on less promising fractions.
+            const float preferred = fit_rpc_preferred_fraction(analysis, margins, cand.split_devices, hi);
+            std::vector<float> fractions;
+            for (float f = 0.0f; f < hi; f += 0.05f) fractions.push_back(f);
+            if (fractions.empty() || std::fabs(fractions.back() - hi) > 1e-6f) fractions.push_back(hi);
+            if (std::none_of(fractions.begin(), fractions.end(), [&](float f) { return std::fabs(f - preferred) < 1e-6f; })) {
+                fractions.push_back(preferred);
             }
-            float f_hi_off = resume_this_rpc ? progress_plan->search.rpc_frac_high :
-                    (feas.empty() ? -1.0f : feas.front());
-            float f_lo_off = resume_this_rpc ? progress_plan->search.rpc_frac_low :
-                    (feas.empty() ? -1.0f : feas.back());
-            if (!resume_this_rpc && feas.empty()) {
-                LOG_DBG("%s: candidate %s could not fit any rpc_frac at the minimum context, skipping\n",
-                        __func__, cand.label.c_str());
-                if (!have_rpc_spill) {
-                    // this candidate overrides a local-only spill base recorded
-                    // above, so RPC stays in use (rocm+rpc+cpu) during the spill
-                    spill_spec = cand;
-                    have_rpc_spill = true;
-                    have_spill = true;
+            std::stable_sort(fractions.begin(), fractions.end(), [&](float a, float b) {
+                const float da = std::fabs(a - preferred);
+                const float db = std::fabs(b - preferred);
+                return da == db ? a < b : da < db;
+            });
+
+            size_t fraction_start = 0;
+            if (resume_this_rpc) {
+                const float next = progress_plan->search.rpc_frac_next;
+                const auto next_it = std::find_if(fractions.begin(), fractions.end(),
+                        [&](float f) { return std::fabs(f - next) < 1e-6f; });
+                if (next_it == fractions.end()) {
+                    LOG_WRN("%s: cached RPC split cursor is invalid; restarting this candidate\n", __func__);
+                } else {
+                    fraction_start = (size_t) (next_it - fractions.begin());
                 }
-                continue;
-            }
-            // scanned top-down: front = largest rpc_frac (max offload), back = smallest
-            if (resume_this_rpc && (f_lo_off < 0.0f || f_hi_off < f_lo_off)) {
-                LOG_WRN("%s: cached RPC split interval is invalid; restarting this candidate\n", __func__);
-                continue;
             }
 
-            // pick the rpc_frac that maximizes the achievable context. with a layer
-            // split the KV cache follows the weights, so the device holding the larger
-            // layer share is the context bottleneck. a balanced split maximizes the
-            // global context; a min-offload split leaves the local device holding most
-            // layers and caps context far below the available headroom.
-            // scan bottom-up so that among splits reaching the same maximum context
-            // the smallest rpc_frac (least RPC offload) wins: RPC is used last to
-            // avoid per-token network lag on the dense path.
             float best_ftry = -1.0f;
             int32_t cand_best_ctx = -1;
             common_fit_plan cand_best_plan;
             fit_measure_result cand_best_m;
-            const float ftry_start = resume_this_rpc
-                    ? std::max(f_lo_off, progress_plan->search.rpc_frac_next) : f_lo_off;
-            for (float ftry = ftry_start; ftry <= f_hi_off + 1e-6f; ftry += 0.05f) {
-                common_fit_plan plan;
-                fit_measure_result m;
-                const int32_t ctx = fit_grow_context(analysis, margins, params, mparams, cparams,
-                        probe, cand, ftry, loader_ngl, path_model, plan, m, -1, ceiling_free, ceiling_free_warm,
-                        &attempt_count);
-                if (ctx < 0) continue;
-                if (cand_best_ctx < 0 || ctx > cand_best_ctx) {
-                    cand_best_ctx = ctx;
-                    best_ftry = ftry;
-                    cand_best_plan = plan;
-                    cand_best_m = m;
+            bool found_floor_fit = false;
+            for (size_t fi = fraction_start; fi < fractions.size(); fi++) {
+                const float ftry = fractions[fi];
+                if (best_ctx >= 0 && attempt_limit > 0 && attempt_count >= attempt_limit) {
+                    retain_incumbent(ci);
+                    out_plan.search.rpc_stage = 2;
+                    out_plan.search.rpc_frac_next = ftry;
+                    out_plan.search.rpc_frac_low = 0.0f;
+                    out_plan.search.rpc_frac_high = hi;
+                    LOG_INF("%s: attempt budget reached (%zu measured probes); retaining incumbent n_ctx=%d\n",
+                            __func__, attempt_count, best_ctx);
+                    break;
                 }
+
+                common_fit_plan floor_plan = fit_plan_from_spec(analysis, cand, loader_ngl,
+                        (int32_t) params.fit_strategy_min_ctx, ftry);
+                fit_measure_result floor_measure;
+                const bool ok_measure = fit_measure_plan(probe, floor_plan, mparams, cparams,
+                        path_model, floor_measure, true, &attempt_count, search_session);
+                const bool ok_devs = ok_measure && fit_same_devices(floor_measure.devs, analysis);
+                const bool ok_margin = ok_devs && fit_fits_margins(floor_measure.memory, margins, analysis,
+                        nullptr, &ceiling_free, &ceiling_free_warm);
+                LOG_DBG("%s: rpc_frac=%.4f min_ctx measure=%d devs=%d margin=%d -> %s\n",
+                        __func__, ftry, ok_measure ? 1 : 0, ok_devs ? 1 : 0, ok_margin ? 1 : 0,
+                        ok_margin ? "FEASIBLE" : "rejected");
+                if (!ok_margin) continue;
+                found_floor_fit = true;
+
+                const int32_t min_ctx = (int32_t) params.fit_strategy_min_ctx;
                 const size_t split_size = cand.split_devices.size();
-                if (ctx > best_ctx || (ctx == best_ctx && split_size > best_split_size)) {
-                    best_ctx = ctx;
+                if (cand_best_ctx < 0 || min_ctx > cand_best_ctx ||
+                        (min_ctx == cand_best_ctx && ftry < best_ftry)) {
+                    cand_best_ctx = min_ctx;
+                    best_ftry = ftry;
+                    cand_best_plan = floor_plan;
+                    cand_best_m = floor_measure;
+                }
+                if (min_ctx > best_ctx || (min_ctx == best_ctx && split_size > best_split_size) ||
+                        (min_ctx == best_ctx && split_size == best_split_size && best_rpc_frac >= 0.0f && ftry < best_rpc_frac)) {
+                    best_ctx = min_ctx;
                     best_split_size = split_size;
-                    best_plan = plan;
-                    best_m = m;
+                    best_plan = floor_plan;
+                    best_m = floor_measure;
                     best_label = cand.label;
                     best_rpc_frac = ftry;
-                    attempt_count = 0;
                 }
-                if (context_ceiling > 0 && ctx >= context_ceiling) {
-                    break;
+
+                common_fit_plan plan;
+                fit_measure_result m;
+                const size_t refine_limit = best_ctx >= 0 ? attempt_limit : 0;
+                const int32_t ctx = fit_grow_context(analysis, margins, params, mparams, cparams,
+                        probe, cand, ftry, loader_ngl, path_model, plan, m, -1, ceiling_free, ceiling_free_warm,
+                        &attempt_count, refine_limit, search_session);
+                if (ctx >= 0) {
+                    if (ctx > cand_best_ctx || (ctx == cand_best_ctx && ftry < best_ftry)) {
+                        cand_best_ctx = ctx;
+                        best_ftry = ftry;
+                        cand_best_plan = plan;
+                        cand_best_m = m;
+                    }
+                    if (ctx > best_ctx || (ctx == best_ctx && split_size > best_split_size) ||
+                            (ctx == best_ctx && split_size == best_split_size && best_rpc_frac >= 0.0f && ftry < best_rpc_frac)) {
+                        best_ctx = ctx;
+                        best_split_size = split_size;
+                        best_plan = plan;
+                        best_m = m;
+                        best_label = cand.label;
+                        best_rpc_frac = ftry;
+                    }
+                    if (context_ceiling > 0 && ctx >= context_ceiling) break;
                 }
-                if (best_ctx >= 0 && attempt_limit > 0 && attempt_count >= attempt_limit) {
-                    search_complete = false;
-                    best_plan.search.complete = false;
-                    best_plan.search.policy_version = COMMON_FIT_SEARCH_POLICY_VERSION;
-                    best_plan.search.shed_level = (int32_t) li;
-                    best_plan.search.candidate_cursor = (int32_t) ci;
-                    best_plan.search.best_split_size = (int32_t) best_split_size;
-                    best_plan.search.best_rpc_frac = best_rpc_frac;
-                    best_plan.search.rpc_stage = 2;
-                    best_plan.search.rpc_frac_next = ftry + 0.05f;
-                    best_plan.search.rpc_frac_low = f_lo_off;
-                    best_plan.search.rpc_frac_high = f_hi_off;
-                    best_plan.search.baseline_free.clear();
-                    for (const auto & d : analysis.devices) best_plan.search.baseline_free.push_back(d.free_bytes);
-                    break;
+            }
+            if (search_complete && best_ctx >= 0 && attempt_limit > 0 && attempt_count >= attempt_limit &&
+                    !(context_ceiling > 0 && best_ctx >= context_ceiling)) {
+                retain_incumbent(ci);
+                out_plan.search.rpc_stage = 2;
+                out_plan.search.rpc_frac_next = best_ftry >= 0.0f ? best_ftry : preferred;
+                out_plan.search.rpc_frac_low = 0.0f;
+                out_plan.search.rpc_frac_high = hi;
+            }
+            if (!found_floor_fit && !resume_this_rpc) {
+                LOG_DBG("%s: candidate %s could not fit any rpc_frac at the minimum context, skipping\n",
+                        __func__, cand.label.c_str());
+                if (!have_rpc_spill) {
+                    spill_spec = cand;
+                    have_rpc_spill = true;
+                    have_spill = true;
                 }
             }
             if (cand_best_ctx >= 0) {
@@ -1347,10 +1483,8 @@ static bool fit_solve_rpc_aware(
                 }
             }
             if (!search_complete) {
-                out_plan = best_plan;
-                out_measure = best_m;
                 LOG_INF("%s: attempt budget reached (%zu measured probes); retaining incumbent n_ctx=%d and resuming rpc_frac=%.4f\n",
-                        __func__, attempt_limit, best_ctx, best_plan.search.rpc_frac_next);
+                        __func__, attempt_count, best_ctx, out_plan.search.rpc_frac_next);
                 break;
             }
 
@@ -1386,7 +1520,7 @@ static bool fit_solve_rpc_aware(
                     __func__, best_label.c_str(), best_ctx, best_rpc_frac,
                     best_split_size, params.fit_strategy_min_ctx);
             if (search_session) {
-                search_session->probes_without_improvement = attempt_count;
+                search_session->probes_used = attempt_count;
             }
             return true;
         }
@@ -1423,10 +1557,11 @@ static bool fit_solve_rpc_aware(
                 if (spec_is_rpc_split) {
                     ctx = fit_spill_split_at_ngl(analysis, margins, params, mparams, cparams,
                             probe, spill_spec, loader_ngl, path_model, mid_ngl, scan_hi,
-                            plan, m, frac, ceiling_free, ceiling_free_warm);
+                            plan, m, frac, ceiling_free, ceiling_free_warm, nullptr, search_session);
                 } else {
                     ctx = fit_grow_context(analysis, margins, params, mparams, cparams,
-                            probe, spill_spec, -1.0f, loader_ngl, path_model, plan, m, mid_ngl, ceiling_free, ceiling_free_warm);
+                            probe, spill_spec, -1.0f, loader_ngl, path_model, plan, m, mid_ngl, ceiling_free,
+                            ceiling_free_warm, nullptr, 0, search_session);
                 }
                 if (ctx >= min_ctx) {
                     best_ngl = mid_ngl;
@@ -2156,6 +2291,11 @@ bool common_activation_profile_sink(const common_activation_profile & profile, c
         j["n_tokens"]   = c.n_tokens;
         j["expert_set"] = c.expert_set;
         j["kv_touched"] = c.kv_touched;
+        j["layer"] = c.layer;
+        j["device_id"] = c.device_id;
+        j["is_rpc"] = c.is_rpc;
+        j["activation_bytes"] = c.activation_bytes;
+        j["n_calls"] = c.n_calls;
         counters.push_back(j);
     }
     row["counters"] = counters;

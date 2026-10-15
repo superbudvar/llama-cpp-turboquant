@@ -21,11 +21,14 @@
 #include <chrono>
 #include <cstdarg>
 #include <cstring>
+#include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <map>
+#include <mutex>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -1938,6 +1941,50 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     return mparams;
 }
 
+static void common_activation_profile_callback(
+        void * user_data,
+        const char * model_id,
+        int32_t layer,
+        const char * device_name,
+        bool is_rpc,
+        uint32_t n_tokens,
+        size_t activation_bytes,
+        bool finalize) {
+    const char * path = std::getenv("LLAMA_ACTIVATION_PROFILE");
+    if (path == nullptr || path[0] == '\0' || model_id == nullptr) {
+        return;
+    }
+
+    static std::mutex mutex;
+    static std::map<std::string, common_activation_profile> profiles;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    auto & profile = profiles[model_id];
+    profile.version = 2;
+    profile.model_id = model_id;
+    if (!finalize) {
+        const std::string tensor_id = "blk." + std::to_string(layer) + ".l_out";
+        auto it = std::find_if(profile.counters.begin(), profile.counters.end(), [&](const auto & counter) {
+            return counter.tensor_id == tensor_id && counter.device_id == device_name;
+        });
+        if (it == profile.counters.end()) {
+            profile.counters.push_back({ tensor_id, COMMON_FIT_ROLE_LAYER_OUTPUT, 0, 0, 0,
+                    layer, device_name != nullptr ? device_name : "unknown", is_rpc, 0, 0 });
+            it = std::prev(profile.counters.end());
+        }
+        it->n_tokens += n_tokens;
+        it->activation_bytes += (int64_t) activation_bytes;
+        it->n_calls++;
+        return;
+    }
+
+    if (!profile.counters.empty() && !common_activation_profile_sink(profile, path)) {
+        LOG_WRN("%s: failed to write activation profile to %s\n", __func__, path);
+    }
+    profiles.erase(model_id);
+    (void) user_data;
+}
+
 struct llama_context_params common_context_params_to_llama(const common_params & params) {
     auto cparams = llama_context_default_params();
 
@@ -1982,6 +2029,12 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
     cparams.kv_stream_arena_mib = params.kv_stream_arena_mib;
+
+    const char * activation_profile_path = std::getenv("LLAMA_ACTIVATION_PROFILE");
+    if (activation_profile_path != nullptr && activation_profile_path[0] != '\0') {
+        cparams.activation_profile_callback = common_activation_profile_callback;
+        cparams.activation_profile_model_id = params.model.path.c_str();
+    }
 
     if (params.moe_cache.mode_explicit) {
         switch (params.moe_cache.mode) {

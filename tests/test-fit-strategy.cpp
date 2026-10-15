@@ -542,6 +542,7 @@ static void test_rpc_aware_placement() {
     fake_probe_ctx cfg;
     cfg.default_dev = { (int64_t) (16 * GiB), (int64_t) (16 * GiB), (size_t) (64 * MiB), (size_t) (32 * MiB), 0 };
     common_fit_search_session search_session;
+    search_session.probes_used = 7;
     const common_params_fit_status st = common_fit_strategy_apply_impl(
             params, &mparams, &cparams, nullptr, make_probe(&cfg), nullptr, &search_session);
     expect(st == COMMON_PARAMS_FIT_STATUS_SUCCESS,
@@ -557,6 +558,53 @@ static void test_rpc_aware_placement() {
     expect(search_session.has_incumbent && search_session.fit_key != 0 &&
            search_session.incumbent.n_ctx == (int32_t) cparams.n_ctx,
             "fit search session retains the validated incumbent for MTP preflight iterations");
+    expect(search_session.probes_used > 7,
+            "finding a better incumbent must not reset the probe budget across MTP preflight iterations");
+}
+
+static void test_rpc_aware_reuses_probe_after_margin_change() {
+    if (g_model.empty()) {
+        test_skip("no model available");
+        return;
+    }
+    const char * old_cache = std::getenv("LLAMA_FIT_CACHE");
+    const std::string old_cache_value = old_cache ? old_cache : "";
+    const std::string test_cache = "/tmp/opencode/fit-session-probes-" + std::to_string(llama_time_us());
+    setenv("LLAMA_FIT_CACHE", test_cache.c_str(), 1);
+
+    common_params params;
+    params.fit_strategy = COMMON_FIT_STRATEGY_RPC_AWARE;
+    params.n_ctx = 1024;
+    params.fit_params_no_context_reserve = true;
+    params.model.path = g_model;
+    params.fit_cache_defer_save = true;
+    fake_probe_ctx cfg;
+    cfg.default_dev = { (int64_t) (16 * GiB), (int64_t) (16 * GiB), (size_t) (64 * MiB), (size_t) (32 * MiB), 0 };
+    common_fit_search_session search_session;
+    common_params params_first = params;
+    llama_model_params mparams = common_model_params_to_llama(params_first);
+    llama_context_params cparams = common_context_params_to_llama(params_first);
+    const common_fit_probe probe = make_probe(&cfg);
+    const common_params_fit_status first = common_fit_strategy_apply_impl(
+            params_first, &mparams, &cparams, nullptr, probe, nullptr, &search_session);
+
+    common_params params_second = params;
+    params_second.fit_params_target.resize(llama_max_devices(), 0);
+    params_second.fit_params_target[0] = 128 * MiB;
+    mparams = common_model_params_to_llama(params_second);
+    cparams = common_context_params_to_llama(params_second);
+    const common_params_fit_status second = common_fit_strategy_apply_impl(
+            params_second, &mparams, &cparams, nullptr, probe, nullptr, &search_session);
+
+    if (old_cache) {
+        setenv("LLAMA_FIT_CACHE", old_cache_value.c_str(), 1);
+    } else {
+        unsetenv("LLAMA_FIT_CACHE");
+    }
+    expect(first == COMMON_PARAMS_FIT_STATUS_SUCCESS && second == COMMON_PARAMS_FIT_STATUS_SUCCESS,
+            "a margin-only MTP refit must keep producing a safe plan");
+    expect(search_session.probe_cache_hits > 0,
+            "a reserve-only refit must reuse exact same-placement probe results");
 }
 
 static void test_rpc_aware_uses_no_alloc_probes() {
@@ -759,12 +807,16 @@ static void test_activation_profile_sink() {
     std::remove(path.c_str());
 
     common_activation_profile profile;
-    profile.version = 1;
+    profile.version = 2;
     profile.model_id = "fit-strategy-test-model";
     profile.counters = {
-        { "blk.0.attn_q.weight", COMMON_FIT_ROLE_ATTN_QKV, 100, 0, 42 },
-        { "blk.0.ffn_gate_up_exps.weight", COMMON_FIT_ROLE_EXPERT_UP, 7, 3, 0 },
+        { "blk.0.attn_q.weight", COMMON_FIT_ROLE_ATTN_QKV, 100, 0, 42, 0, "", false, 0, 0 },
+        { "blk.0.ffn_gate_up_exps.weight", COMMON_FIT_ROLE_EXPERT_UP, 7, 3, 0, 0, "", false, 0, 0 },
     };
+    profile.counters[0].layer = 0;
+    profile.counters[0].device_id = "CUDA0";
+    profile.counters[0].activation_bytes = 4096;
+    profile.counters[0].n_calls = 100;
 
     expect(common_activation_profile_sink(profile, path),
             "sink to a writable path must return true");
@@ -776,7 +828,7 @@ static void test_activation_profile_sink() {
         std::getline(in, rest);
         expect(!line.empty() && rest.empty(), "sink must write exactly one JSONL row");
         nlohmann::json j = nlohmann::json::parse(line);
-        expect(j["version"] == 1 && j["model_id"] == "fit-strategy-test-model",
+        expect(j["version"] == 2 && j["model_id"] == "fit-strategy-test-model",
                 "the row header fields must round-trip");
         expect(j["counters"].size() == 2, "both counters must round-trip");
         expect(j["counters"][0]["tensor_id"] == "blk.0.attn_q.weight",
@@ -784,10 +836,59 @@ static void test_activation_profile_sink() {
         expect(j["counters"][1]["role"] == (int) COMMON_FIT_ROLE_EXPERT_UP,
                 "the counter role must round-trip");
         expect(j["counters"][0]["kv_touched"] == 42, "the counter kv_touched must round-trip");
+        expect(j["counters"][0]["activation_bytes"] == 4096 && j["counters"][0]["n_calls"] == 100,
+                "layer activation byte and call counters must round-trip");
     }
 
     expect(!common_activation_profile_sink(profile, "/nonexistent-dir-12345/fit.jsonl"),
             "sink to an unwritable path must fail closed");
+}
+
+static void test_activation_profile_collection() {
+    const char * old_path = std::getenv("LLAMA_ACTIVATION_PROFILE");
+    const std::string old_value = old_path != nullptr ? old_path : "";
+    const std::string path = "/tmp/opencode/fit-activation-profile-" + std::to_string(llama_time_us()) + ".jsonl";
+    std::remove(path.c_str());
+
+    unsetenv("LLAMA_ACTIVATION_PROFILE");
+    common_params params;
+    params.model.path = "profile-test-model";
+    auto cparams = common_context_params_to_llama(params);
+    expect(cparams.activation_profile_callback == nullptr,
+            "activation profiling must be disabled when the environment variable is unset");
+
+    setenv("LLAMA_ACTIVATION_PROFILE", path.c_str(), 1);
+    cparams = common_context_params_to_llama(params);
+    expect(cparams.activation_profile_callback != nullptr &&
+           std::string(cparams.activation_profile_model_id) == "profile-test-model",
+            "the environment variable must enable a model-identified callback");
+    auto callback = cparams.activation_profile_callback;
+    callback(cparams.activation_profile_user_data, cparams.activation_profile_model_id,
+            2, "CUDA0", false, 1, 4096, false);
+    callback(cparams.activation_profile_user_data, cparams.activation_profile_model_id,
+            2, "CUDA0", false, 1, 4096, false);
+    callback(cparams.activation_profile_user_data, cparams.activation_profile_model_id,
+            -1, "", false, 0, 0, true);
+
+    if (old_path != nullptr) {
+        setenv("LLAMA_ACTIVATION_PROFILE", old_value.c_str(), 1);
+    } else {
+        unsetenv("LLAMA_ACTIVATION_PROFILE");
+    }
+
+    std::ifstream in(path);
+    std::string line;
+    std::getline(in, line);
+    expect(!line.empty(), "finalizing a profile must append one JSONL record");
+    if (!line.empty()) {
+        const auto j = nlohmann::json::parse(line);
+        expect(j["model_id"] == "profile-test-model" && j["counters"].size() == 1,
+                "profile aggregation must retain model identity and merge repeated layers");
+        expect(j["counters"][0]["layer"] == 2 && j["counters"][0]["n_tokens"] == 2 &&
+               j["counters"][0]["activation_bytes"] == 8192 && j["counters"][0]["n_calls"] == 2,
+                "profile aggregation must sum layer tokens, bytes, and calls");
+    }
+    std::remove(path.c_str());
 }
 
 static void test_manual_plan_validated() {
@@ -1144,12 +1245,14 @@ static const struct test_case {
     { "maxctx_above_floor",         test_maxctx_above_floor },
     { "floor_unreachable_errors",   test_floor_unreachable_errors },
     { "rpc_aware_placement",        test_rpc_aware_placement },
+    { "rpc_aware_reuses_probe_after_margin_change", test_rpc_aware_reuses_probe_after_margin_change },
     { "rpc_aware_no_alloc_probes",  test_rpc_aware_uses_no_alloc_probes },
     { "rpc_cold_start",             test_rpc_cold_start },
     { "shed_reserve_order",         test_shed_reserve_order },
     { "exception_classification",   test_exception_classification },
     { "no_provider_pool",           test_no_provider_pool },
     { "activation_profile_sink",    test_activation_profile_sink },
+    { "activation_profile_collection", test_activation_profile_collection },
     { "manual_plan_validated",      test_manual_plan_validated },
     { "device_id_mapping",          test_device_id_mapping },
     { "rpc_pool_split_device_mapping", test_rpc_pool_split_device_mapping },

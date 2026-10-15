@@ -4639,7 +4639,12 @@ prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, 
             }
         }
 
+        const bool is_generation = batch.slot_batched != nullptr &&
+                batch.slot_batched->state == SLOT_STATE_GENERATING;
+        llama_set_decode_phase(ctx_tgt, is_generation
+                ? LLAMA_DECODE_PHASE_GENERATION : LLAMA_DECODE_PHASE_PROMPT);
         const int ret = llama_decode(ctx_tgt, batch_view);
+        llama_set_decode_phase(ctx_tgt, LLAMA_DECODE_PHASE_AUTOMATIC);
 
         metrics.on_decoded(slots);
 

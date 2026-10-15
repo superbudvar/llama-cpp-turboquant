@@ -255,6 +255,16 @@ extern "C" {
 
     typedef bool (*llama_progress_callback)(float progress, void * user_data);
 
+    typedef void (*llama_activation_profile_callback)(
+            void * user_data,
+            const char * model_id,
+            int32_t layer,
+            const char * device_name,
+            bool is_rpc,
+            uint32_t n_tokens,
+            size_t activation_bytes,
+            bool finalize);
+
     // Input data for llama_encode/llama_decode
     // A llama_batch object can contain input about one or many sequences
     // The provided arrays (i.e. token, embd, pos, etc.) must have size of n_tokens
@@ -439,6 +449,11 @@ extern "C" {
         // a caller built against a pre-streaming header keeps the same
         // offsets for every field before it.
         uint32_t kv_stream_arena_mib;
+
+        // Optional decode activation profile callback. The caller owns user_data.
+        llama_activation_profile_callback activation_profile_callback;
+        void * activation_profile_user_data;
+        const char * activation_profile_model_id;
     };
 
     struct llama_model_tensor_override {

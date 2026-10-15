@@ -437,6 +437,9 @@ private:
 
     enum llama_decode_phase decode_phase =
         LLAMA_DECODE_PHASE_AUTOMATIC;
+    llama_activation_profile_callback activation_profile_callback = nullptr;
+    void * activation_profile_user_data = nullptr;
+    std::string activation_profile_model_id;
 
     // perf
     mutable int64_t t_start_us  = 0;

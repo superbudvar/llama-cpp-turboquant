@@ -87,6 +87,13 @@ A green run means the cases that ran passed, not that your change was exercised.
 - Main branches: `feature/turboquant-kv-cache` tracks the upstream TurboQuant fork
 - Upstream master is always fully contained in the tree (verified by rebase parity audits; git log is the record of the last sync point)
 
+### Local Windows CUDA build runner
+
+- Personal Libvirt/SSH build processes live under `local-processes/`; read `local-processes/README.md` before using or cherry-picking them.
+- Run the profile-driven host runner with `--dry-run` first. It discovers the VM address dynamically and verifies the pinned SSH host-key fingerprint and guest hostname; do not hard-code the VM IP or accept an unknown host key.
+- The Windows runner verifies the mapped source commit, builds on a temporary qcow2 data disk under `/mnt/build`, and exports binaries, logs, and a hash manifest to the host artifact directory. Do not put the build tree on the `Z:` share or the VM system disk.
+- Coordinate before starting a real build because the Libvirt VM is shared. If SSH disconnects during a build, the runner intentionally leaves the scratch disk attached and preserves its image; inspect the VM and runner output before attempting cleanup.
+
 ### Known pitfalls (each caused a real bug once - check these first on regressions)
 
 - **Metal**: turbo kernels need their `[[host_name]]` instantiations; a missing one is a NULL-pipeline deref on the first turbo KV write.
