@@ -318,10 +318,12 @@ static bool fit_fits_margins(
         const std::vector<int64_t> & margins,
         const common_fit_analysis & analysis,
         size_t * fail_dev = nullptr,
+        int64_t * shortfall_bytes = nullptr,
         const std::vector<int64_t> * ceiling_free = nullptr,
         const std::vector<int64_t> * ceiling_free_warm = nullptr) {
     const size_t nd = analysis.devices.size();
     if (fail_dev) { *fail_dev = (size_t) -1; }
+    if (shortfall_bytes) { *shortfall_bytes = 0; }
     LOG_DBG("%s: memory.size()=%zu nd+1=%zu margins.size()=%zu nd=%zu\n",
             __func__, memory.size(), nd + 1, margins.size(), nd);
     if (memory.size() != nd + 1 || margins.size() < nd) {
@@ -358,6 +360,9 @@ static bool fit_fits_margins(
             rem < margins[id]) {
             LOG_DBG("%s: fit_fits_margins FAIL dev[%zu]\n", __func__, id);
             if (fail_dev) { *fail_dev = id; }
+            // bytes the rejecting device is over budget by. the caller uses this
+            // to size the next placement step instead of walking a blind grid.
+            if (shortfall_bytes) { *shortfall_bytes = margins[id] - rem; }
             return false;
         }
     }
@@ -664,7 +669,7 @@ static int32_t fit_grow_context(
         const bool ok_m = fit_measure_plan(decode_probe, p, mparams, cparams, path_model, m, true,
                 attempt_counter, search_session);
         const bool ok_devs = ok_m && fit_same_devices(m.devs, analysis);
-        const bool ok_fm = ok_devs && fit_fits_margins(m.memory, margins, analysis, nullptr, &ceiling_free, &ceiling_free_warm);
+        const bool ok_fm = ok_devs && fit_fits_margins(m.memory, margins, analysis, nullptr, nullptr, &ceiling_free, &ceiling_free_warm);
         LOG_TRC("%s: grow fits n_ctx=%u measure=%d margins=%d -> %s (probes=%zu/%zu)\n",
                 __func__, p.n_ctx, ok_m ? 1 : 0, ok_fm ? 1 : 0, ok_fm ? "ok" : "FAIL",
                 attempt_counter ? *attempt_counter : 0, attempt_limit);
@@ -796,6 +801,7 @@ static int32_t fit_spill_split_at_ngl(
         const std::vector<int64_t> & ceiling_free,
         const std::vector<int64_t> & ceiling_free_warm,
         size_t * attempt_counter = nullptr,
+        size_t attempt_limit = 0,
         common_fit_search_session * search_session = nullptr) {
     out_frac = -1.0f;
     const int32_t min_ctx = (int32_t) (params.n_ctx > 0 ? params.n_ctx : params.fit_strategy_min_ctx);
@@ -848,13 +854,18 @@ static int32_t fit_spill_split_at_ngl(
     // overflows RPC.
     for (float f = scan_hi; f >= -step * 0.5f; f -= step) {
         if (f < 0.0f) { f = 0.0f; }
+        if (attempt_counter && attempt_limit > 0 && *attempt_counter >= attempt_limit) {
+            LOG_DBG("%s: ngl=%d scan stopped at rpc_frac=%.4f, probe budget %zu/%zu reached\n",
+                    __func__, ngl, f, *attempt_counter, attempt_limit);
+            break;
+        }
         common_fit_plan plan = fit_plan_from_spec(analysis, spec, loader_ngl, min_ctx, f, ngl);
         fit_measure_result m;
         const bool ok_measure = fit_measure_plan(probe, plan, mparams, cparams, path_model, m, true,
                 attempt_counter, search_session);
         const bool ok_devs    = ok_measure && fit_same_devices(m.devs, analysis);
         size_t fail = (size_t) -1;
-        const bool ok_margin  = ok_devs && fit_fits_margins(m.memory, margins, analysis, &fail, &ceiling_free, &ceiling_free_warm);
+        const bool ok_margin  = ok_devs && fit_fits_margins(m.memory, margins, analysis, &fail, nullptr, &ceiling_free, &ceiling_free_warm);
         LOG_DBG("%s: ngl=%d rpc_frac=%.4f measure=%d devs=%d margin=%d -> %s\n",
                 __func__, ngl, f, ok_measure ? 1 : 0, ok_devs ? 1 : 0, ok_margin ? 1 : 0,
                 ok_margin ? "FEASIBLE" : "rejected");
@@ -885,13 +896,18 @@ static int32_t fit_spill_split_at_ngl(
         }
         if (have_lo && have_hi) {
             for (int it = 0; it < 13 && f_hi - f_lo > 1e-4f; it++) {
+                if (attempt_counter && attempt_limit > 0 && *attempt_counter >= attempt_limit) {
+                    LOG_DBG("%s: ngl=%d bisect stopped in [%.4f,%.4f], probe budget %zu/%zu reached\n",
+                            __func__, ngl, f_lo, f_hi, *attempt_counter, attempt_limit);
+                    break;
+                }
                 const float fm = (f_lo + f_hi) * 0.5f;
                 common_fit_plan plan = fit_plan_from_spec(analysis, spec, loader_ngl, min_ctx, fm, ngl);
                 fit_measure_result m;
                 const bool ok_measure = fit_measure_plan(probe, plan, mparams, cparams, path_model, m, true, attempt_counter);
                 const bool ok_devs    = ok_measure && fit_same_devices(m.devs, analysis);
                 size_t fail = (size_t) -1;
-                const bool ok_margin  = ok_devs && fit_fits_margins(m.memory, margins, analysis, &fail, &ceiling_free, &ceiling_free_warm);
+                const bool ok_margin  = ok_devs && fit_fits_margins(m.memory, margins, analysis, &fail, nullptr, &ceiling_free, &ceiling_free_warm);
                 LOG_DBG("%s: ngl=%d bisect rpc_frac=%.4f measure=%d devs=%d margin=%d -> %s\n",
                         __func__, ngl, fm, ok_measure ? 1 : 0, ok_devs ? 1 : 0, ok_margin ? 1 : 0,
                         ok_margin ? "FEASIBLE" : "rejected");
@@ -936,11 +952,16 @@ static int32_t fit_spill_split_at_ngl(
     common_fit_plan best_plan;
     fit_measure_result best_m;
     for (float f : feas) {
+        if (attempt_counter && attempt_limit > 0 && *attempt_counter >= attempt_limit) {
+            LOG_DBG("%s: ngl=%d refine stopped at rpc_frac=%.4f, probe budget %zu/%zu reached\n",
+                    __func__, ngl, f, *attempt_counter, attempt_limit);
+            break;
+        }
         common_fit_plan plan;
         fit_measure_result m;
         const int32_t ctx = fit_grow_context(analysis, margins, params, mparams, cparams,
                 probe, spec, f, loader_ngl, path_model, plan, m, ngl, ceiling_free, ceiling_free_warm,
-                attempt_counter, 0, search_session);
+                attempt_counter, attempt_limit, search_session);
         if (ctx < 0) { continue; }
         if (best_ctx < 0 || ctx > best_ctx) {
             best_ctx = ctx;
@@ -1235,7 +1256,7 @@ static bool fit_solve_rpc_aware(
                 if (fit_measure_plan(probe, best_plan, mparams, cparams, path_model, best_m, true,
                             &attempt_count, search_session)) {
                     if (!fit_same_devices(best_m.devs, analysis) ||
-                            !fit_fits_margins(best_m.memory, margins, analysis, nullptr, &ceiling_free, &ceiling_free_warm)) {
+                            !fit_fits_margins(best_m.memory, margins, analysis, nullptr, nullptr, &ceiling_free, &ceiling_free_warm)) {
                         best_ctx = -1;
                         first_candidate = 0;
                     }
@@ -1374,18 +1395,54 @@ static bool fit_solve_rpc_aware(
             common_fit_plan cand_best_plan;
             fit_measure_result cand_best_m;
             bool found_floor_fit = false;
-            for (size_t fi = fraction_start; fi < fractions.size(); fi++) {
-                const float ftry = fractions[fi];
+            // feasibility window. a local-device rejection raises frac_lo, an RPC
+            // rejection lowers frac_hi, so grid points outside are skipped without
+            // a probe. frac_target is the magnitude-directed guess for the next
+            // probe: bytes over budget, divided by the total model bytes, is the
+            // rpc_frac delta that moves them off the rejecting device.
+            float frac_lo = resume_this_rpc ? progress_plan->search.rpc_frac_low : 0.0f;
+            float frac_hi = resume_this_rpc ? progress_plan->search.rpc_frac_high : hi;
+            float frac_target = -1.0f;
+            int64_t total_model_bytes = 0;
+            size_t frac_probes = 0;
+            size_t fi = fraction_start;
+            while (true) {
                 if (best_ctx >= 0 && attempt_limit > 0 && attempt_count >= attempt_limit) {
                     retain_incumbent(ci);
                     out_plan.search.rpc_stage = 2;
-                    out_plan.search.rpc_frac_next = ftry;
-                    out_plan.search.rpc_frac_low = 0.0f;
-                    out_plan.search.rpc_frac_high = hi;
+                    out_plan.search.rpc_frac_next = fi < fractions.size() ? fractions[fi] : frac_target;
+                    out_plan.search.rpc_frac_low = frac_lo;
+                    out_plan.search.rpc_frac_high = frac_hi;
                     LOG_INF("%s: attempt budget reached (%zu measured probes); retaining incumbent n_ctx=%d\n",
                             __func__, attempt_count, best_ctx);
                     break;
                 }
+
+                // the directed guess goes first, then the next grid point inside
+                // the window. Nothing inside the window is skipped: a fraction
+                // that fits can reach more context than one that does not, so the
+                // window only prunes what is known to be infeasible.
+                float ftry;
+                bool have_try = false;
+                if (frac_target >= 0.0f && frac_target > frac_lo && frac_target < frac_hi) {
+                    ftry = frac_target;
+                    frac_target = -1.0f;
+                    have_try = true;
+                }
+                while (fi < fractions.size()) {
+                    const float f = fractions[fi];
+                    if (f > frac_lo && f < frac_hi) {
+                        ftry = f;
+                        have_try = true;
+                        break;
+                    }
+                    ++fi;
+                }
+                if (!have_try) {
+                    break;
+                }
+                ++fi;
+                ++frac_probes;
 
                 common_fit_plan floor_plan = fit_plan_from_spec(analysis, cand, loader_ngl,
                         (int32_t) params.fit_strategy_min_ctx, ftry);
@@ -1393,13 +1450,40 @@ static bool fit_solve_rpc_aware(
                 const bool ok_measure = fit_measure_plan(probe, floor_plan, mparams, cparams,
                         path_model, floor_measure, true, &attempt_count, search_session);
                 const bool ok_devs = ok_measure && fit_same_devices(floor_measure.devs, analysis);
+                size_t fail_dev = (size_t) -1;
+                int64_t shortfall = 0;
                 const bool ok_margin = ok_devs && fit_fits_margins(floor_measure.memory, margins, analysis,
-                        nullptr, &ceiling_free, &ceiling_free_warm);
-                LOG_TRC("%s: rpc_frac=%.4f min_ctx measure=%d devs=%d margin=%d -> %s (fraction=%zu/%zu probes=%zu/%zu candidate=%s)\n",
+                        &fail_dev, &shortfall, &ceiling_free, &ceiling_free_warm);
+                if (total_model_bytes == 0) {
+                    for (size_t id = 0; id < analysis.devices.size() && id < floor_measure.memory.size(); id++) {
+                        total_model_bytes += (int64_t) floor_measure.memory[id].model;
+                    }
+                }
+                LOG_TRC("%s: rpc_frac=%.4f min_ctx measure=%d devs=%d margin=%d -> %s (probe=%zu probes=%zu/%zu dev=%zu short=%lld window=[%.4f,%.4f] candidate=%s)\n",
                         __func__, ftry, ok_measure ? 1 : 0, ok_devs ? 1 : 0, ok_margin ? 1 : 0,
-                        ok_margin ? "FEASIBLE" : "rejected", fi + 1, fractions.size(), attempt_count,
-                        attempt_limit, cand.label.c_str());
-                if (!ok_margin) continue;
+                        ok_margin ? "FEASIBLE" : "rejected", frac_probes, attempt_count,
+                        attempt_limit, fail_dev, (long long) shortfall, frac_lo, frac_hi,
+                        cand.label.c_str());
+                if (!ok_margin) {
+                    if (fail_dev >= analysis.devices.size()) {
+                        continue;   // size guard or device mismatch, no direction to learn
+                    }
+                    // low rpc_frac overflows the local device, high overflows RPC
+                    const bool rpc_overflow = analysis.devices[fail_dev].is_rpc;
+                    if (rpc_overflow) {
+                        frac_hi = std::min(frac_hi, ftry);
+                    } else {
+                        frac_lo = std::max(frac_lo, ftry);
+                    }
+                    if (shortfall > 0 && total_model_bytes > 0) {
+                        const float delta = (float) ((double) shortfall / (double) total_model_bytes);
+                        const float aimed = rpc_overflow ? ftry - delta : ftry + delta;
+                        if (aimed > frac_lo && aimed < frac_hi) {
+                            frac_target = aimed;
+                        }
+                    }
+                    continue;
+                }
                 found_floor_fit = true;
 
                 const int32_t min_ctx = (int32_t) params.fit_strategy_min_ctx;
@@ -1451,8 +1535,8 @@ static bool fit_solve_rpc_aware(
                 retain_incumbent(ci);
                 out_plan.search.rpc_stage = 2;
                 out_plan.search.rpc_frac_next = best_ftry >= 0.0f ? best_ftry : preferred;
-                out_plan.search.rpc_frac_low = 0.0f;
-                out_plan.search.rpc_frac_high = hi;
+                out_plan.search.rpc_frac_low = frac_lo;
+                out_plan.search.rpc_frac_high = frac_hi;
             }
             if (!found_floor_fit && !resume_this_rpc) {
                 LOG_DBG("%s: candidate %s could not fit any rpc_frac at the minimum context, skipping\n",
@@ -1553,6 +1637,11 @@ static bool fit_solve_rpc_aware(
             fit_measure_result best_m;
             float best_frac = -1.0f;
             while (lo_ngl <= hi_ngl) {
+                if (attempt_limit > 0 && attempt_count >= attempt_limit) {
+                    LOG_INF("%s: attempt budget reached (%zu measured probes) during the n_gpu_layers bisect\n",
+                            __func__, attempt_count);
+                    break;
+                }
                 const int32_t mid_ngl = lo_ngl + (hi_ngl - lo_ngl) / 2;
                 common_fit_plan plan;
                 fit_measure_result m;
@@ -1561,11 +1650,11 @@ static bool fit_solve_rpc_aware(
                 if (spec_is_rpc_split) {
                     ctx = fit_spill_split_at_ngl(analysis, margins, params, mparams, cparams,
                             probe, spill_spec, loader_ngl, path_model, mid_ngl, scan_hi,
-                            plan, m, frac, ceiling_free, ceiling_free_warm, nullptr, search_session);
+                            plan, m, frac, ceiling_free, ceiling_free_warm, &attempt_count, attempt_limit, search_session);
                 } else {
                     ctx = fit_grow_context(analysis, margins, params, mparams, cparams,
                             probe, spill_spec, -1.0f, loader_ngl, path_model, plan, m, mid_ngl, ceiling_free,
-                            ceiling_free_warm, nullptr, 0, search_session);
+                            ceiling_free_warm, &attempt_count, attempt_limit, search_session);
                 }
                 if (ctx >= min_ctx) {
                     best_ngl = mid_ngl;
@@ -1587,11 +1676,17 @@ static bool fit_solve_rpc_aware(
                     out_plan.projected_free[id] = analysis.devices[id].free_bytes - fit_device_used(out_measure.memory[id]);
                 }
                 if (best_frac >= 0.0f) {
-                    LOG_WRN("%s: spilling %u layers to CPU to reach min-ctx %d (n_gpu_layers=%d of %u, rpc_frac=%.4f)\n",
-                            __func__, (uint32_t) (loader_ngl + 1 - best_ngl), min_ctx, best_ngl, loader_ngl + 1, best_frac);
+                    LOG_WRN("%s: spilling %u layers to CPU to reach min-ctx %d (n_gpu_layers=%d of %u, rpc_frac=%.4f, probes=%zu/%zu)\n",
+                            __func__, (uint32_t) (loader_ngl + 1 - best_ngl), min_ctx, best_ngl, loader_ngl + 1, best_frac, attempt_count, attempt_limit);
                 } else {
-                    LOG_WRN("%s: spilling %u layers to CPU to reach min-ctx %d (n_gpu_layers=%d of %u)\n",
-                            __func__, (uint32_t) (loader_ngl + 1 - best_ngl), min_ctx, best_ngl, loader_ngl + 1);
+                    LOG_WRN("%s: spilling %u layers to CPU to reach min-ctx %d (n_gpu_layers=%d of %u, probes=%zu/%zu)\n",
+                            __func__, (uint32_t) (loader_ngl + 1 - best_ngl), min_ctx, best_ngl, loader_ngl + 1, attempt_count, attempt_limit);
+                }
+                // carry the budget across searches. the full-offload path writes
+                // this on its own success return; without it a spilling solve
+                // restarts the next search near zero probes.
+                if (search_session) {
+                    search_session->probes_used = attempt_count;
                 }
                 return true;
             }
@@ -1615,7 +1710,9 @@ static common_fit_plan fit_solve_maxctx(
         uint32_t loader_ngl,
         fit_measure_result & out_measure,
         const std::vector<int64_t> & ceiling_free,
-        const std::vector<int64_t> & ceiling_free_warm) {
+        const std::vector<int64_t> & ceiling_free_warm,
+        size_t * attempt_counter = nullptr,
+        size_t attempt_limit = 0) {
     if (params.fit_strategy_min_ctx <= 0) {
         throw common_params_fit_exception("maxctx strategy requires --fit-strategy-min-ctx");
     }
@@ -1640,12 +1737,18 @@ static common_fit_plan fit_solve_maxctx(
         const std::vector<int64_t> margins = fit_effective_margins(base_margins, reserves, shed_tags);
 
         for (const auto & placement : placements) {
+            if (attempt_counter && attempt_limit > 0 && *attempt_counter >= attempt_limit) {
+                LOG_DBG("%s: placement %s not probed, probe budget %zu/%zu reached\n",
+                        __func__, placement.label.c_str(), *attempt_counter, attempt_limit);
+                break;
+            }
             // grow the context from the minimum upward; this also tests the full
             // context first and uses it directly when it fits.
             common_fit_plan plan;
             fit_measure_result m;
             const int32_t ctx = fit_grow_context(analysis, margins, params, mparams, cparams,
-                    probe, placement, -1.0f, loader_ngl, path_model, plan, m, -1, ceiling_free, ceiling_free_warm);
+                    probe, placement, -1.0f, loader_ngl, path_model, plan, m, -1, ceiling_free,
+                    ceiling_free_warm, attempt_counter, attempt_limit);
             if (ctx < 0) {
                 LOG_DBG("%s: placement %s cannot fit even the minimum context, skipping\n",
                         __func__, placement.label.c_str());
@@ -2054,7 +2157,7 @@ common_params_fit_status common_fit_strategy_apply_impl(
                     // released are released here too
                     const std::vector<int64_t> cache_margins =
                         fit_effective_margins(margins, params.fit_params_reserves, cache_plan.shed_reserves);
-                    if (fit_fits_margins(win_measure.memory, cache_margins, analysis, nullptr, &ceiling_free, &ceiling_free_warm)) {
+                    if (fit_fits_margins(win_measure.memory, cache_margins, analysis, nullptr, nullptr, &ceiling_free, &ceiling_free_warm)) {
                         final_plan = cache_plan;
                         have_plan  = true;
                         cache_ok   = true;
@@ -2087,6 +2190,7 @@ common_params_fit_status common_fit_strategy_apply_impl(
                         __func__, params.model.path.c_str());
             }
             if (!cache_ok) {
+                size_t maxctx_probes = 0;
                 // run the ceiling probe if requested and no ceiling is available from cache or plan
                 if (params.fit_params_probe_ceiling && ceiling_free.empty()) {
                     ceiling_free = fit_probe_ceiling(analysis, params);
@@ -2132,7 +2236,8 @@ common_params_fit_status common_fit_strategy_apply_impl(
                 } else {
                     final_plan = fit_solve_maxctx(
                             analysis, margins, params.fit_params_reserves, params, mparams, cparams, probe,
-                            params.model.path, analysis.loader_ngl, win_measure, ceiling_free, ceiling_free_warm);
+                            params.model.path, analysis.loader_ngl, win_measure, ceiling_free,
+                            ceiling_free_warm, &maxctx_probes, params.fit_max_attempts);
                     have_plan = true;
                 }
             }
@@ -2158,7 +2263,7 @@ common_params_fit_status common_fit_strategy_apply_impl(
             if (!fit_same_devices(win_measure.devs, analysis)) {
                 throw std::runtime_error("manual plan changed the device set");
             }
-            if (!fit_fits_margins(win_measure.memory, margins, analysis, nullptr, &ceiling_free, &ceiling_free_warm)) {
+            if (!fit_fits_margins(win_measure.memory, margins, analysis, nullptr, nullptr, &ceiling_free, &ceiling_free_warm)) {
                 throw std::runtime_error("manual plan does not fit within the per-device margins");
             }
             have_plan = true;
