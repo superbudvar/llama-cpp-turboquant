@@ -1680,7 +1680,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    // no_alloc never reads tensor data, so prefetching the mapping would
+    // MAP_POPULATE the whole file for nothing. The fit probe hits this on every
+    // candidate: one full read of the GGUF per probe.
+    ml.init_mappings(!ml.no_alloc, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers

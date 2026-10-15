@@ -30,7 +30,8 @@ The engine code lives in `common/fit-strategy.{h,cpp}`. `common/fit.cpp` is not 
 
 ### Fit probe output is not the real allocation
 
-- During the fit probe phase (`load_mode = none`) every device prints `model buffer size = 0.00 MiB` and `offloaded N/N layers`, and the breakdown `unaccounted` column can go negative (reported free includes other processes, e.g. the desktop session on ROCm). These lines are measurement artifacts.
+- During the fit probe phase every device prints `model buffer size = 0.00 MiB` and `offloaded N/N layers`, and the breakdown `unaccounted` column can go negative (reported free includes other processes, e.g. the desktop session on ROCm). These lines are measurement artifacts.
+- The probe loads with `no_alloc = true` and `load_mode = mmap` (forced at `common/fit-strategy.cpp:409` and `:1814`), not `load_mode = none`. MMAP is required: the probe reports exact per-tensor byte counts from the tensor table, and `load_mode` is part of the fit measurement cache key (`fit-strategy.cpp:178`), so changing it would invalidate every cached placement. Because `no_alloc` never reads tensor data, `llama_model_loader::init_mappings` is called without prefetch when `no_alloc` is set (`src/llama-model.cpp:1683`), which skips `MAP_POPULATE`. With prefetch, every probe read the entire GGUF from disk (~11 GiB, ~70 s per probe on a 12 GB model).
 - The real placement only appears in the final `MODEL READY - device memory breakdown` line.
 - `n_ctx_seq < n_ctx_train` warnings during probing are expected; the final context is printed right after MODEL READY.
 - `--fit-target` values are indexed by the model device order used by `fit_analyze`, not by the intuitive local-then-RPC order. Check the new per-device margin log before interpreting a comma-separated target list.
