@@ -167,7 +167,8 @@ try {
     foreach ($option in $cmakeOptions) {
         Assert-SafeValue $option "CMake option"
     }
-    Assert-SafeValue $sourceRoot "source root"
+    $cmakeSourceRoot = $sourceRoot.Replace('\', '/')
+    Assert-SafeValue $cmakeSourceRoot "source root"
     Assert-SafeValue $buildRoot "build root"
 
     $buildDir = Join-Path $buildRoot "build"
@@ -180,7 +181,7 @@ try {
         "@echo off",
         "call `"$vcvars`" x64 >nul 2>&1",
         "if errorlevel 1 exit /b 11",
-        "`"$cmake`" -S `"$sourceRoot`" -B `"$buildDir`" -G `"$($cuda.generator)`" $quotedOptions > `"$configureLog`" 2>&1",
+        "`"$cmake`" -S `"$cmakeSourceRoot`" -B `"$buildDir`" -G `"$($cuda.generator)`" $quotedOptions > `"$configureLog`" 2>&1",
         "if errorlevel 1 exit /b 12",
         "`"$cmake`" --build `"$buildDir`" --config $($cuda.configuration) -j $([int]$cuda.jobs) $targetArgs > `"$buildLog`" 2>&1",
         "exit /b %ERRORLEVEL%"
@@ -240,8 +241,7 @@ try {
 } finally {
     if ($scratchMounted -and $disk) {
         try {
-            Dismount-Volume -DriveLetter $ScratchDriveLetter -Force -ErrorAction SilentlyContinue
-            Set-Disk -Number $disk.Number -IsOffline $true -ErrorAction SilentlyContinue
+            Set-Disk -Number $disk.Number -IsOffline $true -ErrorAction Stop
         } catch {
             Write-Warning "Could not offline scratch disk: $_"
         }
