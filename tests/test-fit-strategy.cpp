@@ -562,6 +562,41 @@ static void test_rpc_aware_placement() {
             "finding a better incumbent must not reset the probe budget across MTP preflight iterations");
 }
 
+static void test_rpc_aware_budget_resets_when_margins_change() {
+    // MTP preflight iteration N raises fit_params_target for iteration N+1, so the
+    // two iterations are different problems. The incumbent carries across, but the
+    // probe budget must not: carrying it left the next iteration unable to afford
+    // one probe and it returned min-ctx instead of the context it could reach.
+    // Observed on Qwen3.8-27B-Q3 at min_ctx=123840: iteration 1 reached 160512 and
+    // spent all 32 probes, iteration 2 did zero measurements and selected 123840.
+    if (g_model.empty()) {
+        test_skip("no model available");
+        return;
+    }
+    common_params params;
+    params.fit_strategy = COMMON_FIT_STRATEGY_RPC_AWARE;
+    params.n_ctx = 1024;
+    params.model.path = g_model;
+    llama_model_params mparams = common_model_params_to_llama(params);
+    llama_context_params cparams = common_context_params_to_llama(params);
+    fake_probe_ctx cfg;
+    cfg.default_dev = { (int64_t) (16 * GiB), (int64_t) (16 * GiB), (size_t) (64 * MiB), (size_t) (32 * MiB), 0 };
+    common_fit_search_session search_session;
+    // a key from a previous margin configuration, and a budget already spent far
+    // past any limit. with the stale spend carried, every probe short-circuits on
+    // the budget guard and the solve returns min-ctx having measured nothing.
+    search_session.probes_used = 1000;
+    search_session.fit_key = 12345;
+    const common_params_fit_status st = common_fit_strategy_apply_impl(
+            params, &mparams, &cparams, nullptr, make_probe(&cfg), nullptr, &search_session);
+    expect(st == COMMON_PARAMS_FIT_STATUS_SUCCESS,
+            "a stale fit key must not abort the solve");
+    expect(search_session.fit_key != 12345,
+            "the session must adopt the current fit key");
+    expect(search_session.probes_used < 1000,
+            "a changed fit key must reset the probe budget so the new margins are actually searched");
+}
+
 static void test_rpc_aware_reuses_probe_after_margin_change() {
     if (g_model.empty()) {
         test_skip("no model available");
@@ -1245,6 +1280,7 @@ static const struct test_case {
     { "maxctx_above_floor",         test_maxctx_above_floor },
     { "floor_unreachable_errors",   test_floor_unreachable_errors },
     { "rpc_aware_placement",        test_rpc_aware_placement },
+    { "rpc_aware_budget_resets_when_margins_change", test_rpc_aware_budget_resets_when_margins_change },
     { "rpc_aware_reuses_probe_after_margin_change", test_rpc_aware_reuses_probe_after_margin_change },
     { "rpc_aware_no_alloc_probes",  test_rpc_aware_uses_no_alloc_probes },
     { "rpc_cold_start",             test_rpc_cold_start },

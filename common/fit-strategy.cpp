@@ -1167,7 +1167,15 @@ static bool fit_solve_rpc_aware(
     const auto shed_levels = fit_shed_levels(reserves);
     fprintf(stderr, "[FITDBG] %zu candidates, %zu shed levels\n", candidates.size(), shed_levels.size()); fflush(stderr);
     const uint64_t fit_key = common_fit_cache_key_hash(params, path_model, analysis);
-    size_t attempt_count = search_session ? search_session->probes_used : 0;
+    // the probe budget bounds searching against one margin configuration. the MTP
+    // preflight raises fit_params_target between iterations by design, so each
+    // iteration is a different problem. carrying the previous iteration's spend
+    // left the next one unable to afford a single probe, so it returned the floor
+    // it was handed instead of the context it could have reached. the incumbent
+    // is still carried and re-validated below; only the spend is dropped.
+    const bool fit_key_changed = search_session && search_session->fit_key != 0 &&
+            search_session->fit_key != fit_key;
+    size_t attempt_count = (search_session && !fit_key_changed) ? search_session->probes_used : 0;
     const size_t attempt_limit = params.fit_max_attempts;
     common_fit_plan session_resume_plan;
     const common_fit_plan * progress_plan = resume_plan;
