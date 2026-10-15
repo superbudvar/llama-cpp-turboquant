@@ -1248,27 +1248,39 @@ static bool fit_solve_rpc_aware(
             }
             if (baseline_matches) {
                 first_candidate = std::min(candidates.size(), (size_t) std::max(0, progress_plan->search.candidate_cursor));
-                best_ctx = progress_plan->n_ctx;
-                best_plan = *progress_plan;
-                best_split_size = (size_t) std::max(0, progress_plan->search.best_split_size);
-                best_rpc_frac = progress_plan->search.best_rpc_frac;
-                best_label = "cached incumbent";
-                if (fit_measure_plan(probe, best_plan, mparams, cparams, path_model, best_m, true,
-                            &attempt_count, search_session)) {
-                    if (!fit_same_devices(best_m.devs, analysis) ||
-                            !fit_fits_margins(best_m.memory, margins, analysis, nullptr, nullptr, &ceiling_free, &ceiling_free_warm)) {
-                        best_ctx = -1;
-                        first_candidate = 0;
-                    }
-                } else {
+                resume_rpc_stage = progress_plan->search.rpc_stage == 2;
+            }
+
+            // the incumbent is a concrete placement, not part of the cursor: adopt
+            // and re-validate it even when the cursor is not resumable. free memory
+            // shifting between MTP preflight iterations is normal (the reserve
+            // grows), and dropping a known-good plan there costs context: the next
+            // iteration starts with no incumbent, spends its first probe on the
+            // floor, and if the carried budget is already spent it retains that
+            // floor instead of the context the previous iteration had found.
+            best_ctx = progress_plan->n_ctx;
+            best_plan = *progress_plan;
+            best_split_size = (size_t) std::max(0, progress_plan->search.best_split_size);
+            best_rpc_frac = progress_plan->search.best_rpc_frac;
+            best_label = "cached incumbent";
+            if (fit_measure_plan(probe, best_plan, mparams, cparams, path_model, best_m, true,
+                        &attempt_count, search_session)) {
+                if (!fit_same_devices(best_m.devs, analysis) ||
+                        !fit_fits_margins(best_m.memory, margins, analysis, nullptr, nullptr, &ceiling_free, &ceiling_free_warm)) {
                     best_ctx = -1;
-                    first_candidate = 0;
                 }
-                if (best_ctx >= 0) {
-                    resume_rpc_stage = progress_plan->search.rpc_stage == 2;
-                    LOG_INF("%s: resuming search after candidate %zu with incumbent n_ctx=%d\n",
-                            __func__, first_candidate, best_ctx);
-                }
+            } else {
+                best_ctx = -1;
+            }
+            if (best_ctx < 0) {
+                first_candidate = 0;
+                resume_rpc_stage = false;
+            } else if (baseline_matches) {
+                LOG_INF("%s: resuming search after candidate %zu with incumbent n_ctx=%d\n",
+                        __func__, first_candidate, best_ctx);
+            } else {
+                LOG_INF("%s: device baseline shifted; keeping incumbent n_ctx=%d and restarting the search\n",
+                        __func__, best_ctx);
             }
         }
 
