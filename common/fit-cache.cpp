@@ -21,6 +21,22 @@ constexpr uint32_t CACHE_MAGIC   = 0x46495443; // "FITC"
 constexpr uint32_t CACHE_VERSION = 9;
 constexpr std::int64_t MAX_CACHE_AGE_S = 24 * 3600;
 
+// Memory quantities in the key are quantised to this grid before hashing.
+// The MTP preflight folds a measured reserve into fit_params_target, and the
+// mmproj and spec reserves carry measured bytes, so the same configuration
+// produced keys 1.5 MiB apart across consecutive loads and the cache never hit.
+// Measured byte values are floored to the grid; everything else in the key stays
+// exact. Two configurations whose targets differ by less than this share a key,
+// which is the accepted tradeoff: the stored plan is re-validated against live
+// free memory and margins on load, so a plan fitted under the larger target is
+// simply conservative for the smaller one.
+constexpr size_t CACHE_KEY_GRID_MIB = 24;
+
+size_t quantize_mib(size_t bytes) {
+    const size_t grid = CACHE_KEY_GRID_MIB * 1024 * 1024;
+    return bytes / grid * grid;
+}
+
 // parse guards: no plan can legitimately exceed these
 constexpr size_t MAX_ROLES = 16;
 constexpr size_t MAX_SPLIT = 64;
@@ -282,7 +298,7 @@ key += "model=";
 
     for (size_t t : params.fit_params_target) {
         key += "target=";
-        key += std::to_string(t);
+        key += std::to_string(quantize_mib(t));
         key += "\n";
     }
     key += "shed=";
@@ -298,7 +314,7 @@ key += "model=";
         key += ",";
         key += std::to_string(r.device);
         key += ":";
-        key += std::to_string(r.bytes);
+        key += std::to_string(quantize_mib(r.bytes));
         key += ":";
         key += std::to_string(r.priority);
         key += ":";
@@ -402,6 +418,25 @@ key += "model=";
     return hash;
 }
 
+// Memory buckets that went into the key, so a miss can be attributed to a
+// specific axis: same buckets but a different key means a non-quantised
+// component moved, not the reserve granularity.
+static std::string cache_key_buckets(const common_params & params) {
+    std::string s;
+    for (size_t t : params.fit_params_target) {
+        s += std::to_string(quantize_mib(t) / (1024 * 1024));
+        s += ",";
+    }
+    s += " reserves=";
+    for (const auto & r : params.fit_params_reserves) {
+        s += r.tag;
+        s += ":";
+        s += std::to_string(quantize_mib(r.bytes) / (1024 * 1024));
+        s += ",";
+    }
+    return s;
+}
+
 bool common_fit_cache_load(
         const common_params & params,
         const std::string & path_model,
@@ -419,6 +454,8 @@ bool common_fit_cache_load(
 
     std::ifstream in(path, std::ios::binary);
     if (!in.is_open()) {
+        LOG_INF("%s: no cache file: %s (key %016llx, grid %zu MiB, target_mib=[%s])\n",
+                __func__, path.c_str(), (unsigned long long) key, CACHE_KEY_GRID_MIB, cache_key_buckets(params).c_str());
         return false;
     }
     std::vector<uint8_t> buf((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
@@ -434,20 +471,23 @@ bool common_fit_cache_load(
         return false;
     }
     if (magic != CACHE_MAGIC || version < 6 || version > CACHE_VERSION) {
-        LOG_DBG("%s: cache header mismatch: %s\n", __func__, path.c_str());
+        LOG_INF("%s: cache header mismatch: %s\n", __func__, path.c_str());
         return false;
     }
     if (key_hash != key) {
-        LOG_DBG("%s: cache key mismatch: %s\n", __func__, path.c_str());
+        LOG_INF("%s: cache key mismatch: %s (want %016llx, have %016llx, grid %zu MiB, target_mib=[%s])\n",
+                __func__, path.c_str(), (unsigned long long) key, (unsigned long long) key_hash,
+                CACHE_KEY_GRID_MIB, cache_key_buckets(params).c_str());
         return false;
     }
     const int64_t now = (int64_t) std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
     if ((int64_t) timestamp <= 0 || now - (int64_t) timestamp > MAX_CACHE_AGE_S || (int64_t) timestamp > now) {
-        LOG_DBG("%s: cache entry stale: %s\n", __func__, path.c_str());
+        LOG_INF("%s: cache entry stale: %s (age %lld s, max %lld s)\n", __func__, path.c_str(),
+                (long long) (now - (int64_t) timestamp), (long long) MAX_CACHE_AGE_S);
         return false;
     }
     if (r.pos + body_size != buf.size()) {
-        LOG_DBG("%s: cache body size mismatch: %s\n", __func__, path.c_str());
+        LOG_INF("%s: cache body size mismatch: %s\n", __func__, path.c_str());
         return false;
     }
 
@@ -772,7 +812,7 @@ bool common_fit_cache_save(
         LOG_WRN("%s: cannot move cache file into place: %s\n", __func__, ec.message().c_str());
         return false;
     }
-    LOG_INF("%s: saved cache: delta_ema=[%s] projected=[%s] ceiling=[%s] model_size_error=[%s] to %s\n",
+    LOG_INF("%s: saved cache: delta_ema=[%s] projected=[%s] ceiling=[%s] model_size_error=[%s] to %s (grid %zu MiB, target_mib=[%s])\n",
             __func__,
             [&]() {
                 std::string s;
@@ -810,7 +850,9 @@ bool common_fit_cache_save(
                 }
                 return s;
             }().c_str(),
-            path.c_str());
+            path.c_str(),
+            CACHE_KEY_GRID_MIB,
+            cache_key_buckets(params).c_str());
     return true;
 }
 
