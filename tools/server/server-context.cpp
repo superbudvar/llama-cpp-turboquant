@@ -1200,7 +1200,7 @@ private:
 
     bool add_bos_token = true;
 
-    int32_t n_ctx; // total context for all clients / slots
+    int32_t n_ctx = 0; // total context for all clients / slots; settled in load_model()
 
     // set to llama_model_n_swa(model)
     // if swa_full is enabled, this is set to 0 to simulate a non-SWA model
@@ -1858,6 +1858,11 @@ private:
 
         n_ctx = llama_n_ctx(ctx_tgt);
 
+        if (params_base.n_ctx_checkpoints > 0) {
+            SRV_TRC("context checkpoint min spacing = %" PRId64 " (effective, n_ctx = %d)\n",
+                    checkpoint_min_step_eff(), n_ctx);
+        }
+
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
         if (has_spec) {
@@ -2106,8 +2111,9 @@ prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, 
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
         if (params_base.n_ctx_checkpoints > 0) {
-            SRV_TRC("context checkpoints enabled, max = %d, min spacing = %" PRId64 " (effective)\n",
-                        params_base.n_ctx_checkpoints, checkpoint_min_step_eff());
+            // spacing is settled in load_model() once the fit solver has picked
+            // the context; it is logged there with the value that applies
+            SRV_TRC("context checkpoints enabled, max = %d\n", params_base.n_ctx_checkpoints);
         } else {
             SRV_TRC("%s", "context checkpoints disabled\n");
         }
@@ -3217,9 +3223,13 @@ prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, 
         if (params_base.checkpoint_min_step == 0) {
             return 0;
         }
-        const int64_t step  = params_base.checkpoint_min_step;
-        const int64_t n_ctx = params_base.n_ctx > 0 ? params_base.n_ctx : 65536;
-        return std::min(step, std::max<int64_t>(1024, n_ctx / 64));
+        // prefer the settled context. params_base.n_ctx is still 0 for a router
+        // preset that lets the fit solver pick the context, which would pin the
+        // clamp to the 1024 floor on every such model.
+        const int64_t step = params_base.checkpoint_min_step;
+        const int64_t n_ctx_eff = this->n_ctx > 0 ? this->n_ctx
+            : (params_base.n_ctx > 0 ? params_base.n_ctx : 65536);
+        return std::min(step, std::max<int64_t>(1024, n_ctx_eff / 64));
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
@@ -4585,8 +4595,18 @@ prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, 
                         slot.init_sampler();
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
-                        // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        // message, we are near the end of the prompt, or enough tokens have
+                        // passed since the last one. without the last case a prompt that is one
+                        // large user message gets no mid-prompt checkpoint at all, and every
+                        // later turn sharing a prefix with it finds no checkpoint at or before
+                        // its common prefix and re-prefills the whole prompt.
+                        // use the raw checkpoint_min_step here, not checkpoint_min_step_eff():
+                        // the latter clamps against the pre-fit n_ctx and lands on its 1024
+                        // floor for a preset that lets the fit solver pick the context.
+                        const bool spacing_elapsed = params_base.checkpoint_min_step > 0 &&
+                            (slot.prompt.checkpoints.empty() ||
+                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+                        if (!is_user_start && !near_prompt_end && !spacing_elapsed) {
                             do_checkpoint = false;
                         }
                     }

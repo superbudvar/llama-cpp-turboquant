@@ -683,7 +683,7 @@ struct common_params {
     bool    cache_prompt        = true;  // whether to enable prompt caching
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
-    int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
+    int32_t checkpoint_min_step = 4096;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     std::string cache_disk_path = "";    // persist the prompt cache to disk (requires cache_ram_mib != 0)
     int32_t cache_disk_max_mib  = 16384; // max size of the disk prompt cache in MiB, 0 = no limit (independent of cache_ram_mib)
