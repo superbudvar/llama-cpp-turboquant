@@ -1872,8 +1872,19 @@ private:
                     // fit released the draft reservation to keep the main model
                     // offloaded; run the draft entirely on CPU
                     params_dft.n_gpu_layers = 0;
-                    params_dft.devices.clear();
-                    params_dft.split_mode = LLAMA_SPLIT_MODE_NONE;
+
+                    // leave the device list and split_mode alone. forcing
+                    // LLAMA_SPLIT_MODE_NONE here prunes model.devices down to
+                    // main_gpu (src/llama.cpp:280), and with the RPC endpoint
+                    // first that drops ROCm0 from the draft scheduler. DFlash
+                    // and DSpark build their graph from tensors borrowed out of
+                    // the target model (output.weight, tok_embd), so those
+                    // weights sit in ROCm0 buffers; ggml aborts on a
+                    // pre-allocated tensor whose buffer has no backend in this
+                    // scheduler, so the prune turned every fit shed into a hard
+                    // crash during resolve_fused_ops. server_prepare_shared_draft_
+                    // devices already lists the target devices for exactly this
+                    // reason, and n_gpu_layers=0 still keeps the shed.
                 }
 
                 // progress callback
