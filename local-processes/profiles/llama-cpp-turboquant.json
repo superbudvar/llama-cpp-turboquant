@@ -22,7 +22,7 @@
     "poll_seconds": 3
   },
   "scratch": {
-    "host_root": "/mnt/build/local-processes",
+    "host_root": "/mnt/ai/build/local-processes",
     "size_gib": 8,
     "reserve_bytes": 1073741824,
     "qemu_group": "qemu",
