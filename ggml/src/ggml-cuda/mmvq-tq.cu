@@ -1699,7 +1699,7 @@ void ggml_cuda_mul_mat_tq4_1s_cublas(ggml_backend_cuda_context & ctx,
 // pooled f32 scratch and run the stock MMQ with the TQ4_1S int8-centroid load_tiles (the weight
 // stays as rotated-domain centroids). Env-gated by GGML_TQ_MMQ. src1/dst assumed contiguous f32
 // with ne10 % QK_TQ4_1S == 0 (checked by the caller's tq_fast_path_ok).
-void ggml_cuda_mul_mat_tq4_1s_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+static void ggml_cuda_mul_mat_tq_mmq_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     cudaStream_t stream = ctx.stream();
 
     const int64_t n_act    = ggml_nelements(src1);   // contiguous f32
@@ -1716,6 +1716,17 @@ void ggml_cuda_mul_mat_tq4_1s_mmq(ggml_backend_cuda_context & ctx, const ggml_te
     src1_rot.data = act_buf.get();
 
     ggml_cuda_mul_mat_q(ctx, src0, &src1_rot, nullptr, dst, false);
+}
+
+void ggml_cuda_mul_mat_tq4_1s_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    ggml_cuda_mul_mat_tq_mmq_impl(ctx, src0, src1, dst);
+}
+
+// TQ3_1S uses the same 32-element block-local WHT (tq3_0_rht_forward) and the same
+// sign pattern as TQ4_1S, so the activation pre-rotation is identical; only the
+// int8-centroid load_tiles differ, and those are selected from src0->type.
+void ggml_cuda_mul_mat_tq3_1s_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    ggml_cuda_mul_mat_tq_mmq_impl(ctx, src0, src1, dst);
 }
 
 // Phase 2 (MoE): native MFMA-i8 MMQ prefill for TQ4_1S experts (gfx90a). Same trick as the dense
@@ -1739,6 +1750,26 @@ void ggml_cuda_mul_mat_id_tq4_1s_mmq(ggml_backend_cuda_context & ctx, const ggml
     tq_prerotate_activation<<<grid, block, 0, stream>>>((const float *) src1->data, act_buf.get(), (int) n_act);
 
     // Shallow tensor over the rotated activation (same shape/strides, still contiguous f32).
+    ggml_tensor src1_rot = *src1;
+    src1_rot.data = act_buf.get();
+
+    ggml_cuda_mul_mat_q(ctx, src0, &src1_rot, ids, dst, false);
+}
+
+// TQ3_1S MoE: same activation pre-rotation as TQ4_1S, see ggml_cuda_mul_mat_tq3_1s_mmq.
+void ggml_cuda_mul_mat_id_tq3_1s_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
+                                     const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t n_act    = ggml_nelements(src1);   // contiguous f32
+    const int64_t n_blocks = n_act / 32;             // 32-elem WHT blocks along ne0
+
+    ggml_cuda_pool_alloc<float> act_buf(ctx.pool(), n_act);
+
+    const dim3 block(32, MMVQ_TQ_NWARPS);
+    const dim3 grid((n_blocks + MMVQ_TQ_NWARPS - 1) / MMVQ_TQ_NWARPS);
+    tq_prerotate_activation<<<grid, block, 0, stream>>>((const float *) src1->data, act_buf.get(), (int) n_act);
+
     ggml_tensor src1_rot = *src1;
     src1_rot.data = act_buf.get();
 
