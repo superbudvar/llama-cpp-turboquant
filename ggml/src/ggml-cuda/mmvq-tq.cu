@@ -1736,8 +1736,11 @@ void ggml_cuda_mul_mat_tq3_1s_mmq(ggml_backend_cuda_context & ctx, const ggml_te
 // dequant-to-f16 cuBLAS fallback for native (GGML_TQ_NATIVE) MoE, so experts can stay at native
 // 5bpw (avoiding the ~1.7x-VRAM Q8_0 load-time conversion) without the prefill penalty. Env-gated
 // by GGML_TQ_MMQ. src1 assumed contiguous f32 with ne10 % QK_TQ4_1S == 0.
-void ggml_cuda_mul_mat_id_tq4_1s_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
-                                     const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+// The TQ types share the MoE MMQ path: the block-local turbo WHT is cancelled on the
+// activation side, so the pre-rotation is identical for TQ3_1S and TQ4_1S and only
+// the int8-centroid load_tiles differ (selected from src0->type).
+static void ggml_cuda_mul_mat_id_tq_mmq_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
+                                             const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
     cudaStream_t stream = ctx.stream();
 
     const int64_t n_act    = ggml_nelements(src1);   // contiguous f32
@@ -1756,22 +1759,12 @@ void ggml_cuda_mul_mat_id_tq4_1s_mmq(ggml_backend_cuda_context & ctx, const ggml
     ggml_cuda_mul_mat_q(ctx, src0, &src1_rot, ids, dst, false);
 }
 
-// TQ3_1S MoE: same activation pre-rotation as TQ4_1S, see ggml_cuda_mul_mat_tq3_1s_mmq.
+void ggml_cuda_mul_mat_id_tq4_1s_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
+                                     const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+    ggml_cuda_mul_mat_id_tq_mmq_impl(ctx, src0, src1, ids, dst);
+}
+
 void ggml_cuda_mul_mat_id_tq3_1s_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
                                      const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
-    cudaStream_t stream = ctx.stream();
-
-    const int64_t n_act    = ggml_nelements(src1);   // contiguous f32
-    const int64_t n_blocks = n_act / 32;             // 32-elem WHT blocks along ne0
-
-    ggml_cuda_pool_alloc<float> act_buf(ctx.pool(), n_act);
-
-    const dim3 block(32, MMVQ_TQ_NWARPS);
-    const dim3 grid((n_blocks + MMVQ_TQ_NWARPS - 1) / MMVQ_TQ_NWARPS);
-    tq_prerotate_activation<<<grid, block, 0, stream>>>((const float *) src1->data, act_buf.get(), (int) n_act);
-
-    ggml_tensor src1_rot = *src1;
-    src1_rot.data = act_buf.get();
-
-    ggml_cuda_mul_mat_q(ctx, src0, &src1_rot, ids, dst, false);
+    ggml_cuda_mul_mat_id_tq_mmq_impl(ctx, src0, src1, ids, dst);
 }
