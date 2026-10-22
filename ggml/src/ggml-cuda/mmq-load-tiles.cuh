@@ -549,10 +549,11 @@ static __device__ __forceinline__ int tq4_1s_qs_to_int8x4(const uint8_t * __rest
 }
 
 // TQ3_1S: 3-bit indices, 8 elements per 3-byte group, 4 groups per 32-element block.
-#define TQ3_CENTROID_I8_RESCALE (1.996684f / 127.0f)
-
+//
 // 4 consecutive elements never straddle a group boundary (a group holds 8), so one
-// 3-byte group read serves the quad.
+// 3-byte group read serves the quad. The group is read as three bytes, not one
+// 32-bit load: the fourth byte of a 32-bit load would run past the end of the
+// block for its last group.
 static __device__ __forceinline__ int tq3_1s_qs_to_int8x4(const uint8_t * __restrict__ qs, const int kqsx) {
     const int g   = kqsx >> 1;        // group 0..3
     const int sub = (kqsx & 1) * 4;    // first element within the group
@@ -562,12 +563,14 @@ static __device__ __forceinline__ int tq3_1s_qs_to_int8x4(const uint8_t * __rest
     const int i1 = (packed >> (3*sub + 3)) & 7;
     const int i2 = (packed >> (3*sub + 6)) & 7;
     const int i3 = (packed >> (3*sub + 9)) & 7;
-    // cast through uint8_t: a negative int8 would otherwise sign-extend into the
-    // upper bytes of the packed word.
-    return (int) (uint8_t) kvalues_tq3[i0]
-         | ((int) (uint8_t) kvalues_tq3[i1] << 8)
-         | ((int) (uint8_t) kvalues_tq3[i2] << 16)
-         | ((int) (uint8_t) kvalues_tq3[i3] << 24);
+    // Cast through uint8_t: a negative int8 would otherwise sign-extend into the
+    // upper bytes of the packed word. The shifts are done in uint32_t for the same
+    // reason - (int) 0x81 << 24 overflows a signed int.
+    const uint32_t w = (uint32_t) (uint8_t) kvalues_tq3[i0]
+                     | ((uint32_t) (uint8_t) kvalues_tq3[i1] << 8)
+                     | ((uint32_t) (uint8_t) kvalues_tq3[i2] << 16)
+                     | ((uint32_t) (uint8_t) kvalues_tq3[i3] << 24);
+    return (int) w;
 }
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_tq3_1s(
@@ -579,12 +582,20 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
     constexpr int QI_TQ = QK_TQ3_0 / 4;   // 8 ints (int8-quads) per block
 
+    // Recover the float centroids from the int8 table: the table is
+    // round(CENTROID * 127 / max|CENTROID|), so the rescale is max|CENTROID| / 127.
+    constexpr float TQ3_CENTROID_I8_RESCALE = 1.996684f / 127.0f;
+
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     int   * x_qs = (int   *)  x_tile;
     float * x_df = (float *) (x_qs + 2*MMQ_TILE_NE_K);
 #else
     // dp4a consumes a different tile layout: rows are padded by one int and the scales start
     // after the (padded) quant region, not at a fixed 2*MMQ_TILE_NE_K offset.
+    // Unreachable today: TQ3_1S has an MMQ config entry only in mmq-config-rdna4.cuh, and
+    // RDNA4 defines AMD_WMMA_AVAILABLE, so it always takes the branch above. This branch
+    // becomes live when an arch that lacks MFMA/WMMA/MMA gets a TQ3_1S config entry, and
+    // it needs a run on that arch first.
     constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_TQ3_1S, I);
     int   * x_qs = (int   *)  x_tile;
     float * x_df = (float *) (x_qs + txs.qs);
