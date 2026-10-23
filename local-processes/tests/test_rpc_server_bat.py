@@ -133,8 +133,16 @@ class Batch:
             return
         if low.startswith("for "):
             m = re.search(r'do\s+set\s+"?([A-Za-z_][A-Za-z0-9_]*)=', stmt, re.I)
-            if m and m.group(1).upper() == "RPC_DIR":
+            if not m:
+                return
+            name = m.group(1).upper()
+            if name == "RPC_DIR":
                 self.vars["RPC_DIR"] = self.cwd
+            elif "get-date" in stmt.lower():
+                # the real thing shells out to PowerShell; stub the value
+                self.vars[name] = "20260101-000000"
+            elif "get-filehash" in stmt.lower():
+                self.vars[name] = "DEADBEEF"
             return
         if low.startswith("if "):
             self.exec_if(stmt[3:].strip())
@@ -338,6 +346,17 @@ class RpcServerBatTests(unittest.TestCase):
         data = BAT_PATH.read_bytes()
         self.assertEqual(data.count(b"\n") - data.count(b"\r\n"), 0,
                          "cmd.exe needs CRLF line endings for labels and goto")
+
+    def test_the_log_path_and_hash_are_expanded(self):
+        """A for /f result used in the same block would stay literal."""
+        _, bat = self.run_bat([])
+        printed = " ".join(bat.out)
+        self.assertNotIn("%STAMP%", printed,
+                         "the log path still contains the unexpanded stamp")
+        self.assertNotIn("%SHA%", printed,
+                         "the hash was never expanded")
+        self.assertIn("rpc-server-20260101-000000.log", printed)
+        self.assertIn("DEADBEEF", printed)
 
 
 if __name__ == "__main__":
