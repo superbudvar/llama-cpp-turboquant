@@ -42,29 +42,73 @@ rem Default: keep TQ4_1S weights native on this peer (no 1.7x q8_0 expansion).
 set "RPC_TQ_NATIVE=1"
 
 rem ------------------------------------------------------------------- args
+rem Each option that takes a value gets its own label. A chained
+rem "if (...) (set ... & shift & shift & goto parse_args)" block works, but
+rem a value check inside it does not, so the check lives at the label.
 :parse_args
 if "%~1"=="" goto args_done
-if /I "%~1"=="-p"        (set "RPC_PORT=%~2"    & shift & shift & goto parse_args)
-if /I "%~1"=="--port"    (set "RPC_PORT=%~2"    & shift & shift & goto parse_args)
-if /I "%~1"=="-H"        (set "RPC_HOST=%~2"    & shift & shift & goto parse_args)
-if /I "%~1"=="--host"    (set "RPC_HOST=%~2"    & shift & shift & goto parse_args)
-if /I "%~1"=="-t"        (set "RPC_THREADS=%~2" & shift & shift & goto parse_args)
-if /I "%~1"=="--threads" (set "RPC_THREADS=%~2" & shift & shift & goto parse_args)
-if /I "%~1"=="-d"        (set "RPC_DEVICE=%~2"  & shift & shift & goto parse_args)
-if /I "%~1"=="--device"  (set "RPC_DEVICE=%~2"  & shift & shift & goto parse_args)
+
+if /I "%~1"=="-p"        goto opt_port
+if /I "%~1"=="--port"    goto opt_port
+if /I "%~1"=="-H"        goto opt_host
+if /I "%~1"=="--host"    goto opt_host
+if /I "%~1"=="-t"        goto opt_threads
+if /I "%~1"=="--threads" goto opt_threads
+if /I "%~1"=="-d"        goto opt_device
+if /I "%~1"=="--device"  goto opt_device
 if /I "%~1"=="--tq-native=1" (set "RPC_TQ_NATIVE=1" & shift & goto parse_args)
 if /I "%~1"=="--tq-native=0" (set "RPC_TQ_NATIVE=0" & shift & goto parse_args)
 if /I "%~1"=="--foreground"  (set "RPC_FOREGROUND=1" & shift & goto parse_args)
 if /I "%~1"=="--help" goto usage
 echo unknown option: %~1
-goto usage
+goto usage_err
+
+:opt_port
+if "%~2"=="" goto missing_value
+set "RPC_PORT=%~2"
+shift
+shift
+goto parse_args
+
+:opt_host
+if "%~2"=="" goto missing_value
+set "RPC_HOST=%~2"
+shift
+shift
+goto parse_args
+
+:opt_threads
+if "%~2"=="" goto missing_value
+set "RPC_THREADS=%~2"
+shift
+shift
+goto parse_args
+
+:opt_device
+if "%~2"=="" goto missing_value
+set "RPC_DEVICE=%~2"
+shift
+shift
+goto parse_args
+
+:missing_value
+echo missing value for %~1
+goto usage_err
+
 :args_done
+goto preflight
 
 :usage
 echo Usage: %~nx0 [-H host] [-p port] [-t threads] [-d device]
 echo                 [--tq-native=0^|1] [--foreground]
-exit /b 1
+exit /b 0
 
+:usage_err
+echo Usage: %~nx0 [-H host] [-p port] [-t threads] [-d device]
+echo                 [--tq-native=0^|1] [--foreground]
+exit /b 2
+
+:preflight
 rem ------------------------------------------------------------- preflight
 if not exist "%RPC_EXE%" (
     echo ERROR: %RPC_EXE% not found.

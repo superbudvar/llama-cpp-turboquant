@@ -104,3 +104,18 @@ that has it.
 With `GGML_TQ_NATIVE=1` on the peer the mismatch cannot arise at all: the
 server keeps the TQ4_1S bytes, so the client's retyping test (which fires only
 when the peer reports a q8_0-sized allocation) never triggers.
+
+## Testing the launcher
+
+The launcher runs on Windows, so it cannot be run on the build host. The test
+interprets it instead:
+
+```sh
+cd local-processes/tests
+python3 -m unittest test_rpc_server_bat -v
+```
+
+It covers the option dispatch, the error paths, the CRLF line endings, and the
+label fall-through class of bug - the first version of this script had
+`:args_done` directly above `:usage`, so it printed its usage and exited
+without starting anything.
