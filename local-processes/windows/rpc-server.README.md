@@ -93,6 +93,20 @@ the Windows box, not on the Linux client. The client's own `GGML_TQ_NATIVE` has
 no effect on the weights that live on the peer - the client does not hold
 them.
 
+### Measured (2026-10-24)
+
+Two TQ4_1S models were served through a peer running this script and checked
+against the GGUF's own tensor bytes:
+
+| model | GGUF tensor bytes | model buffers | difference |
+|---|---:|---|---:|
+| Polaris 13B TQ4_1S | 7,962,512,384 B | 7,962,508,657 B | -3,727 B |
+| 35B-A3B-UD TQ4_1S | 21,329.73 MiB | 21,329.72 MiB | -0.01 MiB |
+
+Nothing was expanded, so the peer held the native 5 bpw bytes. With the
+expansion the totals would have been about 767 MiB and 1000 MiB higher. Both
+models answer correctly over RPC (the Polaris at 23.91 tok/s decode).
+
 ## Related
 
 The TQ4_1S-over-RPC type mismatch (the `!!!!!!!!!!!!!!` symptom) is a **client**

@@ -94,6 +94,7 @@ A green run means the cases that ran passed, not that your change was exercised.
 - Run the profile-driven host runner with `--dry-run` first. It discovers the VM address dynamically and verifies the pinned SSH host-key fingerprint and guest hostname; do not hard-code the VM IP or accept an unknown host key.
 - The Windows runner verifies the mapped source commit, builds on a temporary qcow2 data disk under `/mnt/build`, and exports binaries, logs, and a hash manifest to the host artifact directory. Do not put the build tree on the `Z:` share or the VM system disk.
 - Coordinate before starting a real build because the Libvirt VM is shared. If SSH disconnects during a build, the runner intentionally leaves the scratch disk attached and preserves its image; inspect the VM and runner output before attempting cleanup.
+- The RPC peer (192.168.5.2) runs `local-processes/windows/rpc-server.bat`, which sets `GGML_TQ_NATIVE=1` by default so the peer keeps TQ4_1S weights native instead of expanding them to q8_0 at load. The flag is read by the process that owns the tensor, so it has to be set on the peer, not on the client. The launcher cannot be run on the build host; `local-processes/tests/test_rpc_server_bat.py` interprets it instead, and that test is what caught the label fall-through that made the first version exit before starting anything.
 
 ### Known pitfalls (each caused a real bug once - check these first on regressions)
 
