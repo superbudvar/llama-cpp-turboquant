@@ -802,23 +802,60 @@ static int32_t fit_spill_split_at_ngl(
         const std::vector<int64_t> & ceiling_free_warm,
         size_t * attempt_counter = nullptr,
         size_t attempt_limit = 0,
-        common_fit_search_session * search_session = nullptr) {
+        common_fit_search_session * search_session = nullptr,
+        bool * out_budget_exhausted = nullptr) {
     out_frac = -1.0f;
+    if (out_budget_exhausted) {
+        *out_budget_exhausted = false;
+    }
+    bool budget_hit = false;
     const int32_t min_ctx = (int32_t) (params.n_ctx > 0 ? params.n_ctx : params.fit_strategy_min_ctx);
     const float step = 0.05f;
     const size_t nd = analysis.devices.size();
 
     // NOTE: fit_solve_rpc_aware is single-threaded; rpc_frac_cache_entry is safe.
-    static struct { uint64_t key; float lo_frac; float hi_frac; bool valid; } rpc_frac_cache_entry[4] = {};
+    // The entry keeps the spec and margin hashes separately from the exact
+    // key, so a neighbouring layer count can reuse the feasible window this
+    // one found instead of scanning the whole range again.
+    struct rpc_frac_cache_entry_t {
+        uint64_t key;         // exact key: spec, ngl and margins
+        uint64_t spec_hash;
+        uint64_t margins_hash;
+        float lo_frac;        // smallest feasible fraction
+        float hi_frac;        // largest feasible fraction
+        bool valid;
+    };
+    static rpc_frac_cache_entry_t rpc_frac_cache_entry[4] = {};
 
     // cache key: combine spec label hash, ngl, and margins hash
     uint64_t margins_hash = 1469598103934665603ull; // FNV offset basis
     for (int64_t m : margins) {
         margins_hash ^= (uint64_t)m;
-        margins_hash *= 1099511628211ull; // FNV prime
+        margins_hash *= 1097511628211ull; // FNV prime
     }
     uint64_t spec_hash = std::hash<std::string>{}(spec.label);
     uint64_t cache_key = spec_hash ^ ((uint64_t)ngl << 32) ^ margins_hash;
+
+    // The feasible rpc_frac window moves slowly with the layer count, so a
+    // window found at a neighbouring layer count is a good starting point.
+    // Scanning the whole range at every layer count costs more probes than
+    // the budget allows: the n_gpu_layers bisect needs several evaluations
+    // and each one was paying for a full sweep plus a bisection.
+    float hint_lo = 0.0f;
+    float hint_hi = scan_hi;
+    bool have_hint = false;
+    for (int i = 0; i < 4; i++) {
+        if (rpc_frac_cache_entry[i].valid &&
+                rpc_frac_cache_entry[i].spec_hash == spec_hash &&
+                rpc_frac_cache_entry[i].margins_hash == margins_hash) {
+            hint_lo = std::max(0.0f, rpc_frac_cache_entry[i].lo_frac - 2.0f * step);
+            hint_hi = std::min(scan_hi, rpc_frac_cache_entry[i].hi_frac + 2.0f * step);
+            have_hint = true;
+            LOG_DBG("%s: ngl=%d reusing window [%.4f,%.4f] from a neighbouring layer count\n",
+                    __func__, ngl, hint_lo, hint_hi);
+            break;
+        }
+    }
 
     struct row_t {
         float f;
@@ -840,8 +877,7 @@ static int32_t fit_spill_split_at_ngl(
             // false positives (non-feasible values in a contiguous interval) are benign:
             // the binary search tests each and discards infeasible ones, still arriving
             // at the correct best fraction.
-            for (float f = rpc_frac_cache_entry[i].hi_frac; f >= rpc_frac_cache_entry[i].lo_frac - 1e-6f; f -= step) {
-                if (f < 0.0f) break;
+            for (float f = rpc_frac_cache_entry[i].hi_frac; f >= rpc_frac_cache_entry[i].lo_frac - 1e-6f; f -= step) {                if (f < 0.0f) break;
                 feas.push_back(f);
             }
             cache_hit = true;
@@ -852,11 +888,16 @@ static int32_t fit_spill_split_at_ngl(
     // coarse scan top-down, mirroring the full-offload bracket. rpc_frac
     // feasibility is an interval: low f overflows the local device, high f
     // overflows RPC.
-    for (float f = scan_hi; f >= -step * 0.5f; f -= step) {
+    // The scan starts at the window a neighbouring layer count found, when
+    // there is one, and widens to the full range only if nothing inside it
+    // works. A full sweep at every layer count does not fit in the probe
+    // budget: the n_gpu_layers bisect needs several evaluations.
+    for (float f = have_hint ? hint_hi : scan_hi; f >= -step * 0.5f; f -= step) {
         if (f < 0.0f) { f = 0.0f; }
         if (attempt_counter && attempt_limit > 0 && *attempt_counter >= attempt_limit) {
             LOG_DBG("%s: ngl=%d scan stopped at rpc_frac=%.4f, probe budget %zu/%zu reached\n",
                     __func__, ngl, f, *attempt_counter, attempt_limit);
+            budget_hit = true;
             break;
         }
         common_fit_plan plan = fit_plan_from_spec(analysis, spec, loader_ngl, min_ctx, f, ngl);
@@ -873,7 +914,39 @@ static int32_t fit_spill_split_at_ngl(
         if (ok_margin) {
             feas.push_back(f);
         }
-        if (f <= 0.0f) { break; }
+        if (f <= (have_hint ? hint_lo : 0.0f)) { break; }
+    }
+
+    // the hinted window held nothing: fall back to the full range before
+    // concluding that this layer count has no feasible split.
+    if (feas.empty() && have_hint) {
+        LOG_DBG("%s: ngl=%d hinted window [%.4f,%.4f] held no feasible split, widening the scan\n",
+                __func__, ngl, hint_lo, hint_hi);
+        rows.clear();
+        for (float f = scan_hi; f >= -step * 0.5f; f -= step) {
+            if (f < 0.0f) { f = 0.0f; }
+            if (attempt_counter && attempt_limit > 0 && *attempt_counter >= attempt_limit) {
+                LOG_DBG("%s: ngl=%d scan stopped at rpc_frac=%.4f, probe budget %zu/%zu reached\n",
+                        __func__, ngl, f, *attempt_counter, attempt_limit);
+                budget_hit = true;
+                break;
+            }
+            common_fit_plan plan = fit_plan_from_spec(analysis, spec, loader_ngl, min_ctx, f, ngl);
+            fit_measure_result m;
+            const bool ok_measure = fit_measure_plan(probe, plan, mparams, cparams, path_model, m, true,
+                    attempt_counter, search_session);
+            const bool ok_devs    = ok_measure && fit_same_devices(m.devs, analysis);
+            size_t fail = (size_t) -1;
+            const bool ok_margin  = ok_devs && fit_fits_margins(m.memory, margins, analysis, &fail, nullptr, &ceiling_free, &ceiling_free_warm);
+            LOG_DBG("%s: ngl=%d rpc_frac=%.4f measure=%d devs=%d margin=%d -> %s\n",
+                    __func__, ngl, f, ok_measure ? 1 : 0, ok_devs ? 1 : 0, ok_margin ? 1 : 0,
+                    ok_margin ? "FEASIBLE" : "rejected");
+            rows.push_back({ f, ok_margin, fail });
+            if (ok_margin) {
+                feas.push_back(f);
+            }
+            if (f <= 0.0f) { break; }
+        }
     }
 
     // window narrower than one step: the scan straddles it (high rows overflow
@@ -894,11 +967,14 @@ static int32_t fit_spill_split_at_ngl(
                 have_lo = true;
             }
         }
+        // the layer granularity is one layer over the GPU layer count (about 0.03 of
+        // the fraction), so a precision far below that is wasted probes.
         if (have_lo && have_hi) {
-            for (int it = 0; it < 13 && f_hi - f_lo > 1e-4f; it++) {
+            for (int it = 0; it < 8 && f_hi - f_lo > 1e-3f; it++) {
                 if (attempt_counter && attempt_limit > 0 && *attempt_counter >= attempt_limit) {
                     LOG_DBG("%s: ngl=%d bisect stopped in [%.4f,%.4f], probe budget %zu/%zu reached\n",
                             __func__, ngl, f_lo, f_hi, *attempt_counter, attempt_limit);
+                    budget_hit = true;
                     break;
                 }
                 const float fm = (f_lo + f_hi) * 0.5f;
@@ -925,12 +1001,18 @@ static int32_t fit_spill_split_at_ngl(
 
     // populate the cache with the feasible interval for this (candidate, ngl, margins) key
     if (!cache_hit) {
+        // lo_frac must be the smallest feasible fraction and hi_frac the
+        // largest: the cache-hit reconstruction below scans from hi_frac down
+        // to lo_frac. storing them the other way round made that loop a no-op,
+        // so a cache hit produced an empty feasible set, fit_spill_split_at_ngl
+        // returned -1 and the n_gpu_layers bisect rejected a layer count that
+        // actually fits - which shows up as extra CPU spill.
         float lo_frac = 0.0f;
         float hi_frac = 0.0f;
         bool have_feas = !feas.empty();
         if (have_feas) {
-            lo_frac = feas.back();
-            hi_frac = feas.front();
+            lo_frac = feas.front();
+            hi_frac = feas.back();
         }
         // LRU eviction: find first invalid slot or oldest (index 0)
         int slot = 0;
@@ -938,7 +1020,7 @@ static int32_t fit_spill_split_at_ngl(
             if (!rpc_frac_cache_entry[i].valid) { slot = i; break; }
             if (i == 3) slot = 0; // all valid: evict oldest (slot 0)
         }
-        rpc_frac_cache_entry[slot] = { cache_key, lo_frac, hi_frac, have_feas };
+        rpc_frac_cache_entry[slot] = { cache_key, spec_hash, margins_hash, lo_frac, hi_frac, have_feas };
         LOG_DBG("%s: rpc_frac cache populate candidate=%s ngl=%d [%.4f, %.4f]%s\n",
                 __func__, spec.label.c_str(), ngl, lo_frac, hi_frac,
                 have_feas ? "" : " (empty)");
@@ -971,6 +1053,13 @@ static int32_t fit_spill_split_at_ngl(
         }
     }
     if (best_ctx < 0) {
+        // no feasible split. if the probe budget ran out, the scan never got
+        // to answer the question: the caller must not read that as "this
+        // layer count cannot work", because it then narrows the search to
+        // fewer GPU layers and spills more of the model to the CPU.
+        if (out_budget_exhausted) {
+            *out_budget_exhausted = budget_hit;
+        }
         return -1;
     }
     out_plan = best_plan;
@@ -1668,9 +1757,20 @@ static bool fit_solve_rpc_aware(
                 int32_t ctx;
                 float frac = -1.0f;
                 if (spec_is_rpc_split) {
+                    bool exhausted = false;
                     ctx = fit_spill_split_at_ngl(analysis, margins, params, mparams, cparams,
                             probe, spill_spec, loader_ngl, path_model, mid_ngl, scan_hi,
-                            plan, m, frac, ceiling_free, ceiling_free_warm, &attempt_count, attempt_limit, search_session);
+                            plan, m, frac, ceiling_free, ceiling_free_warm, &attempt_count, attempt_limit, search_session,
+                            &exhausted);
+                    if (exhausted) {
+                        // the probe budget ran out before this layer count could
+                        // be judged. treat it as unknown, not as infeasible:
+                        // narrowing the search here would drop GPU layers and
+                        // spill more of the model to the CPU.
+                        LOG_WRN("%s: probe budget reached while testing n_gpu_layers=%d, "                                "stopping the CPU-spill search with the best placement found so far\n",
+                                __func__, mid_ngl);
+                        break;
+                    }
                 } else {
                     ctx = fit_grow_context(analysis, margins, params, mparams, cparams,
                             probe, spill_spec, -1.0f, loader_ngl, path_model, plan, m, mid_ngl, ceiling_free,

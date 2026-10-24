@@ -67,6 +67,26 @@ std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         throw std::runtime_error("failed to load model");
     }
 
+    // Capture the device free memory BEFORE the probe context is created.
+    // The context allocates the KV cache, the compute buffer and the graph
+    // pool on every device, so a reading taken afterwards is short by exactly
+    // what the probe itself holds. The solver treats this number as the
+    // device's capacity and subtracts the planned model+context+compute from
+    // it, so the probe's own footprint was counted twice - once as a
+    // reduction of "free" and once inside the planned context+compute.
+    // On the 35B-A3B TQ4_1S MoE that was ~1.6 GiB on the local card, enough
+    // for the solver to conclude it had to spill 13 of 42 layers to the CPU
+    // where the stock fit placed all of them on the GPUs (0.80 tok/s against
+    // 17.92).
+    // The real load allocates in the same order (model, then context), so
+    // this is the same baseline it will see.
+    const size_t nd = llama_model_n_devices(model.get());
+    std::vector<size_t> dev_free(nd, 0);
+    std::vector<size_t> dev_total(nd, 0);
+    for (size_t i = 0; i < nd; i++) {
+        ggml_backend_dev_memory(llama_model_get_device(model.get(), i), &dev_free[i], &dev_total[i]);
+    }
+
     llama_context_params cparams_copy = *cparams;
     if (ctx_parent != nullptr) {
         cparams_copy.ctx_other = ctx_parent;
@@ -77,7 +97,6 @@ std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         throw std::runtime_error("failed to create llama_context from model");
     }
 
-    const size_t nd = llama_model_n_devices(model.get());
     std::vector<llama_device_memory_data> ret(nd + 1);
 
     if (per_layer_costs) {
@@ -157,9 +176,9 @@ std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     for (size_t i = 0; i < nd; i++) {
         ggml_backend_dev_t dev = llama_model_get_device(model.get(), i);
 
-        size_t free;
-        size_t total;
-        ggml_backend_dev_memory(dev, &free, &total);
+        // free/total captured before the probe context existed, see above
+        size_t free  = dev_free[i];
+        size_t total = dev_total[i];
 
         // Some non-GPU accelerator backends, such as BLAS, report 0/0 and rely on
         // the host-memory fallback. For GPU-like backends, keep 0/0 so --fit does
