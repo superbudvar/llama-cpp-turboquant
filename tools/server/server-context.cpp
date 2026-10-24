@@ -19,6 +19,7 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+#include <cmath>
 #include <algorithm>
 #include <cctype>
 #include <cstddef>
@@ -1546,7 +1547,7 @@ private:
                         bool have_previous_plan = false;
                         common_fit_search_session fit_search_session;
                         bool converged = false;
-                        constexpr size_t max_iterations = 4;
+                        constexpr size_t max_iterations = 6;
 
                         for (size_t iter = 0; iter < max_iterations; iter++) {
                             common_params params_prefit = params_base;
@@ -1621,11 +1622,30 @@ private:
                                     reserve_grew = true;
                                 }
                             }
+                            // The plan counts as unchanged when the placement is
+                            // the same. The solver can return a slightly
+                            // different tensor_split for the same ctx (float
+                            // noise in the rpc_frac scan), and the MTP reserve
+                            // it measured is then identical - demanding exact
+                            // float equality made the preflight oscillate and
+                            // fail with "did not converge" once the solver had
+                            // a bigger probe budget to explore with.
+                            static auto splits_equal = [](const std::vector<float> & a, const std::vector<float> & b) {
+                                if (a.size() != b.size()) {
+                                    return false;
+                                }
+                                for (size_t i = 0; i < a.size(); i++) {
+                                    if (std::fabs(a[i] - b[i]) > 1e-3f) {
+                                        return false;
+                                    }
+                                }
+                                return true;
+                            };
                             const bool same_plan = have_previous_plan &&
                                     previous_plan.n_ctx == plan_prefit.n_ctx &&
                                     previous_plan.n_gpu_layers == plan_prefit.n_gpu_layers &&
                                     previous_plan.role_devices == plan_prefit.role_devices &&
-                                    previous_plan.tensor_split == plan_prefit.tensor_split &&
+                                    splits_equal(previous_plan.tensor_split, plan_prefit.tensor_split) &&
                                     previous_plan.shed_reserves == plan_prefit.shed_reserves;
                             size_t total_spec_bytes = 0;
                             for (const auto & entry : reservations) {
