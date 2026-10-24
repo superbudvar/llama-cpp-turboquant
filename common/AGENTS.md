@@ -27,6 +27,7 @@ The engine code lives in `common/fit-strategy.{h,cpp}`. `common/fit.cpp` is not 
 - Positions: mmproj sheds before spec before model layers; if shedding mmproj alone suffices, the spec (draft) stays on VRAM.
 - The winning plan's `shed_reserves` (tags) is saved to the fit cache, published back into `params.fit_params_shed_tags`, and used by the server to load the tagged companions on CPU (draft forced to CPU via `devices.clear()/n_gpu_layers=0`, mmproj via `mparams.use_gpu=false`).
 - The cache key includes the reserve set; a cache hit is validated against the margins matching its own `shed_reserves`.
+- A plan carries the margins it was solved with (`common_fit_plan::margins`, cache version 10) and is validated against those, not against whatever margins the caller has now. The MTP preflight raises `fit_params_target` between iterations, so without this a plan solved for one margin gets re-validated against a stricter one and is rejected with "manual plan does not fit within the per-device margins".
 
 ### Fit probe output is not the real allocation
 
@@ -40,4 +41,12 @@ The engine code lives in `common/fit-strategy.{h,cpp}`. `common/fit.cpp` is not 
 ### Config semantics
 
 - `--fit-strategy-min-ctx` is a floor, not a cap. With `--ctx-size` unset the solver grows context up to `n_ctx_train`.
-- The rpc_frac feasibility interval: low rpc_frac overflows the local device, high rpc_frac overflows RPC (each device has a 2 GiB `context_reserve`; RPC also subtracts a 2 GiB `rpc_overhead`). The interval is bracketed at the minimum context, then context grows per candidate.
+- The rpc_frac feasibility interval: low rpc_frac overflows the local device, high rpc_frac overflows RPC (each device reserves 512 MiB of `FIT_CONTEXT_RESERVE`; RPC also subtracts 512 MiB of `FIT_RPC_OVERHEAD`). The interval is bracketed at the minimum context, then context grows per candidate.
+- The reserve is charged on top of a footprint the probe measures exactly. The KV cache and the compute buffer come out of the context initialisation, per device, so a reserve only has to cover the uncertainty in those measurements - not the cache itself. It used to be 2 GiB, charged both here and as the margin floor.
+
+### The margin is the fit-target, and the learned correction moves it
+
+- `margin = fit-target` when the user set one. The old rule was `max(fit-target, 2 GiB)`: the fit-target could raise the margin but never lower it, so the learned `delta_free_ema` could never correct an over-estimate - the floor swallowed it. The fallback reserve (512 MiB) applies only when no fit-target was given.
+- The `delta_free_ema` is `actual_free - projected_free` measured after MODEL READY. Negative means the fit overestimated the free space, so the margin grows; positive means it was pessimistic and the margin shrinks. With the floor gone the correction can move the margin in either direction.
+- The correction can only be learned if the placement actually pushes past what the device reported. The RPC peer reports 6962 MiB free when idle and then holds 7941 MiB of allocations - `cudaMemGetInfo` counts the CUDA context's reserved-but-uncommitted pages as used - so the solver never places more than the reported free and the EMA never gets to measure the difference. The peer has to report its *allocatable* memory for this to converge.
+- `--fit-max-attempts` (default 96) bounds the measured probes for one search. The spill phase needs one rpc_frac sweep per layer count it tries, and at 32 the search was cut off mid-sweep at 32 of 42 layers on the GPUs. When the budget runs out the search stops and keeps the best placement found; it does not report that a layer count does not fit, because it was not allowed to find out.
