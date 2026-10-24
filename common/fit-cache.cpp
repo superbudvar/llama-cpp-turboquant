@@ -18,7 +18,7 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr uint32_t CACHE_MAGIC   = 0x46495443; // "FITC"
-constexpr uint32_t CACHE_VERSION = 9;
+constexpr uint32_t CACHE_VERSION = 10;
 constexpr std::int64_t MAX_CACHE_AGE_S = 24 * 3600;
 
 // Memory quantities in the key are quantised to this grid before hashing.
@@ -659,6 +659,19 @@ bool common_fit_cache_load(
     if (version >= 9 && r.pos < buf.size() && !r.u32(plan.search.policy_version)) {
         return false;
     }
+    // v10+: the per-device margins the plan was solved with
+    if (version >= 10 && r.pos < buf.size()) {
+        int32_t n_margins = 0;
+        if (!r.i32(n_margins) || n_margins < 0 || (size_t) n_margins > MAX_SPLIT) {
+            return false;
+        }
+        plan.margins.resize(n_margins > 0 ? (size_t) n_margins : 0);
+        for (int32_t i = 0; i < n_margins; i++) {
+            if (!r.i64(plan.margins[(size_t) i])) {
+                return false;
+            }
+        }
+    }
 
     if (r.pos != buf.size()) {
         LOG_DBG("%s: cache body not fully consumed: %s\n", __func__, path.c_str());
@@ -781,6 +794,11 @@ bool common_fit_cache_save(
     app_f32(body, plan.search.rpc_frac_low);
     app_f32(body, plan.search.rpc_frac_high);
     app_u32(body, plan.search.policy_version);
+    // v10+: the per-device margins the plan was solved with
+    app_i32(body, (int32_t) plan.margins.size());
+    for (int64_t m : plan.margins) {
+        app_i64(body, m);
+    }
 
     std::vector<uint8_t> out;
     app_u32(out, CACHE_MAGIC);

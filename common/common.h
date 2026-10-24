@@ -521,7 +521,7 @@ struct common_params {
     bool                fit_cache_defer_save = false; // preflight-only fit: do not persist an intermediate plan
     bool                fit_defer_delta_update = false; // server updates fit feedback after companion models load
     bool                skip_infile_mtp = false; // external MTP draft replaces target in-file MTP tensors
-    uint32_t            fit_max_attempts = 32; // measured probes without improving a feasible plan
+    uint32_t            fit_max_attempts = 96; // measured probes without improving a feasible plan
     bool                fit_params_no_context_reserve = false; // honor --fit-target as explicit margin, ignore 2 GiB context_reserve floor
     bool                fit_params_probe_ceiling = false; // probe device ceiling and clamp reported free to measured maximum
 

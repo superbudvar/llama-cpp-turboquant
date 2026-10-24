@@ -115,6 +115,12 @@ struct common_fit_plan {
     // this is the dominant component of delta_free_ema but converges slowly via EMA.
     // storing it directly avoids the multi-load convergence lag. version 5+: cached.
     std::vector<int64_t> model_size_error;
+    // the per-device margins this plan was solved with. a plan has to be checked
+    // against the margins it was found under, not against whatever margins the
+    // caller happens to have now: the MTP preflight raises fit_params_target
+    // between iterations, so a plan solved for one margin can be re-validated
+    // against a stricter one and rejected for no good reason. version 10+: cached.
+    std::vector<int64_t> margins;
     common_fit_search_progress search;
 };
 

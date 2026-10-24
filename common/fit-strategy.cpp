@@ -24,6 +24,22 @@
 
 static constexpr uint32_t COMMON_FIT_SEARCH_POLICY_VERSION = 2;
 
+// The reserve held back on every device.
+//
+// The KV cache and the compute buffer are measured exactly by the probe (they
+// come out of the context initialisation, per device), so a reserve only has
+// to cover the uncertainty in those measurements - not the cache itself. The
+// 2 GiB this replaces was charged on top of an already-measured footprint,
+// and it was charged twice: once in the rpc_frac bracket and again as the
+// margin floor. On the 35B-A3B TQ4_1S MoE that was the difference between
+// 21 of 42 layers on the GPUs and 32 of 42.
+static constexpr int64_t FIT_CONTEXT_RESERVE = 512LL * 1024 * 1024; // 512 MiB per device
+
+// The RPC backend stages weight copies on the local GPU and keeps its own
+// command/staging buffers, so it cannot use the full reported VRAM. Leave
+// headroom so the offload does not OOM the RPC device mid-load.
+static constexpr int64_t FIT_RPC_OVERHEAD = 512LL * 1024 * 1024;
+
 // local copy of the guard exception from fit.cpp. fit.cpp's copy is private to
 // that translation unit and the probe seam never throws it, so the strategy
 // engine keeps its own for guard throws + the outer catch (same-TU catch works).
@@ -576,11 +592,11 @@ static common_fit_plan fit_plan_from_spec(
             }
         }
 
-        const int64_t context_reserve = 2LL * 1024 * 1024 * 1024; // 2 GiB per device for KV/compute
+        const int64_t context_reserve = FIT_CONTEXT_RESERVE;
         // The RPC backend stages weight copies on the local GPU and keeps its
         // own command/staging buffers, so it cannot use the full reported VRAM.
         // Leave headroom so the offload does not OOM the RPC device mid-load.
-        const int64_t rpc_overhead = 2LL * 1024 * 1024 * 1024;
+        const int64_t rpc_overhead = FIT_RPC_OVERHEAD;
         const int64_t local_avail = analysis.devices[local_device].total_bytes - context_reserve;
         const int64_t rpc_avail   = rpc_device >= 0 ? analysis.devices[rpc_device].total_bytes - context_reserve - rpc_overhead : 0;
 
@@ -1133,7 +1149,7 @@ static float fit_rpc_scan_hi(const common_fit_analysis & analysis, const std::ve
         if (d >= 0 && analysis.devices[d].is_rpc) { rpc_device = d; break; }
     }
     GGML_ASSERT(rpc_device >= 0);
-    const int64_t context_reserve = 2LL * 1024 * 1024 * 1024;
+    const int64_t context_reserve = FIT_CONTEXT_RESERVE;
     const int64_t rpc_avail = analysis.devices[rpc_device].total_bytes - context_reserve;
     size_t total_model = 0;
     for (const auto & t : analysis.tensors) {
@@ -1390,6 +1406,7 @@ static bool fit_solve_rpc_aware(
             out_plan.search.candidate_cursor = (int32_t) candidate_cursor;
             out_plan.search.best_split_size = (int32_t) best_split_size;
             out_plan.search.best_rpc_frac = best_rpc_frac;
+            out_plan.margins = margins;
             out_plan.search.baseline_free.clear();
             for (const auto & d : analysis.devices) out_plan.search.baseline_free.push_back(d.free_bytes);
             out_measure = best_m;
@@ -1709,6 +1726,7 @@ static bool fit_solve_rpc_aware(
             }
             out_plan.shed_reserves = shed_tags;
             out_plan.projected_with_delta = !out_plan.delta_free_ema.empty();
+            out_plan.margins = margins;
             out_plan.projected_free.resize(analysis.devices.size());
             for (size_t id = 0; id < analysis.devices.size(); id++) {
                 out_plan.projected_free[id] = analysis.devices[id].free_bytes - fit_device_used(out_measure.memory[id]);
@@ -2157,22 +2175,42 @@ common_params_fit_status common_fit_strategy_apply_impl(
 
         // margins are indexed by model device order; the user's explicit
         // fit-target values are honored per device (no RPC main_gpu swap).
-        // the context_reserve (2 GiB per device) is a hard floor for the margin:
-        // fit-target can only increase the margin, never drop it below context_reserve.
+        // the fit-target IS the margin: it is how much free memory the user
+        // wants left on the device, and the KV cache and the compute buffer
+        // are measured exactly by the probe, so the margin only has to cover
+        // the uncertainty in those measurements. The old 2 GiB floor could
+        // only raise the margin, never lower it, which meant the learned
+        // delta_free_ema below could never correct an over-estimate: the
+        // margin stayed at the floor no matter what the measurement said.
+        // Without an explicit target there is still a reserve, so the KV
+        // cache has somewhere to go.
         // the delta_free_ema (from cache) corrects systematic bias: actual_free tends
         // to be lower than projected_free when model+KV+compute are counted separately.
         // a negative EMA means we underestimated the footprint -> increase margin.
-        const int64_t context_reserve = 2LL * 1024 * 1024 * 1024;
+        const int64_t context_reserve = FIT_CONTEXT_RESERVE;
+        // the floor for a device margin: zero when the user asked for a
+        // specific margin (the learned correction may move it either way),
+        // the reserve otherwise.
+        const auto margin_floor = [&](size_t id) -> int64_t {
+            const bool have_target = id < params.fit_params_target.size() &&
+                    (int64_t) params.fit_params_target[id] > 0;
+            return (params.fit_params_no_context_reserve || have_target) ? (int64_t) 0 : context_reserve;
+        };
         std::vector<int64_t> margins;
         margins.reserve(analysis.devices.size());
         for (size_t id = 0; id < analysis.devices.size(); id++) {
             int64_t target = (id < params.fit_params_target.size()
                 ? (int64_t) params.fit_params_target[id] : 0);
             int64_t margin = 0;
-            if (params.fit_params_no_context_reserve && target > 0) {
+            if (target > 0) {
+                // the user asked for this much headroom
                 margin = target;
+            } else if (params.fit_params_no_context_reserve) {
+                margin = 0;
             } else {
-                margin = std::max(target, context_reserve);
+                // no explicit target: keep a reserve so the KV cache has
+                // somewhere to go
+                margin = context_reserve;
             }
             margins.push_back(margin);
             LOG_INF("%s: device[%zu]=%s fit-target=%lld MiB base-margin=%lld MiB\n",
@@ -2217,11 +2255,7 @@ common_params_fit_status common_fit_strategy_apply_impl(
                         // delta is actual_free - proj_free: negative means fit overestimates
                         // free space, so margin should increase to compensate
                         int64_t new_margin = margins[id] - delta;
-                        if (params.fit_params_no_context_reserve) {
-                            margins[id] = std::max((int64_t)0, new_margin);
-                        } else {
-                            margins[id] = std::max(context_reserve, new_margin);
-                        }
+                        margins[id] = std::max(margin_floor(id), new_margin);
                         LOG_DBG("%s: device %zu: margin %lld - delta %lld (ema) = %lld\n",
                                 __func__, id, (long long) margins[id] + delta, (long long) delta, (long long) margins[id]);
                     }
@@ -2368,9 +2402,7 @@ common_params_fit_status common_fit_strategy_apply_impl(
                 ? final_plan.delta_free_ema : final_plan.model_size_error;
             for (size_t id = 0; id < margins.size() && id < cached_correction.size(); id++) {
                 const int64_t adjusted = margins[id] - cached_correction[id];
-                margins[id] = params.fit_params_no_context_reserve
-                    ? std::max<int64_t>(0, adjusted)
-                    : std::max<int64_t>(context_reserve, adjusted);
+                margins[id] = std::max(margin_floor(id), adjusted);
             }
             for (int id : final_plan.role_devices) {
                 if (id >= (int) analysis.devices.size()) {
@@ -2383,7 +2415,16 @@ common_params_fit_status common_fit_strategy_apply_impl(
             if (!fit_same_devices(win_measure.devs, analysis)) {
                 throw std::runtime_error("manual plan changed the device set");
             }
-            if (!fit_fits_margins(win_measure.memory, margins, analysis, nullptr, nullptr, &ceiling_free, &ceiling_free_warm)) {
+            // check the plan against the margins it was solved with, when it
+            // carries them: the caller may have raised fit_params_target since
+            // (the MTP preflight does exactly that), and a plan that was
+            // valid under the margins it was found under is still valid.
+            std::vector<int64_t> plan_margins = margins;
+            if (!final_plan.margins.empty() && final_plan.margins.size() == margins.size()) {
+                plan_margins = final_plan.margins;
+                LOG_DBG("%s: checking the plan against the margins it was solved with\n", __func__);
+            }
+            if (!fit_fits_margins(win_measure.memory, plan_margins, analysis, nullptr, nullptr, &ceiling_free, &ceiling_free_warm)) {
                 throw std::runtime_error("manual plan does not fit within the per-device margins");
             }
             have_plan = true;
@@ -2396,8 +2437,20 @@ common_params_fit_status common_fit_strategy_apply_impl(
         // the final placement is validated and serialized against the margins
         // that match its own shed state; reservations it released are released
         // here too
-        const std::vector<int64_t> final_margins =
-            fit_effective_margins(margins, params.fit_params_reserves, final_plan.shed_reserves);
+        //
+        // A plan has to be checked against the margins it was solved with, not
+        // against whatever margins the caller happens to have now. The MTP
+        // preflight raises fit_params_target between iterations, so a plan
+        // solved for one set of margins gets re-validated against a stricter
+        // one and is rejected ("manual plan does not fit within the per-device
+        // margins") even though nothing about the placement changed.
+        std::vector<int64_t> final_margins;
+        if (!final_plan.margins.empty() && final_plan.margins.size() == margins.size()) {
+            final_margins = final_plan.margins;
+            LOG_DBG("%s: validating the plan against the margins it was solved with\n", __func__);
+        } else {
+            final_margins = fit_effective_margins(margins, params.fit_params_reserves, final_plan.shed_reserves);
+        }
 
         fit_serialize(final_plan, params, mparams, cparams, analysis, win_measure, final_margins);
         fit_validate(final_plan, analysis, final_margins, analysis.loader_ngl, mparams, cparams, probe, params.model.path,
