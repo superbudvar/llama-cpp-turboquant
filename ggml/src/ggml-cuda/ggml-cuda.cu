@@ -2809,7 +2809,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;
 
-    const bool is_tq_weight = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
+    const bool is_tq_weight = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S ||
+                               src0->type == GGML_TYPE_TQ3_4S);
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && !is_tq_weight &&
                              src0->type != GGML_TYPE_Q8_CR &&
                              src0->type != GGML_TYPE_Q5_CR &&
@@ -3020,7 +3021,8 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     // TQ weight types use the fused dp4a path (decode) or runtime q8_0 conversion + cuBLAS (prefill),
     // never mmvq/mmq (mmvq's type switch has no TQ cases and aborts).
-    const bool is_tq_weight = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
+    const bool is_tq_weight = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S ||
+                               src0->type == GGML_TYPE_TQ3_4S);
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11) && !is_tq_weight) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
@@ -3075,9 +3077,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // Toggleable for the perplexity A/B: fused-on by default on gfx1100,
     // TQ3_FUSE_OFF=1 forces the verified dequant+hipBLAS path.
     static const bool tq3_fuse_off = (getenv("TQ3_FUSE_OFF") != nullptr);
-    const bool tq3_1s_fused_disabled = (src0->type == GGML_TYPE_TQ3_1S) && tq3_fuse_off;
+    const bool tq3_1s_fused_disabled = (src0->type == GGML_TYPE_TQ3_1S || src0->type == GGML_TYPE_TQ3_4S) && tq3_fuse_off;
 #else
-    const bool tq3_1s_fused_disabled = (src0->type == GGML_TYPE_TQ3_1S);
+    const bool tq3_1s_fused_disabled = (src0->type == GGML_TYPE_TQ3_1S || src0->type == GGML_TYPE_TQ3_4S);
 #endif
 
     if (is_tq_weight && tq_fast_path_ok && !tq3_1s_fused_disabled && tq_ncols <= MMVQ_MAX_BATCH_SIZE) {
@@ -3086,12 +3088,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_tq(ctx, src0, src1, dst);
         return;
     }
-    if (is_tq_weight && tq_fast_path_ok && (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S)
+    if (is_tq_weight && tq_fast_path_ok
             && (amd_mfma_available(cc) || amd_wmma_available(cc) || GGML_CUDA_CC_IS_RDNA2(cc))
             && ggml_cuda_tq_mmq_supported(src0, cc)) {
         // Phase 2: native int8 MMQ prefill via activation pre-rotation.
         // GGML_TQ_MMQ=0 falls back to the cuBLAS path below.
-        if (src0->type == GGML_TYPE_TQ3_1S) {
+        if (src0->type == GGML_TYPE_TQ3_1S || src0->type == GGML_TYPE_TQ3_4S) {
             ggml_cuda_mul_mat_tq3_1s_mmq(ctx, src0, src1, dst);
         } else {
             ggml_cuda_mul_mat_tq4_1s_mmq(ctx, src0, src1, dst);
@@ -3156,10 +3158,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         // Pre-rotates the activation once, then runs MMQ_ID with the TQ4_1S int8-centroid load_tiles,
         // avoiding the 2x-slower dequant-to-f16 cuBLAS fallback so native (GGML_TQ_NATIVE) experts
         // keep their ~1.7x-smaller 5bpw footprint without a prefill penalty. See ggml_cuda_tq_mmq_env.
-        if (is_tq_weight_id && (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S)
+        if (is_tq_weight_id && (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S ||
+                                src0->type == GGML_TYPE_TQ3_4S)
                 && (amd_mfma_available(cc) || amd_wmma_available(cc) || GGML_CUDA_CC_IS_RDNA2(cc))
                 && ggml_is_contiguous(src1) && ggml_cuda_tq_mmq_supported(src0, cc)) {
-            if (src0->type == GGML_TYPE_TQ3_1S) {
+            if (src0->type == GGML_TYPE_TQ3_1S || src0->type == GGML_TYPE_TQ3_4S) {
                 ggml_cuda_mul_mat_id_tq3_1s_mmq(ctx, src0, src1, ids, dst);
             } else {
                 ggml_cuda_mul_mat_id_tq4_1s_mmq(ctx, src0, src1, ids, dst);

@@ -9971,6 +9971,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // TQ3_4S dense MUL_MAT: n <= 8 runs the fused decode kernels (n >= 3 on the two-rows-per-warp
+    // variant), n = 64 the MMQ or dequantize + f16 matmul path.
+    for (int k : { 1536, 2560 }) {
+        for (int m : { 256, 2048 }) {
+            for (int n : { 1, 3, 8, 64 }) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ3_4S, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
     // TQ3_1S: DeepSeek-V4 MLA head_dim=512 batched-prefill shape.
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ3_1S, GGML_TYPE_F32, 128, 512, 512, {1, 1}, {1, 1}));
 
