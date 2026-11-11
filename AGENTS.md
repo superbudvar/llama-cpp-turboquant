@@ -19,7 +19,7 @@ The fork-only GGML types (registered in `ggml/include/ggml.h`):
 | TQ4_1S | `GGML_TYPE_TQ4_1S` (46)    | model weights                       | 4 bits, block 32 |
 | TQ3_4S | `GGML_TYPE_TQ3_4S` (53)    | model weights, TQ3_1S with 6-bit super-block scales | 3.5 bits, block 128, file type 47 |
 
-Turbo cache types are runtime-only, never stored in GGUF. TQ3_1S/TQ4_1S are first-class weight types with CPU, CUDA/HIP (warp-cooperative mmvq), Metal, Vulkan, and SYCL kernels, exposed as `llama-quantize` targets. TQ3_4S has a CPU reference only; other backends leave it to the CPU.
+Turbo cache types are runtime-only, never stored in GGUF. TQ3_1S/TQ4_1S are first-class weight types with CPU, CUDA/HIP (warp-cooperative mmvq), Metal, Vulkan, and SYCL kernels, exposed as `llama-quantize` targets. TQ3_4S has CPU and CUDA/HIP kernels only; other backends leave it to the CPU.
 
 ### Key files
 
@@ -50,7 +50,7 @@ Any combination of `f16`/`q8_0`/`turbo2`/`turbo3`/`turbo4` for K and V is suppor
 | `TURBO_SPARSE_V`            | `1`     | Sparse-V dequant skip in flash attention |
 | `TQ_FIT_EXPERT_SPLIT`       | unset   | `1` opts into partial expert splits (static residency / RPC offload); CPU pool + MoE cache is the default and measured faster |
 | `GGML_TQ_NATIVE`            | unset    | `1` opts out of load-time TQ->q8_0 conversion, uses fused native TQ kernels (saves ~1.7x VRAM on decode-heavy workloads) |
-| `GGML_TQ_MMQ`               | unset    | Native int8 MMQ prefill for TQ3_1S/TQ4_1S instead of the dequant-to-f16 + cuBLAS fallback. AMD only: the TQ MMQ config exists for CDNA/RDNA2/RDNA3/RDNA4, for both types. Unset: on for TQ3_1S, off for TQ4_1S. `0` turns it off for both, `1` turns it on for both. TQ4_1S also needs `GGML_TQ_NATIVE=1`, because otherwise the weights are converted to q8_0 at load and this path is not reached |
+| `GGML_TQ_MMQ`               | unset    | Native int8 MMQ prefill for TQ3_1S/TQ4_1S/TQ3_4S instead of the dequant-to-f16 + cuBLAS fallback. AMD only: the TQ MMQ config exists for CDNA/RDNA2/RDNA3/RDNA4, for TQ3_1S and TQ4_1S, and for CDNA/RDNA2/RDNA3 for TQ3_4S. Unset: on for TQ3_1S, off for TQ4_1S and TQ3_4S. `0` turns it off for all three, `1` turns it on for all three. TQ4_1S also needs `GGML_TQ_NATIVE=1`, because otherwise the weights are converted to q8_0 at load and this path is not reached |
 | `GGML_CUDA_FUSE_CHAIN`      | unset    | `0` disables the elementwise chain fusion (SILU/GELU/ADD/MUL/SCALE/CLAMP runs into one kernel, `ggml_cuda_fuse_elem_chain`) |
 | `GGML_CUDA_Q8CACHE`         | unset    | `0` disables the per-graph shared-quantize cache in mmvq (gate and up projections reuse one q8_1 copy of the activation) |
 | `GGML_TQ_DP4A`              | unset    | TQ decode kernel override for measurements: unset = per architecture (dp4a on NVIDIA, CDNA, RDNA2, RDNA3.0), `1`/`0` force dp4a/scalar. TQ3_1S ignores it on non-HIP builds |
