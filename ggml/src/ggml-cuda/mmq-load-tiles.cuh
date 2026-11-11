@@ -572,8 +572,19 @@ static __device__ __forceinline__ int tq3_1s_qs_to_int8x4(const uint8_t * __rest
     const int sub = (kqsx & 1) * 4;    // first element within the group
     const uint8_t * qp = qs + 3*g;
     const uint32_t packed = (uint32_t)qp[0] | ((uint32_t)qp[1] << 8) | ((uint32_t)qp[2] << 16);
-    // One variable shift, then fixed-offset fields: shifting by 3*sub + 3*j for each j
-    // measured 9% slower on CDNA2 (gfx90a) prefill.
+#if defined(RDNA4)
+    // RDNA4 keeps the table-load form until the permute form is measured there.
+    const int i0 = (packed >> (3*sub + 0)) & 7;
+    const int i1 = (packed >> (3*sub + 3)) & 7;
+    const int i2 = (packed >> (3*sub + 6)) & 7;
+    const int i3 = (packed >> (3*sub + 9)) & 7;
+    // Cast through uint8_t: a negative int8 would otherwise sign-extend into the upper bytes.
+    const uint32_t w = (uint32_t) (uint8_t) kvalues_tq3[i0]
+                     | ((uint32_t) (uint8_t) kvalues_tq3[i1] << 8)
+                     | ((uint32_t) (uint8_t) kvalues_tq3[i2] << 16)
+                     | ((uint32_t) (uint8_t) kvalues_tq3[i3] << 24);
+    return (int) w;
+#else
     const uint32_t q  = packed >> (3*sub);   // the quad's four 3-bit indices in bits 0-11
     const uint32_t i0 =  q       & 7;
     const uint32_t i1 = (q >> 3) & 7;
@@ -582,15 +593,13 @@ static __device__ __forceinline__ int tq3_1s_qs_to_int8x4(const uint8_t * __rest
     constexpr uint32_t TQ3_KV_LO = 0xF0D1AE81u;   // { -127, -82, -47, -16 }
     constexpr uint32_t TQ3_KV_HI = 0x7F512E0Fu;   // {   15,  46,  81, 127 }
 #if defined(GGML_USE_HIP)
-    // v_perm_b32: one selector byte per output byte; source bytes 0-3 are the second
-    // operand and 4-7 the first. Keep the builtin here: __byte_perm() with a runtime
-    // selector is emulated on HIP through a dynamically indexed byte array.
+    // v_perm_b32: selector bytes; source bytes 0-3 come from the second operand.
     return (int) __builtin_amdgcn_perm(TQ3_KV_HI, TQ3_KV_LO, i0 | (i1 << 8) | (i2 << 16) | (i3 << 24));
 #else
-    // prmt: one selector nibble per output byte; source bytes 0-3 are the first
-    // operand and 4-7 the second. Same result as the HIP form.
+    // prmt: selector nibbles; source bytes 0-3 come from the first operand.
     return (int) __byte_perm(TQ3_KV_LO, TQ3_KV_HI, i0 | (i1 << 4) | (i2 << 8) | (i3 << 12));
 #endif // defined(GGML_USE_HIP)
+#endif // defined(RDNA4)
 }
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_tq3_1s(
