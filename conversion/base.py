@@ -1696,6 +1696,18 @@ class TextModel(ModelBase):
         if chkhsh == "972da7b59cec44d1f0a490a86c96df53859e486e481563e5dddac155013d87ac":
             # ref: https://huggingface.co/poolside/Laguna-XS.2
             res = "laguna"
+        if chkhsh == "653660222fb704f61cbf2b618a8ae6502b7f8b20c980f9a5de07ed78e13319cd":
+            # ref: https://huggingface.co/ufakai/ufakzeka-1
+            res = "ufakzeka"
+        if chkhsh == "4b05e02dad1c5ae07d266fd3342ddb644c6f6be058d728bc0a33af31a1d6ee66":
+            # ref: https://huggingface.co/jhu-clsp/mmBERT-base
+            res = "mmbert"
+        if chkhsh == "a9af07a84191f55098b248ae6f3dfe9e32d3190bebe8eafd91c1ddec9bc3449f":
+            # ref: https://huggingface.co/IFM/K2-Horizon-36B
+            res = "k2-horizon"
+        if chkhsh == "5635e1c8d621dff7b4825f41f2f97b6ceb39bcf2d5c541db28577080d6efd5e5":
+            # ref: https://huggingface.co/thinkingmachines/Inkling-2-Small
+            res = "inkling2"
 
         if res is None:
             logger.warning("\n")

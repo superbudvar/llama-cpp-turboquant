@@ -115,6 +115,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_vocab = 10240;
     } else if (arch == LLM_ARCH_QWEN3TTS) {
         n_vocab = 4096; // must be >= the hard-coded codec head size (3072)
+    } else if (arch == LLM_ARCH_INKLING2) {
+        n_embd  = 128;
+        n_head  = 4;
+        n_ff    = 24;
+        n_layer = 3;
     }
 
     const uint32_t n_embd_head = n_embd / n_head;
@@ -245,6 +250,31 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS, uint32_t(1));
     ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS, std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
     ms.add_kv(LLM_KV_TOKENIZER_MODEL,         "no_vocab");
+
+    if (arch == LLM_ARCH_INKLING2) {
+        ms.add_kv(LLM_KV_ATTENTION_RELATIVE_LENGTH,   uint32_t(4));
+        ms.add_kv(LLM_KV_ATTENTION_RELATIVE_EXTENT,   uint32_t(16));
+        ms.add_kv(LLM_KV_ATTENTION_QK_CLIP,           0.25f);
+        ms.add_kv(LLM_KV_ATTENTION_RELATIVE_CLIP,     0.1f);
+        ms.add_kv(LLM_KV_ATTENTION_LOG_SCALE_FLOOR,   uint32_t(4));
+        ms.add_kv(LLM_KV_ATTENTION_LOG_SCALE_ALPHA,   0.1f);
+        ms.add_kv(LLM_KV_ATTN_RES_BLOCK_SIZE,         uint32_t(2));
+        ms.add_kv(LLM_KV_SHORTCONV_L_CACHE,           uint32_t(4));
+        ms.add_kv(LLM_KV_VOCAB_SIZE,                  n_vocab + 2);
+        ms.add_kv(LLM_KV_VOCAB_SIZE_UNPADDED,         n_vocab);
+        ms.add_kv(LLM_KV_ACTIVATION_SITU_BETA,        0.2f);
+        ms.add_kv(LLM_KV_ACTIVATION_SITU_LINEAR_BETA, 0.3f);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,        8.0f);
+        ms.add_kv(LLM_KV_FINAL_LOGIT_SOFTCAPPING,     30.0f);
+        ms.add_kv(LLM_KV_EXPERT_COUNT,                uint32_t(4));
+        ms.add_kv(LLM_KV_EXPERT_USED_COUNT,           uint32_t(2));
+        std::vector<bool> pattern(n_layer);
+        for (uint32_t i = 0; i < n_layer; ++i) {
+            pattern[i] = i % 2 == 0;
+        }
+        std::vector<uint8_t> values(pattern.begin(), pattern.end());
+        gguf_set_arr_data(ret.get(), LLM_KV(arch)(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN).c_str(), GGUF_TYPE_BOOL, values.data(), values.size());
+    }
     // ms.add_kv(LLM_KV_DENSE_2_FEAT_OUT,     n_embd);
     // ms.add_kv(LLM_KV_DENSE_3_FEAT_IN,      n_embd);
 
@@ -407,6 +437,11 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_MISTRAL4:
         case LLM_ARCH_MELLUM:
         case LLM_ARCH_LAGUNA:
+        case LLM_ARCH_MAPLE:
+        case LLM_ARCH_MUSE_SPARK:
+        case LLM_ARCH_KOLIBRI1:
+        case LLM_ARCH_METIS16:
+        case LLM_ARCH_INKLING2:
             return true;
         default:
             return false;
