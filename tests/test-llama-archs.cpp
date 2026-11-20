@@ -115,7 +115,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_vocab = 10240;
     } else if (arch == LLM_ARCH_QWEN3TTS) {
         n_vocab = 4096; // must be >= the hard-coded codec head size (3072)
-    } else if (arch == LLM_ARCH_INKLING2) {
+    } else if (arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP) {
         n_embd  = 128;
         n_head  = 4;
         n_ff    = 24;
@@ -251,14 +251,24 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS, std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
     ms.add_kv(LLM_KV_TOKENIZER_MODEL,         "no_vocab");
 
-    if (arch == LLM_ARCH_INKLING2) {
+    if (arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP) {
+        const bool loop = arch == LLM_ARCH_INKLING2_LOOP;
         ms.add_kv(LLM_KV_ATTENTION_RELATIVE_LENGTH,   uint32_t(4));
         ms.add_kv(LLM_KV_ATTENTION_RELATIVE_EXTENT,   uint32_t(16));
         ms.add_kv(LLM_KV_ATTENTION_QK_CLIP,           0.25f);
         ms.add_kv(LLM_KV_ATTENTION_RELATIVE_CLIP,     0.1f);
         ms.add_kv(LLM_KV_ATTENTION_LOG_SCALE_FLOOR,   uint32_t(4));
         ms.add_kv(LLM_KV_ATTENTION_LOG_SCALE_ALPHA,   0.1f);
-        ms.add_kv(LLM_KV_ATTN_RES_BLOCK_SIZE,         uint32_t(2));
+        // the inkling2_loop core boundaries must be multiples of the block size
+        ms.add_kv(LLM_KV_ATTN_RES_BLOCK_SIZE,         uint32_t(loop ? 1 : 2));
+        if (loop) {
+            // prelude 0, core 1, coda 2; the loader adds slot 3 for the second pass over the core
+            ms.add_kv(LLM_KV_LOOP_START,     uint32_t(1));
+            ms.add_kv(LLM_KV_LOOP_END,       uint32_t(2));
+            ms.add_kv(LLM_KV_LOOP_COUNT,     uint32_t(2));
+            ms.add_kv(LLM_KV_LOOP_GATE_RANK, uint32_t(8));
+            ms.add_kv(LLM_KV_LOOP_VARYING,   false);
+        }
         ms.add_kv(LLM_KV_SHORTCONV_L_CACHE,           uint32_t(4));
         ms.add_kv(LLM_KV_VOCAB_SIZE,                  n_vocab + 2);
         ms.add_kv(LLM_KV_VOCAB_SIZE_UNPADDED,         n_vocab);
@@ -442,6 +452,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_KOLIBRI1:
         case LLM_ARCH_METIS16:
         case LLM_ARCH_INKLING2:
+        case LLM_ARCH_INKLING2_LOOP:
             return true;
         default:
             return false;
