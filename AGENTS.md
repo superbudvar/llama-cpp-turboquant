@@ -52,6 +52,7 @@ Any combination of `f16`/`q8_0`/`turbo2`/`turbo3`/`turbo4` for K and V is suppor
 | `GGML_TQ_MMQ`               | unset    | Native int8 MMQ prefill for TQ3_1S/TQ4_1S instead of the dequant-to-f16 + cuBLAS fallback. AMD only: the TQ MMQ config exists for CDNA/RDNA2/RDNA3/RDNA4, for both types. Unset: on for TQ3_1S, off for TQ4_1S. `0` turns it off for both, `1` turns it on for both. TQ4_1S also needs `GGML_TQ_NATIVE=1`, because otherwise the weights are converted to q8_0 at load and this path is not reached |
 | `GGML_CUDA_FUSE_CHAIN`      | unset    | `0` disables the elementwise chain fusion (SILU/GELU/ADD/MUL/SCALE/CLAMP runs into one kernel, `ggml_cuda_fuse_elem_chain`) |
 | `GGML_CUDA_Q8CACHE`         | unset    | `0` disables the per-graph shared-quantize cache in mmvq (gate and up projections reuse one q8_1 copy of the activation) |
+| `GGML_TQ_DP4A`              | unset    | TQ decode kernel override for measurements: unset = per architecture (dp4a on NVIDIA, CDNA, RDNA2, RDNA3.0), `1`/`0` force dp4a/scalar. TQ3_1S ignores it on non-HIP builds |
 | `LLAMA_ATTN_ROT_K/V_OVERRIDE` | off   | Optional upstream attention rotation (TurboQuant manages its own rotation) |
 
 ### Test gates (all must pass before touching quant/backend code)
