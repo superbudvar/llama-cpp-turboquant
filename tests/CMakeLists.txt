@@ -331,6 +331,7 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
 endif()
 
 llama_build_and_test(test-moe-cache-fit.cpp)
+llama_build_and_test(test-ink-rel-bias.cpp)
 
 llama_build_and_test(test-fit-strategy.cpp ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-fit-strategy PROPERTIES FIXTURES_REQUIRED test-download-model)
