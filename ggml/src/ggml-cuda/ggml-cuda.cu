@@ -1041,8 +1041,7 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size_for_device(
     int64_t ne0 = tensor->ne[0];
 
     // TQ4_1S → q8_0 load-time conversion: allocate q8_0-sized space if opted in
-    const bool tq4_1s_converted = ggml_tq_convert_q8() && tensor->type == GGML_TYPE_TQ4_1S;
-    if (tq4_1s_converted) {
+    if (ggml_tq_convert_q8() && tensor->type == GGML_TYPE_TQ4_1S) {
         // q8_0 block: 34 bytes per 32 elements. TQ4_1S block: 20 bytes per 32 elements.
         const int64_t n_blocks = ggml_nelements(tensor) / QK_TQ4_1S;
         size = n_blocks * sizeof(block_q8_0);
@@ -1051,9 +1050,7 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size_for_device(
     if (ggml_is_quantized(tensor->type)) {
         if (ne0 % MATRIX_ROW_PADDING != 0) {
             GGML_ASSERT(tensor->nb[0] == ggml_element_size(tensor));
-            // a converted tensor holds q8_0 rows, so the padding must be q8_0 too
-            size += ggml_row_size(tq4_1s_converted ? GGML_TYPE_Q8_0 : tensor->type,
-                                  MATRIX_ROW_PADDING - ne0 % MATRIX_ROW_PADDING);
+            size += ggml_row_size(tensor->type, MATRIX_ROW_PADDING - ne0 % MATRIX_ROW_PADDING);
         }
     }
 
@@ -2836,7 +2833,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 }
 
 // GGML_TQ_MMQ: unset = native TQ MMQ prefill for TQ3_1S only, 0 = off, any other value = on for
-// TQ3_1S and TQ4_1S. Read once: it is a libc call per mul_mat node otherwise.
+// every TQ type with a config. Read once: it is a libc call per mul_mat node otherwise.
 static int ggml_cuda_tq_mmq_env() {
     static const int env = [] {
         const char * e = getenv("GGML_TQ_MMQ");
@@ -3270,7 +3267,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     // TQ weights: small batch uses the capture-safe device-routed matvec (ggml_cuda_mul_mat_id_tq);
     // large batch falls through to the dequant-to-f16 cuBLAS path, which synchronizes the stream.
-    const bool is_tq_weight_id = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
+    const bool is_tq_weight_id = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S ||
+                                  src0->type == GGML_TYPE_TQ3_4S);
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
@@ -4133,7 +4131,8 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
             // read src[0] only here: source-less nodes (ARANGE, ...) have src[0] == NULL
-            const bool is_tq_w = (node->src[0]->type == GGML_TYPE_TQ4_1S || node->src[0]->type == GGML_TYPE_TQ3_1S);
+            const bool is_tq_w = (node->src[0]->type == GGML_TYPE_TQ4_1S || node->src[0]->type == GGML_TYPE_TQ3_1S ||
+                                  node->src[0]->type == GGML_TYPE_TQ3_4S);
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
             const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
             // The mul_mat_id operation synchronizes the stream (forbidding graph capture) unless it
@@ -6499,7 +6498,7 @@ static const char * ggml_backend_cuda_device_get_description(ggml_backend_dev_t 
     return ctx->description.c_str();
 }
 
-#if defined(__linux__) && !defined(GGML_USE_HIP)
+#if defined(__linux__)
 // Helper function to get available memory from /proc/meminfo for UMA systems
 static bool ggml_backend_cuda_get_available_uma_memory(long * available_memory_kb, long * free_swap_kb) {
     FILE * meminfo_file = nullptr;
@@ -6575,49 +6574,6 @@ static bool ggml_backend_cuda_get_available_uma_memory(long * available_memory_k
 }
 #endif // defined(__linux__)
 
-#if defined(__linux__) && defined(GGML_USE_HIP)
-static bool ggml_backend_hip_get_vram_memory(const std::string & pci_bus_id, size_t * free, size_t * total) {
-    if (pci_bus_id.empty() || free == nullptr || total == nullptr) {
-        return false;
-    }
-
-    std::string physical_bus_id = pci_bus_id;
-    const size_t virtual_suffix = physical_bus_id.find("-v");
-    if (virtual_suffix != std::string::npos) {
-        physical_bus_id.resize(virtual_suffix);
-    }
-
-    char path[256];
-    unsigned long long used_bytes = 0;
-    unsigned long long total_bytes = 0;
-    snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/mem_info_vram_used", physical_bus_id.c_str());
-    FILE * used_file = fopen(path, "r");
-    if (used_file == nullptr) {
-        return false;
-    }
-    const bool read_used = fscanf(used_file, "%llu", &used_bytes) == 1;
-    fclose(used_file);
-    if (!read_used) {
-        return false;
-    }
-
-    snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/mem_info_vram_total", physical_bus_id.c_str());
-    FILE * total_file = fopen(path, "r");
-    if (total_file == nullptr) {
-        return false;
-    }
-    const bool read_total = fscanf(total_file, "%llu", &total_bytes) == 1;
-    fclose(total_file);
-    if (!read_total || total_bytes == 0) {
-        return false;
-    }
-
-    *total = (size_t) total_bytes;
-    *free = used_bytes < total_bytes ? (size_t) (total_bytes - used_bytes) : 0;
-    return true;
-}
-#endif
-
 static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
     ggml_cuda_set_device(ctx->device);
@@ -6630,25 +6586,8 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
         return;
     }
 
-#if defined(__linux__) && defined(GGML_USE_HIP)
-    const size_t hip_free = *free;
-    const size_t hip_total = *total;
-    size_t drm_free = 0;
-    size_t drm_total = 0;
-    if (ggml_backend_hip_get_vram_memory(ctx->pci_bus_id, &drm_free, &drm_total)) {
-        GGML_LOG_DEBUG("%s: device=%s hip_free=%zu MiB hip_total=%zu MiB drm_vram_free=%zu MiB drm_vram_total=%zu MiB\n",
-                __func__, ctx->pci_bus_id.c_str(), hip_free / (1024 * 1024), hip_total / (1024 * 1024),
-                drm_free / (1024 * 1024), drm_total / (1024 * 1024));
-        *free = drm_free;
-        *total = drm_total;
-    } else {
-        GGML_LOG_WARN("%s: DRM VRAM counters unavailable for %s; using hipMemGetInfo (%zu/%zu MiB free/total)\n",
-                __func__, ctx->pci_bus_id.c_str(), hip_free / (1024 * 1024), hip_total / (1024 * 1024));
-    }
-#endif
-
 // ref: https://github.com/ggml-org/llama.cpp/pull/17368
-#if defined(__linux__) && !defined(GGML_USE_HIP)
+#if defined(__linux__)
     // Check if this is a UMA (Unified Memory Architecture) system
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, ggml_cuda_get_physical_device(ctx->device)));
@@ -6757,7 +6696,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             // addresses experts through a table and so can be pointed at either place, and only
             // when explicitly opted in.
             if (op->op == GGML_OP_MUL_MAT_ID && i == 0 &&
-                (src->type == GGML_TYPE_TQ3_1S || src->type == GGML_TYPE_TQ4_1S) &&
+                (src->type == GGML_TYPE_TQ3_1S || src->type == GGML_TYPE_TQ4_1S || src->type == GGML_TYPE_TQ3_4S) &&
                 ggml_cuda_moe_host_experts_enabled()) {
                 continue;
             }
@@ -6895,6 +6834,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ4_XS:
                     case GGML_TYPE_BF16:
                     case GGML_TYPE_TQ4_1S:
+                    case GGML_TYPE_TQ3_4S:
                     case GGML_TYPE_TQ3_1S:
                         return true;
                     default:
@@ -6931,6 +6871,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ1_M:
                     case GGML_TYPE_IQ4_XS:
                     case GGML_TYPE_TQ4_1S:
+                    case GGML_TYPE_TQ3_4S:
                     case GGML_TYPE_TQ3_1S:
                         return true;
                     case GGML_TYPE_IQ4_NL:

@@ -6,7 +6,6 @@
  */
 
 #include "mmvq-tq.cuh"
-#include "mmvq.cuh"
 #include "turbo-quant.cuh"
 #include "convert.cuh"
 #include "mmq.cuh"
@@ -80,11 +79,11 @@ static constexpr float TQ3_CENTROID_I8_RESCALE = 1.996684f / 127.0f;
 // TQ decode path: int8 dp4a on NVIDIA, CDNA, RDNA2 and RDNA3.0, scalar float elsewhere.
 // TQ3_1S takes dp4a on HIP only. GGML_TQ_DP4A=1/0 forces either path.
 static bool tq_use_dp4a(int cc, ggml_type type) {
-    if (type != GGML_TYPE_TQ4_1S && type != GGML_TYPE_TQ3_1S) {
+    if (type != GGML_TYPE_TQ4_1S && type != GGML_TYPE_TQ3_1S && type != GGML_TYPE_TQ3_4S) {
         return false;
     }
 #ifndef GGML_USE_HIP
-    if (type == GGML_TYPE_TQ3_1S) {
+    if (type == GGML_TYPE_TQ3_1S || type == GGML_TYPE_TQ3_4S) {
         return false;
     }
 #endif
@@ -171,6 +170,34 @@ static __device__ __forceinline__ void tq3_groups(const uint8_t * __restrict__ q
     g3 =  w2 >> 8;
 }
 
+// TQ3_1S and TQ3_4S share the 3-bit index packing of a 32-value block and differ only in where
+// its two half-block scales live: in the block itself, or as 6-bit multiples in the header of
+// the 128-value super-block holding it. These give a row's length in bytes and, for block ib of
+// a row, its index bytes and scales, so a kernel written for one serves both.
+template <ggml_type T>
+static __device__ __forceinline__ int64_t tq3_row_bytes(const int blocks_per_row) {
+    static_assert(T == GGML_TYPE_TQ3_1S || T == GGML_TYPE_TQ3_4S, "TQ3 types only");
+    return T == GGML_TYPE_TQ3_1S ? (int64_t) blocks_per_row * (int64_t) sizeof(block_tq3_1s)
+                                 : (int64_t) (blocks_per_row / 4) * (int64_t) sizeof(block_tq3_4s);
+}
+
+template <ggml_type T>
+static __device__ __forceinline__ const uint8_t * tq3_block_at(const char * __restrict__ x_row, const int ib,
+                                                              float & d0, float & d1) {
+    if constexpr (T == GGML_TYPE_TQ3_1S) {
+        const block_tq3_1s * blk = (const block_tq3_1s *) x_row + ib;
+        d0 = __half2float(blk->d0);
+        d1 = __half2float(blk->d1);
+        return blk->qs;
+    } else {
+        const block_tq3_4s * sb = (const block_tq3_4s *) x_row + (ib >> 2);
+        const float2 d = tq3_4s_sub_scales(sb, ib & 3);
+        d0 = d.x;
+        d1 = d.y;
+        return sb->qs + 12*(ib & 3);
+    }
+}
+
 // ============================================================================
 // Pre-rotate activation to float (for TQ3_1S scalar path)
 // ============================================================================
@@ -217,19 +244,9 @@ static __global__ void tq_build_expert_table(
 //
 // claim[] is reset each call and resolves collisions by lowest routed index, so the outcome does
 // not depend on thread scheduling.
-//
-// A call routes n_used experts for each of n_tokens tokens, and routed index i is expert k = i % n_used
-// of token t = i / n_used. With more than one token the same expert can appear several times.
-static __device__ __forceinline__ int tq_routed_expert(
-        const int32_t * __restrict__ ids, const int i, const int n_used, const int ids_stride) {
-    return ids[(i / n_used) * ids_stride + i % n_used];
-}
-
 static __global__ void tq_cache_probe(
         const int32_t * __restrict__ ids,
         const int                    n_routed,
-        const int                    n_used,
-        const int                    ids_stride,
         const int                    n_slots,
         const int32_t * __restrict__ slot_expert,
         int32_t       * __restrict__ claim,
@@ -238,7 +255,7 @@ static __global__ void tq_cache_probe(
     if (i >= n_routed) {
         return;
     }
-    const int e    = tq_routed_expert(ids, i, n_used, ids_stride);
+    const int e    = ids[i];
     const int slot = e % n_slots;
 
     if (slot_expert[slot] == e) {
@@ -258,8 +275,6 @@ static __global__ void tq_cache_probe(
 static __global__ void tq_cache_award(
         const int32_t * __restrict__ ids,
         const int                    n_routed,
-        const int                    n_used,
-        const int                    ids_stride,
         const int                    n_slots,
         const int32_t * __restrict__ claim,
         const int32_t * __restrict__ hit,
@@ -276,19 +291,16 @@ static __global__ void tq_cache_award(
         won[i] = 1;
         return;
     }
-    const int e    = tq_routed_expert(ids, i, n_used, ids_stride);
+    const int e    = ids[i];
     const int slot = e % n_slots;
 
     // claim[slot] == -1 means a hit reserved it, so no miss may take it this call
-    const int c = claim[slot];
-    if (c == i) {
+    if (claim[slot] == i) {
         slot_expert[slot] = e;
         const int k = atomicAdd(n_miss, 1);
         miss_expert[k] = e;
         miss_slot[k]   = slot;
         won[i] = 1;                       // will be resident once the copy runs
-    } else if (c >= 0 && tq_routed_expert(ids, c, n_used, ids_stride) == e) {
-        won[i] = 1;                       // another token routed the same expert and copies it once
     } else {
         won[i] = 0;                       // reserved or lost the collision: read this one in place
     }
@@ -327,8 +339,6 @@ static __global__ void tq_page_in_misses(
 static __global__ void tq_table_point(
         const int32_t * __restrict__ ids,
         const int                    n_routed,
-        const int                    n_used,
-        const int                    ids_stride,
         const int                    n_slots,
         const int32_t * __restrict__ won,
         const char    * __restrict__ base,
@@ -339,7 +349,7 @@ static __global__ void tq_table_point(
     if (i >= n_routed) {
         return;
     }
-    const int e = tq_routed_expert(ids, i, n_used, ids_stride);
+    const int e = ids[i];
     // a slot if this expert is or is about to be resident, otherwise its home address
     table[e] = won[i] ? (const void *) (slab + (int64_t) (e % n_slots) * nb_expert)
                       : (const void *) (base + (int64_t) e * nb_expert);
@@ -401,30 +411,10 @@ ggml_backend_cuda_context::moe_expert_slab * ggml_backend_cuda_context::moe_expe
     e.n_routed  = n_routed;
     e.dev       = dev;
 
-    // The slabs are allocated lazily at the first decode, after the compute buffers are reserved,
-    // so without a margin they take every byte that is left. Attention scratch at long context
-    // then has nowhere to grow and the next deep prompt fails with out-of-memory. Keep a reserve
-    // free and let any tensor that does not fit read its experts from host memory instead.
-    static const size_t reserve = [] {
-        const char * env = getenv("GGML_MOE_PAGE_RESERVE_MB");
-        const long   v   = env ? atol(env) : 1024;
-        return (size_t) (v > 0 ? v : 0) << 20;
-    }();
-    bool fits = true;
-    {
-        size_t free_mem = 0, total_mem = 0;
-        ggml_cuda_set_device(dev);
-        if (cudaMemGetInfo(&free_mem, &total_mem) == cudaSuccess) {
-            fits = free_mem >= (size_t) e.n_slots * nb_expert + reserve;
-        }
-        (void) cudaGetLastError();
-    }
-
     auto alloc = [&](void ** p, size_t bytes) {
         return ggml_cuda_device_malloc(p, bytes, dev) == cudaSuccess;
     };
-    if (!fits ||
-        !alloc(&e.slab, (size_t) e.n_slots * nb_expert) ||
+    if (!alloc(&e.slab, (size_t) e.n_slots * nb_expert) ||
         !alloc((void **) &e.slot_expert, (size_t) e.n_slots * sizeof(int32_t)) ||
         !alloc((void **) &e.claim,       (size_t) e.n_slots * sizeof(int32_t)) ||
         !alloc((void **) &e.hit,         (size_t) n_routed * sizeof(int32_t)) ||
@@ -1397,12 +1387,11 @@ static void launch_tq3_1s_wmma(
 //   grid.z = token/sample (ne2)            one dot product per (row, expert_slot, sample)
 // ============================================================================
 
-// Fills a per-expert address table. Every entry is base + i*nb_expert here, which reproduces the
-// contiguous layout exactly; the point is that an entry can instead be made to point at a VRAM
-// cache slot or at mapped host memory for an expert that is not resident, with the kernels none
-// the wiser. Built on the device so nothing is read back to the host, which would be illegal
-// inside a graph capture.
-template <bool USE_TABLE>
+// USE_TABLE swaps the contiguous base + expert*nb_expert addressing for a lookup in the
+// per-expert address table built by tq_build_expert_table, so an expert can be read from a VRAM
+// cache slot or from host memory with the kernel none the wiser. false reproduces the original
+// contiguous addressing exactly.
+template <bool USE_TABLE, ggml_type T = GGML_TYPE_TQ3_1S>   // T: TQ3_1S or TQ3_4S, see tq3_block_at
 static __global__ void mul_mat_tq3_1s_moe(
         const void    * __restrict__ vx,       // all experts, base pointer
         const float   * __restrict__ vy_rot,   // pre-rotated activations
@@ -1436,16 +1425,18 @@ static __global__ void mul_mat_tq3_1s_moe(
 
     const int lane = threadIdx.x;
     const int blocks_per_row = ncols_x / QK_TQ3_0;
-    const block_tq3_1s * x_row =
-        (const block_tq3_1s *) (USE_TABLE ? (const char *) ((const void * const *) vx)[expert]
-                             : (const char *) vx + (int64_t) expert * nb_expert)
-        + (int64_t) row * blocks_per_row;
+    const char * x_row =
+        (USE_TABLE ? (const char *) ((const void * const *) vx)[expert]
+                   : (const char *) vx + (int64_t) expert * nb_expert)
+        + (int64_t) row * tq3_row_bytes<T>(blocks_per_row);
     const float * act = vy_rot + sample * stride_sample_y + (int64_t) channel_y * stride_channel_y;
 
     float sumf = 0.0f;
     for (int ib = 0; ib < blocks_per_row; ib++) {
-        const float d = (lane < 16) ? __half2float(x_row[ib].d0) : __half2float(x_row[ib].d1);
-        const uint32_t idx = tq3_extract_index_fast(x_row[ib].qs, lane);
+        float d0, d1;
+        const uint8_t * qs = tq3_block_at<T>(x_row, ib, d0, d1);
+        const float d = (lane < 16) ? d0 : d1;
+        const uint32_t idx = tq3_extract_index_fast(qs, lane);
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
         const float w = tq3_cent_reg(idx) * d;
 #else
@@ -1602,8 +1593,8 @@ static __global__ void mul_mat_tq4_1s_dp4a_moe(
 }
 
 // TQ3_1S dp4a MoE variant: mul_mat_tq4_1s_dp4a_moe with the 3-bit unpack of
-// mul_mat_tq3_1s_dp4a_multi.
-template <int LPR, bool USE_TABLE>   // LPR: lanes cooperating on one output row (must divide WARP_SIZE)
+// mul_mat_tq3_1s_dp4a_multi. T: TQ3_1S or TQ3_4S, see tq3_block_at.
+template <int LPR, bool USE_TABLE, ggml_type T = GGML_TYPE_TQ3_1S>   // LPR: lanes cooperating on one output row (must divide WARP_SIZE)
 static __global__ void mul_mat_tq3_1s_dp4a_moe(
         const void       * __restrict__ vx,
         const block_q8_1 * __restrict__ vy_q8,      // pre-rotated activations (q8_1)
@@ -1637,20 +1628,19 @@ static __global__ void mul_mat_tq3_1s_dp4a_moe(
 
     const int lane = lane_in_row;
     const int blocks_per_row = ncols_x / QK_TQ3_0;
-    const block_tq3_1s * x_row =
-        (const block_tq3_1s *) (USE_TABLE ? (const char *) ((const void * const *) vx)[expert]
-                             : (const char *) vx + (int64_t) expert * nb_expert)
-        + (int64_t) row * blocks_per_row;
+    const char * x_row =
+        (USE_TABLE ? (const char *) ((const void * const *) vx)[expert]
+                   : (const char *) vx + (int64_t) expert * nb_expert)
+        + (int64_t) row * tq3_row_bytes<T>(blocks_per_row);
     const block_q8_1 * a_base = vy_q8 + sample * stride_sample_y + (int64_t) channel_y * stride_channel_y;
 
     float sumf = 0.0f;
     for (int ib = lane; ib < blocks_per_row; ib += LPR) {
-        const block_tq3_1s * blk = &x_row[ib];
-        const float fd0 = __half2float(blk->d0);
-        const float fd1 = __half2float(blk->d1);
+        float fd0, fd1;
+        const uint8_t * qs = tq3_block_at<T>(x_row, ib, fd0, fd1);
 
         uint32_t g0, g1, g2, g3;
-        tq3_groups(blk->qs, g0, g1, g2, g3);
+        tq3_groups(qs, g0, g1, g2, g3);
 
         int c0_0, c1_0, c0_1, c1_1, c0_2, c1_2, c0_3, c1_3;
         tq3_cents8_reg(g0, c0_0, c1_0);
@@ -1762,7 +1752,7 @@ void ggml_cuda_mul_mat_id_tq(ggml_backend_cuda_context & ctx,
                              const ggml_tensor * src1,
                              const ggml_tensor * ids,
                              ggml_tensor * dst) {
-    GGML_ASSERT(src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
+    GGML_ASSERT(src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S || src0->type == GGML_TYPE_TQ3_4S);
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(ids->type  == GGML_TYPE_I32);
@@ -1814,24 +1804,18 @@ void ggml_cuda_mul_mat_id_tq(ggml_backend_cuda_context & ctx,
 #else
     static const bool page_in_on = getenv("GGML_MOE_PAGE_IN") != nullptr;
 #endif
-    // Every call that reads the table must run the plan, whatever its batch size: only routed
-    // experts get their entries repointed, so a skipped call can read a slot holding another expert.
-    const int n_routed       = n_expert_used * n_tokens;
-    if (page_in_on && expert_tab && nb_expert % (int64_t) sizeof(uint4) == 0) {
+    if (page_in_on && expert_tab && n_tokens == 1 && nb_expert % (int64_t) sizeof(uint4) == 0) {
         const int n_expert_total = (int) src0->ne[2];
-        auto * cache = ctx.moe_expert_slab_get(src0, nb_expert, n_expert_total,
-                                               n_expert_used * MMVQ_MAX_BATCH_SIZE, stream);
-        GGML_ASSERT(!cache || n_routed <= cache->n_routed);
+        auto * cache = ctx.moe_expert_slab_get(src0, nb_expert, n_expert_total, n_expert_used, stream);
         if (cache) {
             const int nthr = 64;
-            const int nblk = (n_routed + nthr - 1) / nthr;
+            const int nblk = (n_expert_used + nthr - 1) / nthr;
             CUDA_CHECK(cudaMemsetAsync(cache->claim, 0x7f, (size_t) cache->n_slots * sizeof(int32_t), stream));
             CUDA_CHECK(cudaMemsetAsync(cache->n_miss, 0, sizeof(int32_t), stream));
             tq_cache_probe<<<nblk, nthr, 0, stream>>>(
-                ids_d, n_routed, n_expert_used, ids_stride,
-                cache->n_slots, cache->slot_expert, cache->claim, cache->hit);
+                ids_d, n_expert_used, cache->n_slots, cache->slot_expert, cache->claim, cache->hit);
             tq_cache_award<<<nblk, nthr, 0, stream>>>(
-                ids_d, n_routed, n_expert_used, ids_stride, cache->n_slots, cache->claim, cache->hit,
+                ids_d, n_expert_used, cache->n_slots, cache->claim, cache->hit,
                 cache->slot_expert, cache->miss_expert, cache->miss_slot, cache->n_miss, cache->won);
 
             const int64_t n_vec  = nb_expert / (int64_t) sizeof(uint4);
@@ -1840,13 +1824,13 @@ void ggml_cuda_mul_mat_id_tq(ggml_backend_cuda_context & ctx,
             if (blocks > 64) {
                 blocks = 64;
             }
-            tq_page_in_misses<<<dim3((unsigned) blocks, (unsigned) n_routed), thr, 0, stream>>>(
+            tq_page_in_misses<<<dim3((unsigned) blocks, (unsigned) n_expert_used), thr, 0, stream>>>(
                 (const char *) src0->data, nb_expert,
                 cache->miss_expert, cache->miss_slot, cache->n_miss,
                 (char *) cache->slab, n_vec);
 
             tq_table_point<<<nblk, nthr, 0, stream>>>(
-                ids_d, n_routed, n_expert_used, ids_stride, cache->n_slots, cache->won,
+                ids_d, n_expert_used, cache->n_slots, cache->won,
                 (const char *) src0->data, (char *) cache->slab, nb_expert, expert_tab);
         }
     }
@@ -1888,23 +1872,22 @@ void ggml_cuda_mul_mat_id_tq(ggml_backend_cuda_context & ctx,
         const dim3 grid_l((unsigned) ((nrows_x + rows_per_wg - 1) / rows_per_wg),
                           (unsigned) n_expert_used, (unsigned) n_tokens);
 
-        const bool is_tq3 = src0->type == GGML_TYPE_TQ3_1S;
-        #define TQ_LAUNCH_MOE_K(K, L) do {                                                             \
-            if (expert_tab) {                                                                          \
-                K<L, true><<<grid_l, block, 0, stream>>>(                                              \
-                    (const void *) expert_tab, q8_act, dst_d, ids_d, ncols_x, nrows_x,                 \
-                    nb_expert, ids_stride, nchannels_y, stride_channel_y, stride_sample_y,             \
-                    stride_channel_dst, stride_sample_dst);                                            \
-            } else {                                                                                   \
-                K<L, false><<<grid_l, block, 0, stream>>>(                                             \
-                    src0->data, q8_act, dst_d, ids_d, ncols_x, nrows_x,                                \
-                    nb_expert, ids_stride, nchannels_y, stride_channel_y, stride_sample_y,             \
-                    stride_channel_dst, stride_sample_dst);                                            \
-            }                                                                                          \
+        const void * expert_vx = expert_tab ? (const void *) expert_tab : src0->data;
+        #define TQ_MOE_ARGS expert_vx, q8_act, dst_d, ids_d, ncols_x, nrows_x,                   \
+            nb_expert, ids_stride, nchannels_y, stride_channel_y, stride_sample_y,              \
+            stride_channel_dst, stride_sample_dst
+        #define TQ_LAUNCH_MOE_T(L, TAB) do {                                                     \
+            if (src0->type == GGML_TYPE_TQ3_1S) {                                                 \
+                mul_mat_tq3_1s_dp4a_moe<L, TAB><<<grid_l, block, 0, stream>>>(TQ_MOE_ARGS);        \
+            } else if (src0->type == GGML_TYPE_TQ3_4S) {                                          \
+                mul_mat_tq3_1s_dp4a_moe<L, TAB, GGML_TYPE_TQ3_4S>                                  \
+                    <<<grid_l, block, 0, stream>>>(TQ_MOE_ARGS);                                   \
+            } else {                                                                              \
+                mul_mat_tq4_1s_dp4a_moe<L, TAB><<<grid_l, block, 0, stream>>>(TQ_MOE_ARGS);        \
+            }                                                                                     \
         } while (0)
-        #define TQ_LAUNCH_MOE(L) do {                                                                  \
-            if (is_tq3) { TQ_LAUNCH_MOE_K(mul_mat_tq3_1s_dp4a_moe, L); }                               \
-            else        { TQ_LAUNCH_MOE_K(mul_mat_tq4_1s_dp4a_moe, L); }                               \
+        #define TQ_LAUNCH_MOE(L) do {                                                            \
+            if (expert_tab) { TQ_LAUNCH_MOE_T(L, true); } else { TQ_LAUNCH_MOE_T(L, false); }    \
         } while (0)
 
         switch (lpr) {
@@ -1916,7 +1899,8 @@ void ggml_cuda_mul_mat_id_tq(ggml_backend_cuda_context & ctx,
             default: TQ_LAUNCH_MOE(32); break;
         }
         #undef TQ_LAUNCH_MOE
-        #undef TQ_LAUNCH_MOE_K
+        #undef TQ_LAUNCH_MOE_T
+        #undef TQ_MOE_ARGS
     } else {
         // Pre-rotate activations to float (WHT), contiguous [ncols_x, nchannels_y, n_tokens].
         ggml_cuda_pool_alloc<float> act_buf(ctx.pool(id), n_act_elements);
@@ -1929,7 +1913,19 @@ void ggml_cuda_mul_mat_id_tq(ggml_backend_cuda_context & ctx,
         }
         const int64_t stride_channel_y = ncols_x;                                // float elems to next y-channel
         const int64_t stride_sample_y  = (int64_t) nchannels_y * ncols_x;        // float elems to next token
-        if (src0->type == GGML_TYPE_TQ3_1S) {
+        if (src0->type == GGML_TYPE_TQ3_4S) {
+            if (expert_tab) {
+                mul_mat_tq3_1s_moe<true, GGML_TYPE_TQ3_4S><<<grid, block, 0, stream>>>(
+                    (const void *) expert_tab, act_buf.get(), dst_d, ids_d, ncols_x, nrows_x,
+                    nb_expert, ids_stride, nchannels_y, stride_channel_y, stride_sample_y,
+                    stride_channel_dst, stride_sample_dst);
+            } else {
+                mul_mat_tq3_1s_moe<false, GGML_TYPE_TQ3_4S><<<grid, block, 0, stream>>>(
+                    src0->data, act_buf.get(), dst_d, ids_d, ncols_x, nrows_x,
+                    nb_expert, ids_stride, nchannels_y, stride_channel_y, stride_sample_y,
+                    stride_channel_dst, stride_sample_dst);
+            }
+        } else if (src0->type == GGML_TYPE_TQ3_1S) {
             if (expert_tab) {
                 mul_mat_tq3_1s_moe<true><<<grid, block, 0, stream>>>(
                     (const void *) expert_tab, act_buf.get(), dst_d, ids_d, ncols_x, nrows_x,
