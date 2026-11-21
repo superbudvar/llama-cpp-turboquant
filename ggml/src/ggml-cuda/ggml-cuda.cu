@@ -653,6 +653,12 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         CUDA_CHECK(err);
         *actual_size = look_ahead_size;
         pool_size += look_ahead_size;
+        {
+            static const bool log_pool = getenv("GGML_CUDA_POOL_LOG") != nullptr;
+            if (log_pool && look_ahead_size >= (16u << 20)) {
+                GGML_LOG_INFO("%s[%d]: new %.1f MiB, pool %.1f MiB\n", __func__, device, look_ahead_size/1048576.0, pool_size/1048576.0);
+            }
+        }
 #ifdef DEBUG_CUDA_MALLOC
         GGML_LOG_INFO("%s[%d]: %d buffers, max_size = %u MB, pool_size = %u MB, requested %u MB\n", __func__, device, nnz,
                            (uint32_t)(max_size / 1024 / 1024), (uint32_t)(pool_size / 1024 / 1024), (uint32_t)(size / 1024 / 1024));
@@ -5449,6 +5455,10 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
         args.norm = true;
         args.norm_scale_bias = false;
         for (const ggml_op op : norm_ops) {
+            if (node_idx >= n_nodes) {
+                args.norm = false;
+                return true;
+            }
             const bool scale_bias = op == GGML_OP_CLAMP && nodes[node_idx]->op == GGML_OP_SCALE;
             if ((nodes[node_idx]->op == op || scale_bias) && nodes[node_idx]->src[0] == nodes[node_idx - 1]) {
                 args.norm_scale_bias = args.norm_scale_bias || scale_bias;
@@ -5460,14 +5470,14 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
         }
 
         // DIV <- CLAMP, RESHAPE
-        if (nodes[node_idx]->op != GGML_OP_DIV || nodes[node_idx]->src[1] != nodes[node_idx - 1] ||
+        if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_DIV || nodes[node_idx]->src[1] != nodes[node_idx - 1] ||
             nodes[node_idx]->src[0] != nodes[node_idx - 3]) {
             args.norm = false;
             return true;
         }
         node_idx++;
 
-        if (nodes[node_idx]->op != GGML_OP_RESHAPE || nodes[node_idx]->src[0] != nodes[node_idx - 1]) {
+        if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_RESHAPE || nodes[node_idx]->src[0] != nodes[node_idx - 1]) {
             args.norm = false;
             return true;
         }
@@ -5475,7 +5485,7 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
         node_idx++;
     }
 
-    if (nodes[node_idx]->op == GGML_OP_SCALE && nodes[node_idx]->src[0] == nodes[node_idx - 1]) {
+    if (node_idx < n_nodes && nodes[node_idx]->op == GGML_OP_SCALE && nodes[node_idx]->src[0] == nodes[node_idx - 1]) {
         args.scale = true;
     }
 
@@ -6392,9 +6402,12 @@ static bool ggml_cuda_ink_match_at(const ggml_cgraph * cgraph, int i, ggml_cuda_
         if (ggml_cuda_ink_ops(cgraph, i, ops, 4)) {
             const ggml_tensor * conv = n[i], * rs = n[i+1], * add = n[i+2], * sc = n[i+3];
             const ggml_tensor * sx = conv->src[0], * w = conv->src[1], * cur = add->src[0];
+            // the residual must be [C, n_t*n_s] in the conv output order: [C, n_t, n_s] reshaped to [C, n_t*n_s]
             bool ok = rs->src[0] == conv && add->src[1] == rs && sc->src[0] == add && ggml_get_op_params_f32(sc, 1) == 0.0f &&
                       sx->type == GGML_TYPE_F32 && sx->nb[0] == sizeof(float) && ggml_cuda_ink_f32c(w) &&
                       cur->type == GGML_TYPE_F32 && cur->nb[0] == sizeof(float) && ggml_are_same_shape(cur, add) &&
+                      rs->ne[0] == w->ne[1] && rs->ne[1] == conv->ne[1]*conv->ne[2] && rs->ne[2] == 1 && rs->ne[3] == 1 &&
+                      ggml_are_same_shape(cur, rs) &&
                       ggml_cuda_ink_f32c(sc) && ggml_nelements(sc) == ggml_nelements(conv) && cur->ne[2] == 1 && cur->ne[3] == 1 &&
                       ggml_cuda_ink_subgraph(cgraph, i, ops, 4);
             if (ok) {
@@ -6434,7 +6447,8 @@ static bool ggml_cuda_ink_match_at(const ggml_cgraph * cgraph, int i, ggml_cuda_
     if (node->op == GGML_OP_RMS_NORM && i + 2 <= cgraph->n_nodes && n[i+1]->op == GGML_OP_CONCAT) {
         const ggml_tensor * rms = n[i], * cat = n[i+1];
         const ggml_tensor * a = cat->src[0], * b = rms->src[0];
-        bool ok = cat->src[1] == rms && ggml_get_op_params_i32(cat, 0) == 0 && ggml_cuda_ink_f32c(a) && ggml_cuda_ink_f32c(b) &&
+        // a == rms would need the normalized rows twice; the kernel copies a as it is
+        bool ok = cat->src[1] == rms && a != rms && ggml_get_op_params_i32(cat, 0) == 0 && ggml_cuda_ink_f32c(a) && ggml_cuda_ink_f32c(b) &&
                   ggml_cuda_ink_f32c(cat) && ggml_nrows(a) == ggml_nrows(b) && a->ne[1] == b->ne[1] && a->ne[2] == 1 && b->ne[2] == 1 &&
                   a->ne[3] == 1 && b->ne[3] == 1;
         static const ggml_op ops[] = { GGML_OP_RMS_NORM, GGML_OP_CONCAT };
@@ -6494,6 +6508,7 @@ static bool ggml_cuda_ink_match_at(const ggml_cgraph * cgraph, int i, ggml_cuda_
             const ggml_tensor * fa = n[i + cnt - 2], * sc = n[i + cnt - 1];
             const ggml_tensor * cur = fa->src[0];
             ok = fa->op == GGML_OP_ADD && fa->src[1] == prev && sc->op == GGML_OP_SCALE && sc->src[0] == fa &&
+                 n[i+1]->ne[0] == w->ne[1] && n[i+1]->ne[1] == conv->ne[1] && ggml_are_same_shape(cur, n[i+1]) &&
                  ggml_get_op_params_f32(sc, 1) == 0.0f && cur->type == GGML_TYPE_F32 && cur->nb[0] == sizeof(float) &&
                  ggml_are_same_shape(cur, fa) && cur->ne[2] == 1 && ggml_cuda_ink_f32c(sc) &&
                  cur->ne[0] == w->ne[1] && mm->ne[0] % nc == 0 && w->ne[1] % (mm->ne[0]/nc) == 0;
@@ -6537,6 +6552,12 @@ static int ggml_cuda_ink_try_fuse(ggml_backend_cuda_context * ctx, ggml_cgraph *
         case GGML_CUDA_INK_CTRL: {
             // f and g are both live when the tail runs; the elementwise tail may write over any of its inputs
             const ggml_tensor * gin = m.g->src[1];
+            // one token, F32 or F16 weights over the same gate: the two products and the tail in one kernel; every warp
+            // reads the whole gate, so the output must not overwrite it
+            if (ggml_cuda_ink_ctrl_mv_supported(m.f, m.g) && !ggml_cuda_ink_overlap(dst, gin)) {
+                ggml_cuda_ink_ctrl_mv(*ctx, m.f->src[0], m.g->src[0], gin, m.c, m.d, dst);
+                break;
+            }
             if (ggml_cuda_ink_overlap(m.f, m.g) || ggml_cuda_ink_overlap(m.g, gin) ||
                 ggml_cuda_ink_overlap(m.f, m.c) || ggml_cuda_ink_overlap(m.f, m.d) || ggml_cuda_ink_overlap(m.f, gin) ||
                 ggml_cuda_ink_overlap(m.g, m.c) || ggml_cuda_ink_overlap(m.g, m.d)) {
@@ -7624,6 +7645,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+
+                // drop cached q8_1 inputs whose memory this node (or fused group) writes
+                for (int k = i; k <= i + nodes_to_skip; ++k) {
+                    if (!ggml_cuda_is_view_or_noop(cgraph->nodes[k])) {
+                        ggml_cuda_mmvq_q8_cache_invalidate(*cuda_ctx, cgraph->nodes[k]);
+                    }
+                }
 
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG

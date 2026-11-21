@@ -1457,6 +1457,9 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch) {
     const auto * attn_ctx = mctx->get_attn();
 
+    // the cell positions cover one stream, the relative bias in flash attention needs them
+    const bool one_stream = cparams.kv_unified || ubatch->n_seqs_unq == 1;
+
     // base tensors may not be allocated if there are no non-SWA attention layers
     if (inp_attn->self_k_idxs && inp_attn->self_k_idxs->buffer) {
         attn_ctx->get_base()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
@@ -1471,6 +1474,10 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
         attn_ctx->get_base()->set_input_relative_pos(self_rel_pos, ubatch, extent);
     }
 
+    if (self_cell_pos->buffer && one_stream) {
+        attn_ctx->get_base()->set_input_cell_pos(self_cell_pos, ubatch);
+    }
+
     // swa tensors may not be allocated if there are no SWA attention layers
     if (inp_attn->self_k_idxs_swa && inp_attn->self_k_idxs_swa->buffer) {
         attn_ctx->get_swa()->set_input_k_idxs(inp_attn->self_k_idxs_swa, ubatch);
@@ -1483,6 +1490,10 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
 
     if (self_rel_pos_swa->buffer) {
         attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
+    }
+
+    if (self_cell_pos_swa->buffer && one_stream) {
+        attn_ctx->get_swa()->set_input_cell_pos(self_cell_pos_swa, ubatch);
     }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
@@ -1521,6 +1532,8 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
     res &= self_rel_pos->ne[0] == attn_ctx->get_base()->get_n_kv();
     res &= self_rel_pos->ne[1] == params.ubatch.n_tokens;
 
+    res &= self_cell_pos->ne[0] == attn_ctx->get_base()->get_n_kv();
+
     // swa tensors may not be allocated if there are no SWA attention layers
     if (inp_attn->self_k_idxs_swa && inp_attn->self_k_idxs_swa->buffer) {
         res &= inp_attn->self_k_idxs_swa->ne[0] == params.ubatch.n_tokens;
@@ -1530,6 +1543,8 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
 
     res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
     res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
+
+    res &= self_cell_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -3201,8 +3216,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     ggml_tensor * cur;
 
-    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr && (!sinks || ggml_is_vector(sinks));
     GGML_ASSERT(use_flash_attn || kv_rows == nullptr);
+    GGML_ASSERT(use_flash_attn || attn_rel_bias == nullptr);
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
@@ -3219,32 +3235,63 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
 
-        if (kv_rows) {
-            cur = ggml_flash_attn_ext_rows(ctx0, q, k, v, kq_mask, kv_rows, kq_scale, hparams.f_max_alibi_bias,
-                                           hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
-        } else {
-            cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
-                                      hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
-        }
-        res->add_fused_node({kv_rows ? LLM_FUSED_OP_FLASH_ATTN_KV_ROWS : LLM_FUSED_OP_FLASH_ATTN, cur, il});
-
-        ggml_flash_attn_ext_add_sinks(cur, sinks);
-        GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
-        ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
-        ggml_prec_set_acc(cur, GGML_PREC_F32);
-
-        // TurboQuant: inverse WHT on FA output when V values are WHT-rotated.
-        // For MLA, V is a view of K with different ne[0] (e.g. V=512, K=576).
-        // Group size must come from K (which determines the WHT rotation), not V.
-        if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO5_0 || v->type == GGML_TYPE_TURBO6_0) {
-            const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO5_0 || k->type == GGML_TYPE_TURBO6_0);
-            const ggml_tensor * group_src = k_is_turbo ? k : v;
-            const int turbo_group = (group_src->ne[0] % 128 == 0) ? 128 : 64;
-            if (cur->ne[0] % turbo_group == 0) {
-                if (!ggml_is_contiguous(cur)) { cur = ggml_cont(ctx0, cur); }
-                ggml_tensor * innerq_scale = mctx ? mctx->get_turbo_innerq_scale_inv() : nullptr;
-                cur = ggml_turbo_wht(ctx0, cur, 1, turbo_group, innerq_scale);  // 1 = inverse
+        // with the relative bias, a long batch runs one flash attention per group of K/V heads: kernels that
+        // convert quantized K/V to F16 then hold one group's copy at a time (all heads: n_kv x n_embd_k_gqa x
+        // 4 bytes). The fewest groups whose copy stays within the budget, so short contexts keep a single op.
+        static const int64_t f16_budget = [] {
+            const char * env = getenv("LLAMA_INK_FA_F16_BUDGET_MB");
+            return (env ? atoll(env) : 512) * 1024 * 1024;
+        }();
+        const int64_t n_head_kv = k->ne[2];
+        int64_t n_groups = 1;
+        if (attn_rel_bias && q->ne[1] > 2 && q->ne[3] == 1 && q->ne[2] % n_head_kv == 0) {
+            const int64_t f16_bytes = k->ne[1]*(k->ne[0] + v->ne[0])*n_head_kv*2;
+            while (n_groups < n_head_kv && n_head_kv % (2*n_groups) == 0 && f16_bytes/n_groups > f16_budget) {
+                n_groups *= 2;
             }
+        }
+        const bool    per_kv_head = n_groups > 1;
+        const int64_t gqa         = q->ne[2] / n_groups;
+        const int64_t kv_per_grp  = n_head_kv / n_groups;
+
+        cur = nullptr;
+        for (int64_t g = 0; g < n_groups; ++g) {
+            ggml_tensor * qg = per_kv_head ? ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], gqa, 1, q->nb[1], q->nb[2], q->nb[3], g*gqa*q->nb[2]) : q;
+            ggml_tensor * kg = per_kv_head ? ggml_view_4d(ctx0, k, k->ne[0], k->ne[1], kv_per_grp, 1, k->nb[1], k->nb[2], k->nb[3], g*kv_per_grp*k->nb[2]) : k;
+            ggml_tensor * vg = per_kv_head ? ggml_view_4d(ctx0, v, v->ne[0], v->ne[1], kv_per_grp, 1, v->nb[1], v->nb[2], v->nb[3], g*kv_per_grp*v->nb[2]) : v;
+
+            ggml_tensor * fa = kv_rows
+                ? ggml_flash_attn_ext_rows(ctx0, qg, kg, vg, kq_mask, kv_rows, kq_scale, hparams.f_max_alibi_bias,
+                                           hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f)
+                : ggml_flash_attn_ext(ctx0, qg, kg, vg, kq_mask, kq_scale, hparams.f_max_alibi_bias,
+                                      hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+            res->add_fused_node({kv_rows ? LLM_FUSED_OP_FLASH_ATTN_KV_ROWS : LLM_FUSED_OP_FLASH_ATTN, fa, il});
+
+            ggml_flash_attn_ext_add_sinks(fa, sinks && per_kv_head ? ggml_view_1d(ctx0, sinks, gqa, g*gqa*sinks->nb[0]) : sinks);
+            if (attn_rel_bias) {
+                ggml_flash_attn_ext_set_rel_bias(fa, attn_rel_bias->table, attn_rel_bias->sinks, attn_rel_bias->kpos,
+                        attn_rel_bias->qpos, attn_rel_bias->extent, (int32_t) (g*gqa));
+            }
+            GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
+            ggml_flash_attn_ext_set_n_kv_max(fa, static_cast<int32_t>(n_kv_max));
+            ggml_prec_set_acc(fa, GGML_PREC_F32);
+
+            // TurboQuant: inverse WHT on FA output when V values are WHT-rotated.
+            // For MLA, V is a view of K with different ne[0] (e.g. V=512, K=576).
+            // Group size must come from K (which determines the WHT rotation), not V.
+            if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO5_0 || v->type == GGML_TYPE_TURBO6_0) {
+                const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO5_0 || k->type == GGML_TYPE_TURBO6_0);
+                const ggml_tensor * group_src = k_is_turbo ? k : v;
+                const int turbo_group = (group_src->ne[0] % 128 == 0) ? 128 : 64;
+                if (fa->ne[0] % turbo_group == 0) {
+                    if (!ggml_is_contiguous(fa)) { fa = ggml_cont(ctx0, fa); }
+                    ggml_tensor * innerq_scale = mctx ? mctx->get_turbo_innerq_scale_inv() : nullptr;
+                    fa = ggml_turbo_wht(ctx0, fa, 1, turbo_group, innerq_scale);  // 1 = inverse
+                }
+            }
+
+            // [n_embd_v, gqa, n_tokens, 1]: the heads of each group follow the previous ones
+            cur = cur ? ggml_concat(ctx0, cur, fa, 1) : fa;
         }
 
         if (v_mla) {
@@ -4508,6 +4555,14 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
     ggml_set_input(inp->self_rel_pos_swa);
     ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
 
+    inp->self_cell_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, attn_ctx->get_base()->get_n_kv());
+    ggml_set_input(inp->self_cell_pos);
+    ggml_set_name(inp->self_cell_pos, "attn_inp_cell_pos");
+
+    inp->self_cell_pos_swa = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, attn_ctx->get_swa()->get_n_kv());
+    ggml_set_input(inp->self_cell_pos_swa);
+    ggml_set_name(inp->self_cell_pos_swa, "attn_inp_cell_pos_swa");
+
     return (llm_graph_input_mem_hybrid_iswa_rel *) res->add_input(std::move(inp));
 }
 
@@ -4522,7 +4577,8 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * kq_b,
         ggml_tensor * sinks,
             float     kq_scale,
-            int       il) const {
+            int       il,
+        ggml_tensor * kq_mask_full) const {
     const bool is_swa = hparams.is_swa(il);
 
     auto * inp_attn = inp->get_attn();
@@ -4534,13 +4590,16 @@ ggml_tensor * llm_graph_context::build_attn(
     GGML_ASSERT(attn_mask.rows == nullptr);
 
     // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
-    ggml_tensor * kq_mask = attn_mask.raw;
-    if (kq_mask->type != GGML_TYPE_F32) {
-        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
-    }
-    kq_mask = ggml_add(ctx0, kq_b, kq_mask);
-    if (cparams.flash_attn) {
-        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
+    ggml_tensor * kq_mask = kq_mask_full;
+    if (!kq_mask) {
+        kq_mask = attn_mask.raw;
+        if (kq_mask->type != GGML_TYPE_F32) {
+            kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+        }
+        kq_mask = ggml_add(ctx0, kq_b, kq_mask);
+        if (cparams.flash_attn) {
+            kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
+        }
     }
     cb(kq_mask, "kq_mask_rel_pos", il);
 

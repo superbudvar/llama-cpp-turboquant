@@ -13,6 +13,11 @@ void ggml_cuda_ink_l2_clip(ggml_backend_cuda_context & ctx, const ggml_tensor * 
 void ggml_cuda_ink_situ(ggml_backend_cuda_context & ctx, const ggml_tensor * gate, const ggml_tensor * up,
         float gi, float go, float ui, float uo, ggml_tensor * dst);
 
+// the same with f = Wf^T gate and g = Wg^T gate computed in the kernel, for one token
+bool ggml_cuda_ink_ctrl_mv_supported(const ggml_tensor * f, const ggml_tensor * g);
+void ggml_cuda_ink_ctrl_mv(ggml_backend_cuda_context & ctx, const ggml_tensor * wf, const ggml_tensor * wg, const ggml_tensor * gate,
+        const ggml_tensor * cur, const ggml_tensor * msg, ggml_tensor * dst);
+
 // dst = cur - tanh(f)*cur + tanh(g)*msg
 void ggml_cuda_ink_ctrl(ggml_backend_cuda_context & ctx, const ggml_tensor * f, const ggml_tensor * g,
         const ggml_tensor * cur, const ggml_tensor * msg, ggml_tensor * dst);

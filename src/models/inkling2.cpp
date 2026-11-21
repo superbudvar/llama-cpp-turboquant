@@ -239,9 +239,7 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 
 // mix a cross-pass message into a looped layer input: (1 - forget)*cur + gain*message, both gated on cur and message
 ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl) {
-    auto it = norms.find(cur);
-    ggml_tensor * cur_norm = it != norms.end() ? it->second : norms.emplace(cur, ggml_rms_norm(ctx0, cur, 1e-6f)).first->second;
-    ggml_tensor * gate = ggml_concat(ctx0, cur_norm, ggml_rms_norm(ctx0, message, 1e-6f), 0);
+    ggml_tensor * gate = ggml_concat(ctx0, ggml_rms_norm(ctx0, cur, 1e-6f), ggml_rms_norm(ctx0, message, 1e-6f), 0);
     gate = build_lora_mm(loop.ctrl_down[ctrl], gate);
 
     ggml_tensor * gain   = ggml_tanh(ctx0, build_lora_mm(loop.ctrl_gain[ctrl],   gate));
@@ -256,6 +254,7 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
     recr = inp->get_recr();
 
     ggml_tensor * inp_pos = build_inp_pos();
+    pos = inp_pos;
     inp_out_ids = build_inp_out_ids();
 
     // log-scaled positions: 1 + alpha*log(max(1, (pos + 1)/floor)), multiplies q and r of the full-attention layers
@@ -287,7 +286,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
     // the message of controller ctrl, [n_embd, n_tokens]
     auto message = [&](int ctrl) {
-        return view_cont(ggml_view_2d(ctx0, messages, n_embd, n_tokens, messages->nb[2], ctrl*messages->nb[1]));
+        return ggml_cont(ctx0, ggml_view_2d(ctx0, messages, n_embd, n_tokens, messages->nb[2], ctrl*messages->nb[1]));
     };
 
     ggml_tensor * state   = recr->mctx->get_r_l(il);
@@ -350,35 +349,48 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         cb(Rcur, "Rcur", il);
 
         ggml_tensor * rel_pos = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
+        ggml_tensor * mask    = is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw;
 
-        const int64_t n_stream = (is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw)->ne[3];
-        const int64_t n_kv     = rel_pos->ne[0];
+        const int64_t n_stream = mask->ne[3];
 
         ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
 
-        // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
+        // project r on the bias table: [n_rel, n_head, n_tokens]
         ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
 
-        // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
-        table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
-        table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
-
-        ggml_tensor * kq_b = ggml_get_rows(ctx0, table, rel_pos);
-        kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
-        kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
-        cb(kq_b, "kq_b", il);
+        // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))).
+        // the sink is folded into the bias, so the softmax sees a zero sink.
+        // with flash attention on one stream the kernel computes the bias from the table and the cell
+        // positions, so no per-head mask is built at all
+        ggml_tensor * kq_b   = nullptr;
+        ggml_tensor * fa_mask = nullptr;
+        llm_graph_rel_bias fa_bias;
+        if (cparams.flash_attn && n_stream == 1) {
+            fa_bias.table  = table;
+            fa_bias.sinks  = sinks;
+            fa_bias.kpos   = is_swa ? inp->self_cell_pos_swa : inp->self_cell_pos;
+            fa_bias.qpos   = pos;
+            fa_bias.extent = is_swa ? hparams.n_swa : hparams.n_relative_extent;
+            attn_rel_bias  = &fa_bias;
+            fa_mask = mask;
+        } else {
+            // one op writes the per-head mask, without the n_kv x n_tokens x n_head F32 intermediates
+            fa_mask = ggml_ink_rel_bias(ctx0, table, sinks, rel_pos, mask,
+                    cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32);
+            cb(fa_mask, "kq_b", il);
+        }
 
         sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
 
         cur = build_attn(inp,
                 nullptr, nullptr, nullptr,
-                Qcur, Kcur, Vcur, kq_b, sinks, 1.0f/sqrtf(n_embd_head), il);
+                Qcur, Kcur, Vcur, kq_b, sinks, 1.0f/sqrtf(n_embd_head), il, fa_mask);
+        attn_rel_bias = nullptr;
 
         cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0])));
         cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);
         cb(cur, "attn_out", il);
     }
-
     // the first layer of each block starts a new residual stream, the earlier one joins the mixed blocks
     if (ip % hparams.attn_res_block_size == 0) {
         blocks.push_back(inpSA);

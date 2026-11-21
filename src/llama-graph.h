@@ -811,6 +811,10 @@ public:
     ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
     ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
 
+    // the position of every cell, for the bias that flash attention computes itself
+    ggml_tensor * self_cell_pos     = nullptr; // I32 [n_kv]
+    ggml_tensor * self_cell_pos_swa = nullptr; // I32 [n_kv_swa]
+
     const uint32_t extent;
     const uint32_t extent_swa;
 
@@ -1089,8 +1093,20 @@ struct llm_graph_amax_src1 {
     ggml_tensor * scale_s; // scale to undo on the matmul result, or nullptr
 };
 
+// a relative-position bias that flash attention computes itself (ggml_flash_attn_ext_set_rel_bias)
+struct llm_graph_rel_bias {
+    ggml_tensor * table  = nullptr; // [n_rel, n_head, n_tokens]
+    ggml_tensor * sinks  = nullptr; // [n_head, n_tokens]
+    ggml_tensor * kpos   = nullptr; // [n_kv]
+    ggml_tensor * qpos   = nullptr; // [n_tokens]
+    int32_t       extent = 0;
+};
+
 struct llm_graph_context {
     const llama_model & model;
+
+    // set by a model around build_attn(): build_attn_mha() attaches it to the flash attention node
+    const llm_graph_rel_bias * attn_rel_bias = nullptr;
 
     const llama_hparams & hparams;
     const llama_cparams & cparams;
@@ -1535,6 +1551,7 @@ struct llm_graph_context {
             uint32_t extent_swa) const;
 
     // kq_b is added to the KQ mask, after the KQ scale
+    // kq_mask_full replaces the mask, the caller has to build it
     ggml_tensor * build_attn(
             llm_graph_input_mem_hybrid_iswa_rel * inp,
             ggml_tensor * wo,
@@ -1546,7 +1563,8 @@ struct llm_graph_context {
             ggml_tensor * kq_b,  // [n_kv, n_tokens/n_stream, n_head_q, n_stream]
             ggml_tensor * sinks, // [n_head_q]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * kq_mask_full = nullptr) const;
 
     //
     // pooling

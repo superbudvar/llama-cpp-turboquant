@@ -1,4 +1,5 @@
 #include "inkling.cuh"
+#include "convert.cuh"
 
 // ---------------------------------------------------------------- l2 clip
 // one warp per row
@@ -103,6 +104,58 @@ void ggml_cuda_ink_ctrl(ggml_backend_cuda_context & ctx, const ggml_tensor * f, 
     const int bs = 256;
     k_ink_ctrl<<<(n + bs - 1)/bs, bs, 0, ctx.stream()>>>((const float *) f->data, (const float *) g->data,
             (const float *) cur->data, (const float *) msg->data, (float *) dst->data, n);
+}
+
+// ---------------------------------------------------------------- loop controller with its two products, one token
+// one warp per output row e: f = Wf[:, e] . gate, g = Wg[:, e] . gate (rank-long dots), then the tail
+template <typename TW>
+static __global__ void k_ink_ctrl_mv(const TW * __restrict__ wf, const TW * __restrict__ wg, const float * __restrict__ gate,
+        const float * cur, const float * __restrict__ msg, float * dst, const int rank, const int n_out) {
+    const int e    = blockIdx.x*(blockDim.x/WARP_SIZE) + threadIdx.x/WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    if (e >= n_out) {
+        return;
+    }
+    const TW * rf = wf + (size_t) e*rank;
+    const TW * rg = wg + (size_t) e*rank;
+    float f = 0.0f;
+    float g = 0.0f;
+    for (int k = lane; k < rank; k += WARP_SIZE) {
+        const float x = gate[k];
+        f += ggml_cuda_cast<float>(rf[k])*x;
+        g += ggml_cuda_cast<float>(rg[k])*x;
+    }
+    f = warp_reduce_sum(f);
+    g = warp_reduce_sum(g);
+    if (lane == 0) {
+        const float c = cur[e];
+        dst[e] = (c - tanhf(f)*c) + tanhf(g)*msg[e];
+    }
+}
+
+bool ggml_cuda_ink_ctrl_mv_supported(const ggml_tensor * f, const ggml_tensor * g) {
+    const ggml_tensor * wf = f->src[0];
+    const ggml_tensor * wg = g->src[0];
+    return f->src[1] == g->src[1] && f->ne[1] == 1 && wf->type == wg->type &&
+           (wf->type == GGML_TYPE_F32 || wf->type == GGML_TYPE_F16) &&
+           ggml_is_contiguous(wf) && ggml_is_contiguous(wg) && ggml_are_same_shape(wf, wg) &&
+           ggml_is_contiguous(f->src[1]) && f->src[1]->type == GGML_TYPE_F32 && wf->ne[0] == f->src[1]->ne[0];
+}
+
+void ggml_cuda_ink_ctrl_mv(ggml_backend_cuda_context & ctx, const ggml_tensor * wf, const ggml_tensor * wg, const ggml_tensor * gate,
+        const ggml_tensor * cur, const ggml_tensor * msg, ggml_tensor * dst) {
+    const int rank  = wf->ne[0];
+    const int n_out = wf->ne[1];
+    GGML_ASSERT(ggml_nelements(dst) == n_out && ggml_nelements(cur) == n_out && ggml_nelements(msg) == n_out);
+    const int warps = 8;
+    const dim3 grid((n_out + warps - 1)/warps), block(warps*WARP_SIZE);
+    if (wf->type == GGML_TYPE_F16) {
+        k_ink_ctrl_mv<half><<<grid, block, 0, ctx.stream()>>>((const half *) wf->data, (const half *) wg->data, (const float *) gate->data,
+                (const float *) cur->data, (const float *) msg->data, (float *) dst->data, rank, n_out);
+    } else {
+        k_ink_ctrl_mv<float><<<grid, block, 0, ctx.stream()>>>((const float *) wf->data, (const float *) wg->data, (const float *) gate->data,
+                (const float *) cur->data, (const float *) msg->data, (float *) dst->data, rank, n_out);
+    }
 }
 
 // ---------------------------------------------------------------- depth attention (mix)
@@ -395,12 +448,12 @@ void ggml_cuda_ink_conv_res(ggml_backend_cuda_context & ctx, const ggml_tensor *
 }
 
 // ---------------------------------------------------------------- GGML_OP_INK_REL_BIAS
-// dst[j, t', h, s] = table[idx[j, t], h, t] - sink[h, t] + mask[j, t', 0, s], t = s*n_tps + t'
+// dst[j, t', h, s] = table[clamp(idx[j, t]), h, t] - sink[h, t] + mask[j, t', 0, s], t = s*n_tps + t'
 template <typename TM, typename TD>
 static __global__ void k_ink_rel_bias(const char * __restrict__ table, const float * __restrict__ sink, const char * __restrict__ idx,
-        const char * __restrict__ mask, char * dst, const int n_kv, const int n_tps, const int n_head, const int n_str,
-        const size_t t_nb0, const size_t t_nb1, const size_t t_nb2, const size_t i_nb1,
-        const size_t m_nb1, const size_t m_nb3, const size_t d_nb1, const size_t d_nb2, const size_t d_nb3) {
+        const char * __restrict__ mask, char * dst, const int n_kv, const int n_tps, const int n_head, const int n_str, const int n_rel,
+        const size_t t_nb0, const size_t t_nb1, const size_t t_nb2, const size_t i_nb0, const size_t i_nb1,
+        const size_t m_nb0, const size_t m_nb1, const size_t m_nb3, const size_t d_nb1, const size_t d_nb2, const size_t d_nb3) {
     const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= (int64_t) n_kv*n_tps*n_head*n_str) {
         return;
@@ -411,8 +464,8 @@ static __global__ void k_ink_rel_bias(const char * __restrict__ table, const flo
     const int st = i / ((int64_t) n_kv*n_tps*n_head);
     const int t  = st*n_tps + tp;
 
-    const int r = ((const int32_t *) (idx + t*i_nb1))[j];
-    const TM  mv = ((const TM *) (mask + tp*m_nb1 + st*m_nb3))[j];
+    const int r  = min(max(*(const int32_t *) (idx + t*i_nb1 + j*i_nb0), 0), n_rel - 1);
+    const TM  mv = *(const TM *) (mask + tp*m_nb1 + st*m_nb3 + j*m_nb0);
     float m;
     if constexpr (std::is_same_v<TM, half>) {
         m = __half2float(mv);
@@ -438,13 +491,13 @@ static void ink_rel_bias_launch(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const int bs = 256;
     k_ink_rel_bias<TM, TD><<<(n + bs - 1)/bs, bs, 0, ctx.stream()>>>((const char *) table->data, (const float *) sinks->data,
             (const char *) idx->data, (const char *) mask->data, (char *) dst->data, dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
-            table->nb[0], table->nb[1], table->nb[2], idx->nb[1], mask->nb[1], mask->nb[3], dst->nb[1], dst->nb[2], dst->nb[3]);
+            table->ne[0], table->nb[0], table->nb[1], table->nb[2], idx->nb[0], idx->nb[1], mask->nb[0], mask->nb[1], mask->nb[3],
+            dst->nb[1], dst->nb[2], dst->nb[3]);
 }
 
 void ggml_cuda_op_ink_rel_bias(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * mask = dst->src[3];
-    GGML_ASSERT(dst->src[2]->nb[0] == sizeof(int32_t) && mask->nb[0] == ggml_type_size(mask->type) && dst->nb[0] == ggml_type_size(dst->type));
-    GGML_ASSERT(ggml_is_contiguous(dst->src[1]));
+    GGML_ASSERT(dst->nb[0] == ggml_type_size(dst->type) && ggml_is_contiguous(dst->src[1]));
     if (mask->type == GGML_TYPE_F16) {
         dst->type == GGML_TYPE_F16 ? ink_rel_bias_launch<half, half>(ctx, dst) : ink_rel_bias_launch<half, float>(ctx, dst);
     } else {

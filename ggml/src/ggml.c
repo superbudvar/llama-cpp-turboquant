@@ -5616,6 +5616,35 @@ void ggml_flash_attn_ext_set_n_kv_max(
     ggml_set_op_params_i32(a, 4, n_kv_max);
 }
 
+void ggml_flash_attn_ext_set_rel_bias(
+        struct ggml_tensor * a,
+        struct ggml_tensor * table,
+        struct ggml_tensor * sinks,
+        struct ggml_tensor * kpos,
+        struct ggml_tensor * qpos,
+        int32_t              extent,
+        int32_t              head0) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    const struct ggml_tensor * q    = a->src[0];
+    const struct ggml_tensor * mask = a->src[3];
+    GGML_ASSERT(mask && mask->ne[2] == 1 && mask->ne[3] == 1 && q->ne[3] == 1);
+    GGML_ASSERT(a->src[5] == NULL); // no kv_rows
+    GGML_ASSERT(table->type == GGML_TYPE_F32 && sinks->type == GGML_TYPE_F32);
+    GGML_ASSERT(kpos->type == GGML_TYPE_I32 && qpos->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(table) && ggml_is_contiguous(sinks) && ggml_is_contiguous(kpos) && ggml_is_contiguous(qpos));
+    GGML_ASSERT(extent >= 0 && table->ne[0] > extent);
+    GGML_ASSERT(head0 >= 0 && head0 + q->ne[2] <= table->ne[1] && table->ne[2] == q->ne[1] && table->ne[3] == 1);
+    GGML_ASSERT(ggml_nelements(sinks) == table->ne[1]*q->ne[1]);
+    GGML_ASSERT(ggml_nelements(kpos) == mask->ne[0] && ggml_nelements(qpos) == q->ne[1]);
+
+    a->src[6] = table;
+    a->src[7] = sinks;
+    a->src[8] = kpos;
+    a->src[9] = qpos;
+    ggml_set_op_params_i32(a, 5, extent);
+    ggml_set_op_params_i32(a, 6, head0);
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {
