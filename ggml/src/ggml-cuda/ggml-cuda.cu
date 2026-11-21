@@ -3032,7 +3032,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // The fused TQ kernels index src1/dst as flat contiguous buffers (no nb[] stride handling in
     // mmvq-tq.cu), so permuted/viewed activations (e.g. DeepSeek-V4 MLA projections) must take the
     // stride-aware cuBLAS fallback below, which dequantizes TQ via ggml_get_to_fp16_cuda.
-    const bool tq_fast_path_ok = ggml_is_contiguous(src1) && ggml_is_contiguous(dst);
+    // They also treat src1 as one [K, N] matrix. For contiguous src1 and dst against a 2D weight
+    // that is exact with N = ne11*ne12*ne13, so the column count below folds the batch dims in: a
+    // hybrid model's GDN output projection takes [K, n_seq_tokens, n_seqs], and with several
+    // sequences in a ubatch only the first sequence's columns used to be computed. A batched
+    // (3D/4D) weight is not one matrix, so it takes the cuBLAS fallback.
+    const bool    tq_fast_path_ok = ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
+                                    src0->ne[2] == 1 && src0->ne[3] == 1;
+    const int64_t tq_ncols        = ggml_nrows(src1);
 
     // GGML_TYPE_TQ3_1S: the fused warp-scalar kernel (mul_mat_tq3_1s_multi /
     // tq_prerotate_activation in mmvq-tq.cu) is disabled here pending a fix.
@@ -3069,7 +3076,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const bool tq3_1s_fused_disabled = (src0->type == GGML_TYPE_TQ3_1S);
 #endif
 
-    if (is_tq_weight && tq_fast_path_ok && !tq3_1s_fused_disabled && ne11 <= MMVQ_MAX_BATCH_SIZE) {
+    if (is_tq_weight && tq_fast_path_ok && !tq3_1s_fused_disabled && tq_ncols <= MMVQ_MAX_BATCH_SIZE) {
         // Fused TQ weight mul_mat with pre-rotated activations via warp shuffle WHT
         // Handles ne[1]=1 (decode) and ne[1]≤8 (multi-token / speculative decoding)
         ggml_cuda_mul_mat_tq(ctx, src0, src1, dst);
@@ -3307,12 +3314,14 @@ static bool ggml_cuda_kv_stream_staged_set_rows_range(
         int64_t * first_row, int64_t * row_count) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
-    // set_rows_cuda_turbo{2,3,4} (set-rows.cu) write F32 -> turbo K/V but don't
-    // accept a row-base offset, which the true page-staging path below relies
-    // on. Force turbo writes through the online_write mirror fallback instead
-    // (two absolute-position ggml_cuda_op_set_rows calls, no offset needed).
+    // set_rows_cuda_turbo{2,3,4,5,6} (set-rows.cu) write F32 -> turbo K/V but
+    // don't accept a row-base offset, which the true page-staging path below
+    // relies on. Force turbo writes through the online_write mirror fallback
+    // instead (two absolute-position ggml_cuda_op_set_rows calls, no offset
+    // needed).
     if (dst->type == GGML_TYPE_TURBO2_0 || dst->type == GGML_TYPE_TURBO3_0 ||
-            dst->type == GGML_TYPE_TURBO4_0) {
+            dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO5_0 ||
+            dst->type == GGML_TYPE_TURBO6_0) {
         return false;
     }
     if (runtime == nullptr || runtime->resident_cache == nullptr ||
@@ -3969,8 +3978,9 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         }
 
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
-        const bool is_tq_w = (node->src[0]->type == GGML_TYPE_TQ4_1S || node->src[0]->type == GGML_TYPE_TQ3_1S);
         if (node->op == GGML_OP_MUL_MAT_ID) {
+            // read src[0] only here: source-less nodes (ARANGE, ...) have src[0] == NULL
+            const bool is_tq_w = (node->src[0]->type == GGML_TYPE_TQ4_1S || node->src[0]->type == GGML_TYPE_TQ3_1S);
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
             const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
             // The mul_mat_id operation synchronizes the stream (forbidding graph capture) unless it
@@ -6789,8 +6799,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if ((op->type == GGML_TYPE_TURBO3_0 || op->type == GGML_TYPE_TURBO2_0) && op->src[0]->ne[0] % 64 != 0) {
                     return false;
                 }
-                // turbo4 block size is 128, so head_dim must be divisible by 128
-                if (op->type == GGML_TYPE_TURBO4_0 && op->src[0]->ne[0] % 128 != 0) {
+                // turbo4, turbo6 and turbo5 block size is 128, so head_dim must be divisible by 128
+                if ((op->type == GGML_TYPE_TURBO4_0 || op->type == GGML_TYPE_TURBO5_0 || op->type == GGML_TYPE_TURBO6_0) && op->src[0]->ne[0] % 128 != 0) {
                     return false;
                 }
                 return (
@@ -6798,7 +6808,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                                (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                                op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
                                op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL ||
-                               op->type == GGML_TYPE_TURBO3_0 || op->type == GGML_TYPE_TURBO2_0 || op->type == GGML_TYPE_TURBO4_0) &&
+                               op->type == GGML_TYPE_TURBO3_0 || op->type == GGML_TYPE_TURBO2_0 || op->type == GGML_TYPE_TURBO4_0 ||
+                               op->type == GGML_TYPE_TURBO5_0 || op->type == GGML_TYPE_TURBO6_0) &&
                                op->src[0]->type == GGML_TYPE_F32
                            ) || (
                                op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_F16
@@ -6826,6 +6837,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return true;
                 }
                 if (src0_type == GGML_TYPE_Q8_0 && src1_type == GGML_TYPE_F32) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_TURBO6_0 && src1_type == GGML_TYPE_F32) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_TURBO5_0 && src1_type == GGML_TYPE_F32) {
                     return true;
                 }
                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_Q4_0) {
