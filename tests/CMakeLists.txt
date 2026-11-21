@@ -421,6 +421,7 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
 endif()
 
 llama_build_and_test(test-moe-cache-fit.cpp  LABEL "main behavior")
+llama_build_and_test(test-ink-rel-bias.cpp)
 
 # TurboQuant WHT round-trip test (links ggml turbo codec symbols via llama)
 llama_build_and_test(test-turbo-quant.c  LABEL "turbo")
