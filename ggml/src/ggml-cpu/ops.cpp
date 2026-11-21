@@ -11578,6 +11578,49 @@ void ggml_compute_forward_dsv4_hc_pre(
     }
 }
 
+// ggml_compute_forward_ink_rel_bias
+
+void ggml_compute_forward_ink_rel_bias(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * table = dst->src[0];
+    const ggml_tensor * sinks = dst->src[1];
+    const ggml_tensor * idx   = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+
+    const int64_t n_kv  = dst->ne[0];
+    const int64_t n_tps = dst->ne[1];
+    const int64_t n_hd  = dst->ne[2];
+    const int64_t n_str = dst->ne[3];
+
+    const float * s = (const float *) sinks->data;
+
+    // rows (j-runs) of the result are split over the threads
+    const int64_t n_rows = n_tps*n_hd*n_str;
+    for (int64_t r = params->ith; r < n_rows; r += params->nth) {
+        const int64_t tp = r % n_tps;
+        const int64_t h  = (r / n_tps) % n_hd;
+        const int64_t st = r / (n_tps*n_hd);
+        const int64_t t  = st*n_tps + tp;
+
+        const int32_t * ir = (const int32_t *) ((const char *) idx->data + t*idx->nb[1]);
+        const char    * mr = (const char *) mask->data + tp*mask->nb[1] + st*mask->nb[3];
+        const char    * tr = (const char *) table->data + h*table->nb[1] + t*table->nb[2];
+        const float     sk = s[h + n_hd*t];
+        char          * dr = (char *) dst->data + tp*dst->nb[1] + h*dst->nb[2] + st*dst->nb[3];
+
+        for (int64_t j = 0; j < n_kv; ++j) {
+            const float m = mask->type == GGML_TYPE_F16 ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) mr)[j]) : ((const float *) mr)[j];
+            const float v = *(const float *) (tr + (int64_t) ir[j]*table->nb[0]) - sk + m;
+            if (dst->type == GGML_TYPE_F16) {
+                ((ggml_fp16_t *) dr)[j] = GGML_CPU_FP32_TO_FP16(v);
+            } else {
+                ((float *) dr)[j] = v;
+            }
+        }
+    }
+}
+
 // ggml_compute_forward_dsv4_hc_post
 
 static void ggml_compute_forward_dsv4_hc_post_f32(

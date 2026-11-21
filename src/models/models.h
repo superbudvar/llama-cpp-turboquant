@@ -1961,6 +1961,14 @@ struct llama_model_inkling2 : public llama_model_base {
 
         ggml_tensor * inp_out_ids = nullptr;
         ggml_tensor * tau         = nullptr; // log-scaled positions
+
+        // graph-build memos: the looped graph reuses the same stacks, norms and padded weights many times
+        ggml_tensor * stack(const std::vector<ggml_tensor *> & blocks, size_t n);
+        ggml_tensor * view_cont(ggml_tensor * view);
+        std::map<std::vector<ggml_tensor *>, ggml_tensor *> stacks;
+        std::map<ggml_tensor *, ggml_tensor *>              norms;
+        std::map<ggml_tensor *, ggml_tensor *>              pads;
+        ggml_tensor *                                       zero_sinks = nullptr;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

@@ -589,6 +589,8 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_TOP_K_MASK,
+        GGML_OP_INK_REL_BIAS,
 
         GGML_OP_UNARY,
 
@@ -2677,6 +2679,39 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // Inkling 2 per-head attention mask from a relative-position bias table:
+    //   table [n_rel, n_head, n_tokens] F32, sinks [n_head, n_tokens] F32 (any shape with that many elements),
+    //   idx [n_kv, n_tokens] I32, mask [n_kv, n_tokens/n_stream, 1, n_stream] F32 or F16
+    //   -> [n_kv, n_tokens/n_stream, n_head, n_stream] of type
+    //   result[j, t', h, s] = table[idx[j, t], h, t] - sinks[h, t] + mask[j, t', 0, s], with t = s*(n_tokens/n_stream) + t'
+    GGML_API struct ggml_tensor * ggml_ink_rel_bias(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * table,
+            struct ggml_tensor  * sinks,
+            struct ggml_tensor  * idx,
+            struct ggml_tensor  * mask,
+            enum ggml_type        type);
+
+    // top-k sparse attention mask: keep the mask cells of the live picks and the extra cells, set the rest to -inf
+    //
+    // mask:   [n_kv,    m1,  m2,  m3]  f16 or f32, broadcast to the rows of top_k
+    // top_k:  [n_top,   ne1, ne2, ne3] i32, picks of each row
+    // score:  [n_pick,  ne1, ne2, ne3] f32, can be NULL: a pick is live when its score is above -inf, else every pick is live
+    // blocks: [n_blk,   n_pick]        i32, can be NULL: the member cells of each pick, else a pick is a cell
+    // extra:  [n_extra, ne1, ne2, ne3] i32, can be NULL: cells of each row kept without a pick
+    // res:    [n_kv,    ne1, ne2, ne3] same type as mask
+    //
+    // res[c, i] = mask[c, i % m] when c is a cell of a live pick of row i or an extra cell of row i, else -inf
+    // picks and cells out of range are skipped
+    //
+    GGML_API struct ggml_tensor * ggml_top_k_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * top_k,
+            struct ggml_tensor  * score,
+            struct ggml_tensor  * blocks,
+            struct ggml_tensor  * extra);
 
     // custom operators
 
