@@ -3033,7 +3033,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("honor --fit-target as the explicit margin per device, "
             "ignoring the default 2 GiB context_reserve floor (use to reclaim headroom "
             "when actual KV cache + compute footprint is smaller than the conservative estimate, "
-            "default: %s)"),
+            "default: %s)", params.fit_params_no_context_reserve ? "true" : "false"),
         [](common_params & params) {
             params.fit_params_no_context_reserve = true;
         }
