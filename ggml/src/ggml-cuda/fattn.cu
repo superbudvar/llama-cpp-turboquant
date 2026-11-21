@@ -3354,6 +3354,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 #endif // GGML_USE_HIP
 
+    // Inkling 2 relative bias: only the vector and tile kernels compute it, both per head
+    if (dst->src[6]) {
+        if (!mask || mask->ne[2] != 1) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        const bool vec_ok = can_use_vector_kernel && Q->ne[1] <= 2 &&
+            (!ggml_is_quantized(K->type) || ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) != nullptr);
+        return vec_ok ? BEST_FATTN_KERNEL_VEC : BEST_FATTN_KERNEL_TILE;
+    }
+
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (can_use_vector_kernel) {

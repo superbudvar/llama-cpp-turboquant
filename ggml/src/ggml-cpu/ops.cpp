@@ -8519,6 +8519,19 @@ void ggml_compute_forward_top_k(
     }
 }
 
+// Inkling 2 relative bias (ggml_flash_attn_ext_set_rel_bias): the mask value for cell ic of token iq1 and head iq2,
+// rounded to F16 where the per-head mask held it
+static inline float ggml_fa_rel_bias_mask(const ggml_tensor * dst, ggml_fp16_t m, int64_t ic, int64_t iq1, int64_t iq2) {
+    const ggml_tensor * table = dst->src[6];
+    const int32_t extent = ggml_get_op_params_i32(dst, 5);
+    iq2 += ggml_get_op_params_i32(dst, 6);
+    const int32_t d = ((const int32_t *) dst->src[9]->data)[iq1] - ((const int32_t *) dst->src[8]->data)[ic];
+    const int64_t r = d >= 0 && d < extent ? d : extent;
+    const float   v = ((const float *) table->data)[r + table->ne[0]*(iq2 + table->ne[1]*iq1)]
+                    - ((const float *) dst->src[7]->data)[iq2 + table->ne[1]*iq1] + GGML_CPU_FP16_TO_FP32(m);
+    return GGML_CPU_FP16_TO_FP32(GGML_CPU_FP32_TO_FP16(v));
+}
+
 static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const ggml_compute_params * params,
         ggml_tensor * dst,
@@ -8643,8 +8656,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
+        const bool rel_bias = dst->src[6] != nullptr;
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
-            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+            const float mv = !mp ? 0.0f : slope*(rel_bias ? ggml_fa_rel_bias_mask(dst, mp[ic], ic, iq1, iq2) : GGML_CPU_FP16_TO_FP32(mp[ic]));
             if (mv == -INFINITY) {
                 continue;
             }
@@ -9542,7 +9556,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const auto has_to_float = [](const ggml_tensor * t) {
             return t->type == GGML_TYPE_F32 || ggml_get_type_traits(t->type)->to_float != nullptr;
         };
-        bool use_tiled = !use_ref &&
+        bool use_tiled = !use_ref && dst->src[6] == nullptr &&
                                (q->type == GGML_TYPE_F32 &&
                                 has_to_float(k) && has_to_float(v) &&
                                 neq1 >= Q_TILE_SZ);
@@ -11603,15 +11617,18 @@ void ggml_compute_forward_ink_rel_bias(
         const int64_t st = r / (n_tps*n_hd);
         const int64_t t  = st*n_tps + tp;
 
-        const int32_t * ir = (const int32_t *) ((const char *) idx->data + t*idx->nb[1]);
-        const char    * mr = (const char *) mask->data + tp*mask->nb[1] + st*mask->nb[3];
-        const char    * tr = (const char *) table->data + h*table->nb[1] + t*table->nb[2];
-        const float     sk = s[h + n_hd*t];
-        char          * dr = (char *) dst->data + tp*dst->nb[1] + h*dst->nb[2] + st*dst->nb[3];
+        const char * ir = (const char *) idx->data + t*idx->nb[1];
+        const char * mr = (const char *) mask->data + tp*mask->nb[1] + st*mask->nb[3];
+        const char * tr = (const char *) table->data + h*table->nb[1] + t*table->nb[2];
+        const float  sk = s[h + n_hd*t];
+        char       * dr = (char *) dst->data + tp*dst->nb[1] + h*dst->nb[2] + st*dst->nb[3];
 
+        const int64_t n_rel = table->ne[0];
         for (int64_t j = 0; j < n_kv; ++j) {
-            const float m = mask->type == GGML_TYPE_F16 ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) mr)[j]) : ((const float *) mr)[j];
-            const float v = *(const float *) (tr + (int64_t) ir[j]*table->nb[0]) - sk + m;
+            const char *  mj = mr + j*mask->nb[0];
+            const float   m  = mask->type == GGML_TYPE_F16 ? GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) mj) : *(const float *) mj;
+            const int64_t r  = std::min<int64_t>(std::max<int64_t>(*(const int32_t *) (ir + j*idx->nb[0]), 0), n_rel - 1);
+            const float   v  = *(const float *) (tr + r*table->nb[0]) - sk + m;
             if (dst->type == GGML_TYPE_F16) {
                 ((ggml_fp16_t *) dr)[j] = GGML_CPU_FP32_TO_FP16(v);
             } else {

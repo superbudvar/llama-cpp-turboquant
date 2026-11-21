@@ -284,6 +284,8 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
+    // position of each K/V cell of the ubatch's stream, -1 for an empty cell
+    void set_input_cell_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     bool has_cell_ext() const;
 
@@ -539,6 +541,8 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
+    // position of each K/V cell of the ubatch's stream, -1 for an empty cell
+    void set_input_cell_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
 
     void set_input_k_rot(ggml_tensor * dst) const;

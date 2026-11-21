@@ -119,6 +119,8 @@ class llm_graph_input_inkling2_pos : public llm_graph_input_i {
 public:
     const llama_kv_cache_context * cache[2];
     ggml_tensor * distance[2];
+    // the position of every cell, for the bias that flash attention computes itself
+    ggml_tensor * cell_pos[2];
     uint32_t extent[2];
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -137,6 +139,9 @@ public:
         for (int i = 0; i < 2; ++i) {
             if (distance[i]->buffer) {
                 cache[i]->set_input_relative_pos(distance[i], ubatch, extent[i]);
+            }
+            if (cell_pos[i]->buffer) {
+                cache[i]->set_input_cell_pos(cell_pos[i], ubatch);
             }
         }
     }
@@ -210,6 +215,7 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
     recr = inp->get_recr();
 
     auto * positions = build_inp_pos();
+    pos = positions;
     inp_out_ids = build_inp_out_ids();
 
     // the distances to the cached cells, the relative bias is gathered with them
@@ -221,6 +227,9 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
     for (int i = 0; i < 2; ++i) {
         distances[i] = rel->distance[i] = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, rel->cache[i]->get_n_kv(), n_tokens);
         ggml_set_input(distances[i]);
+
+        cell_pos[i] = rel->cell_pos[i] = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, rel->cache[i]->get_n_kv());
+        ggml_set_input(cell_pos[i]);
     }
     res->add_input(std::move(rel));
 
@@ -303,31 +312,36 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         r = ggml_mul(ctx0, r, tau);
     }
     auto * mask = swa ? attn->get_kq_mask_swa() : attn->get_kq_mask();
-    const int64_t streams = mask->ne[3];
-    const int64_t n_kv = distances[swa]->ne[0];
     auto * sinks = build_lora_mm(l.attn_sink_proj, inputs[0]);
-    // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x nh
+    // project r on the bias table: [n_rel, nh, n_tokens]
     auto * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, l.attn_rel_bias, 0, 1, 0, 0), r);
-    if (cparams.flash_attn) {
-        // exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))).
-        table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, nh, n_tokens));
-    } else {
-        // build_attn scales the bias along with QK; FA adds the mask after scaling QK.
-        table = ggml_scale(ctx0, table, sqrtf(hd));
-    }
-    table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
-    auto * bias = ggml_get_rows(ctx0, table, distances[swa]);
-    bias = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_4d(ctx0, bias, nh, n_kv, n_tokens/streams, streams), 2, 0, 1, 3));
+
+    // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))).
+    // the sink is folded into the bias, so the softmax sees a zero sink.
+    // with flash attention on one stream the kernel computes the bias from the table and the cell
+    // positions, so no per-head mask is built at all
+    ggml_tensor * kq_b = nullptr;
     ggml_tensor * fa_mask = nullptr;
-    if (cparams.flash_attn) {
-        fa_mask = ggml_cast(ctx0, ggml_add(ctx0, bias, ggml_cast(ctx0, mask, GGML_TYPE_F32)), GGML_TYPE_F16);
-        sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, nh), 0.0f);
-        bias = nullptr;
+    llm_graph_rel_bias fa_bias;
+    if (cparams.flash_attn && mask->ne[3] == 1 && mask->ne[2] == 1) {
+        fa_bias.table  = table;
+        fa_bias.sinks  = sinks;
+        fa_bias.kpos   = cell_pos[swa];
+        fa_bias.qpos   = pos;
+        fa_bias.extent = swa ? hparams.n_swa : hparams.n_relative_extent;
+        attn_rel_bias  = &fa_bias;
+        fa_mask = mask;
     } else {
-        sinks = ggml_reshape_4d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0,
-                ggml_reshape_3d(ctx0, sinks, nh, n_tokens/streams, streams), 1, 0, 2, 3)), 1, n_tokens/streams, nh, streams);
+        // one op writes the per-head mask, without the n_kv x n_tokens x nh F32 intermediates
+        fa_mask = ggml_ink_rel_bias(ctx0, table, sinks, distances[swa], mask,
+                cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32);
+        cb(fa_mask, "kq_b", il);
     }
-    cur = build_attn(attn, nullptr, nullptr, nullptr, q, k, v, bias, sinks, nullptr, 1.0f/sqrtf(hd), il, fa_mask);
+
+    sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, nh), 0.0f);
+
+    cur = build_attn(attn, nullptr, nullptr, nullptr, q, k, v, kq_b, sinks, nullptr, 1.0f/sqrtf(hd), il, fa_mask);
+    attn_rel_bias = nullptr;
     cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(l.wqkv_gate, inputs[0])));
     cur = convolve(build_lora_mm(l.wo, cur), l.attn_post_conv, nullptr, state, history, recr, 2*kv);
     // the first layer of each block starts a new residual stream, the earlier one joins the mixed blocks

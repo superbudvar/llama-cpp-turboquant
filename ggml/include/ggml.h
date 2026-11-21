@@ -2456,6 +2456,20 @@ extern "C" {
             struct ggml_tensor * a,
             int32_t              n_kv_max);
 
+    // Inkling 2 relative-position bias computed inside flash attention, in place of a per-head mask:
+    //   mask[j, t, h] = f16(table[r, h, t] - sinks[h, t] + mask[j, t]), r = d in [0, extent) ? d : extent, d = qpos[t] - kpos[j]
+    // table [n_rel > extent, n_head, n_tokens] F32, sinks [n_head, n_tokens] F32, kpos [n_kv] I32 (cell positions),
+    // qpos [n_tokens] I32; the mask must be shared by the heads and cover one stream.
+    // Q head h of the op reads table and sinks at head head0 + h, so an op over a subset of the heads shares them.
+    GGML_API void ggml_flash_attn_ext_set_rel_bias(
+            struct ggml_tensor * a,
+            struct ggml_tensor * table,
+            struct ggml_tensor * sinks,
+            struct ggml_tensor * kpos,
+            struct ggml_tensor * qpos,
+            int32_t              extent,
+            int32_t              head0);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
@@ -2685,6 +2699,7 @@ extern "C" {
     //   idx [n_kv, n_tokens] I32, mask [n_kv, n_tokens/n_stream, 1, n_stream] F32 or F16
     //   -> [n_kv, n_tokens/n_stream, n_head, n_stream] of type
     //   result[j, t', h, s] = table[idx[j, t], h, t] - sinks[h, t] + mask[j, t', 0, s], with t = s*(n_tokens/n_stream) + t'
+    //   idx and mask may be strided; indices are clamped to [0, n_rel)
     GGML_API struct ggml_tensor * ggml_ink_rel_bias(
             struct ggml_context * ctx,
             struct ggml_tensor  * table,

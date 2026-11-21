@@ -19,6 +19,28 @@
 // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
 
+// Inkling 2 relative-position bias computed in the kernel (ggml_flash_attn_ext_set_rel_bias); table == nullptr: off
+struct ggml_cuda_fattn_rel_bias {
+    const float   * table  = nullptr; // [n_rel, n_head, n_tokens]
+    const float   * sinks  = nullptr; // [n_head, n_tokens]
+    const int32_t * kpos   = nullptr; // [n_kv] cell positions
+    const int32_t * qpos   = nullptr; // [n_tokens] token positions
+    int32_t         n_rel  = 0;
+    int32_t         n_head = 0;      // heads of table and sinks
+    int32_t         extent = 0;
+    int32_t         head0  = 0;      // table head of the op's first Q head
+};
+
+// the mask value the per-head F16 mask held: f16(table[r, head, tok] - sinks[head, tok] + mask)
+static __device__ __forceinline__ float ggml_cuda_fattn_rel_bias_mask(
+        const ggml_cuda_fattn_rel_bias & rb, const half m, const int head_op, const int tok, const int kcol) {
+    const int   head = rb.head0 + head_op;
+    const int   d = rb.qpos[tok] - rb.kpos[kcol];
+    const int   r = d >= 0 && d < rb.extent ? d : rb.extent;
+    const float v = rb.table[r + rb.n_rel*(head + rb.n_head*tok)] - rb.sinks[head + rb.n_head*tok] + __half2float(m);
+    return __half2float(__float2half(v));
+}
+
 typedef void (* fattn_kernel_t)(
         const char * __restrict__ Q,
         const char * __restrict__ K,
@@ -40,7 +62,8 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int64_t nb32, const int64_t nb33);
+                            const int32_t nb31, const int64_t nb32, const int64_t nb33,
+                            const ggml_cuda_fattn_rel_bias rel_bias);
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -1813,7 +1836,22 @@ void launch_fattn(
     const uint3 ne01 = init_fastdiv_values(Q->ne[1]);
 
     GGML_ASSERT(block_dim.x % warp_size == 0);
-    fattn_kernel<<<blocks_num, block_dim, nbytes_shared, main_stream>>>(
+
+    ggml_cuda_fattn_rel_bias rel_bias;
+    if (KQV->src[6]) {
+        GGML_ASSERT(mask && mask->ne[2] == 1 && Q->ne[3] == 1);
+        rel_bias.table  = (const float   *) KQV->src[6]->data;
+        rel_bias.sinks  = (const float   *) KQV->src[7]->data;
+        rel_bias.kpos   = (const int32_t *) KQV->src[8]->data;
+        rel_bias.qpos   = (const int32_t *) KQV->src[9]->data;
+        rel_bias.n_rel  = KQV->src[6]->ne[0];
+        rel_bias.n_head = KQV->src[6]->ne[1];
+        rel_bias.extent = ggml_get_op_params_i32(KQV, 5);
+        rel_bias.head0  = ggml_get_op_params_i32(KQV, 6);
+    }
+
+    ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
+    ggml_cuda_kernel_launch(fattn_kernel, launch_params,
         (const char *) Q->data,
         K_data,
         V_data,
@@ -1827,7 +1865,8 @@ void launch_fattn(
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        rel_bias
     );
     CUDA_CHECK(cudaGetLastError());
 

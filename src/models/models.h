@@ -1959,8 +1959,12 @@ struct llama_model_inkling2 : public llama_model_base {
         // the distance of every query to the cached cells, the relative bias is gathered with them
         ggml_tensor * distances[2] = { nullptr, nullptr };
 
+        // the position of every cell, for the bias that flash attention computes itself
+        ggml_tensor * cell_pos[2] = { nullptr, nullptr };
+
         ggml_tensor * inp_out_ids = nullptr;
         ggml_tensor * tau         = nullptr; // log-scaled positions
+        ggml_tensor * pos         = nullptr; // token positions
 
         // graph-build memos: the looped graph reuses the same stacks, norms and padded weights many times
         ggml_tensor * stack(const std::vector<ggml_tensor *> & blocks, size_t n);

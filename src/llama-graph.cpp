@@ -2623,6 +2623,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     ggml_tensor * cur;
 
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr && (!sinks || ggml_is_vector(sinks));
+    GGML_ASSERT(use_flash_attn || attn_rel_bias == nullptr);
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
@@ -2639,27 +2640,60 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
 
-        cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
-                                  hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
-        res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
-
-        ggml_flash_attn_ext_add_sinks(cur, sinks);
-        GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
-        ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
-        ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
-
-        // TurboQuant: inverse WHT on FA output when V values are WHT-rotated.
-        // For MLA, V is a view of K with different ne[0] (e.g. V=512, K=576).
-        // Group size must come from K (which determines the WHT rotation), not V.
-        if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO5_0 || v->type == GGML_TYPE_TURBO6_0) {
-            const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO5_0 || k->type == GGML_TYPE_TURBO6_0);
-            const ggml_tensor * group_src = k_is_turbo ? k : v;
-            const int turbo_group = (group_src->ne[0] % 128 == 0) ? 128 : 64;
-            if (cur->ne[0] % turbo_group == 0) {
-                if (!ggml_is_contiguous(cur)) { cur = ggml_cont(ctx0, cur); }
-                ggml_tensor * innerq_scale = mctx ? mctx->get_turbo_innerq_scale_inv(il) : nullptr;
-                cur = ggml_turbo_wht(ctx0, cur, 1, turbo_group, innerq_scale);  // 1 = inverse
+        // with the relative bias, a long batch runs one flash attention per group of K/V heads: kernels that convert
+        // quantized K/V to F16 then hold one group's copy at a time (all heads: n_kv x n_embd_k_gqa x 4 bytes). The
+        // fewest groups whose copy stays within the budget, so short contexts keep a single op.
+        static const int64_t f16_budget = [] {
+            const char * env = getenv("LLAMA_INK_FA_F16_BUDGET_MB");
+            return (env ? atoll(env) : 512) * 1024 * 1024;
+        }();
+        const int64_t n_head_kv = k->ne[2];
+        int64_t n_groups = 1;
+        if (attn_rel_bias && q->ne[1] > 2 && q->ne[3] == 1 && q->ne[2] % n_head_kv == 0) {
+            const int64_t f16_bytes = k->ne[1]*(k->ne[0] + v->ne[0])*n_head_kv*2;
+            while (n_groups < n_head_kv && n_head_kv % (2*n_groups) == 0 && f16_bytes/n_groups > f16_budget) {
+                n_groups *= 2;
             }
+        }
+        const bool    per_kv_head = n_groups > 1;
+        const int64_t gqa         = q->ne[2] / n_groups;
+        const int64_t kv_per_grp  = n_head_kv / n_groups;
+
+        cur = nullptr;
+        for (int64_t g = 0; g < n_groups; ++g) {
+            ggml_tensor * qg = per_kv_head ? ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], gqa, 1, q->nb[1], q->nb[2], q->nb[3], g*gqa*q->nb[2]) : q;
+            ggml_tensor * kg = per_kv_head ? ggml_view_4d(ctx0, k, k->ne[0], k->ne[1], kv_per_grp, 1, k->nb[1], k->nb[2], k->nb[3], g*kv_per_grp*k->nb[2]) : k;
+            ggml_tensor * vg = per_kv_head ? ggml_view_4d(ctx0, v, v->ne[0], v->ne[1], kv_per_grp, 1, v->nb[1], v->nb[2], v->nb[3], g*kv_per_grp*v->nb[2]) : v;
+
+            ggml_tensor * fa = ggml_flash_attn_ext(ctx0, qg, kg, vg, kq_mask, kq_scale, hparams.f_max_alibi_bias,
+                                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+            res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, fa, il});
+
+            ggml_flash_attn_ext_add_sinks(fa, sinks && per_kv_head ? ggml_view_1d(ctx0, sinks, gqa, g*gqa*sinks->nb[0]) : sinks);
+            if (attn_rel_bias) {
+                ggml_flash_attn_ext_set_rel_bias(fa, attn_rel_bias->table, attn_rel_bias->sinks, attn_rel_bias->kpos,
+                        attn_rel_bias->qpos, attn_rel_bias->extent, (int32_t) (g*gqa));
+            }
+            GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
+            ggml_flash_attn_ext_set_n_kv_max(fa, static_cast<int32_t>(n_kv_max));
+            ggml_flash_attn_ext_set_prec (fa, GGML_PREC_F32);
+
+            // TurboQuant: inverse WHT on FA output when V values are WHT-rotated.
+            // For MLA, V is a view of K with different ne[0] (e.g. V=512, K=576).
+            // Group size must come from K (which determines the WHT rotation), not V.
+            if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO5_0 || v->type == GGML_TYPE_TURBO6_0) {
+                const bool k_is_turbo = (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO5_0 || k->type == GGML_TYPE_TURBO6_0);
+                const ggml_tensor * group_src = k_is_turbo ? k : v;
+                const int turbo_group = (group_src->ne[0] % 128 == 0) ? 128 : 64;
+                if (fa->ne[0] % turbo_group == 0) {
+                    if (!ggml_is_contiguous(fa)) { fa = ggml_cont(ctx0, fa); }
+                    ggml_tensor * innerq_scale = mctx ? mctx->get_turbo_innerq_scale_inv(il) : nullptr;
+                    fa = ggml_turbo_wht(ctx0, fa, 1, turbo_group, innerq_scale);  // 1 = inverse
+                }
+            }
+
+            // [n_embd_v, gqa, n_tokens, 1]: the heads of each group follow the previous ones
+            cur = cur ? ggml_concat(ctx0, cur, fa, 1) : fa;
         }
 
         if (v_mla) {

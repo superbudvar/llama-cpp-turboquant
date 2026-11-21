@@ -971,6 +971,11 @@ static void mul_mat_vec_q_switch_ncols_dst(
             use = false;
         }
 
+        // RDNA3 Q8_0/IQ4_NL single columns run 4 rows per block; small_k selects the 1-row variant for a row tail
+        if (table_id == MMVQ_PARAMETERS_RDNA3_0 && c_ncols_dst == 1 && (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL)) {
+            use = nrows_x % 4 != 0;
+        }
+
         return use;
     };
 
@@ -1225,37 +1230,25 @@ static void mul_mat_vec_q_switch_type(
 }
 
 // q8_1 copies of recently quantized single-column inputs, reused by later matmuls of the same input within one graph
-// evaluation (Inkling 2 feeds one normed input to up to six projections). The epoch moves at every graph compute, so a
-// copy never outlives the evaluation; a captured CUDA graph replays the same quantize-or-reuse sequence.
-struct ggml_cuda_mmvq_q8_cache {
-    static constexpr int     n_slots   = 4;
-    static constexpr int64_t max_ne10  = 8192;
-    static constexpr size_t  slot_size = max_ne10/QK8_1*sizeof(block_q8_1);
-
-    struct slot {
-        const ggml_tensor * t     = nullptr;
-        const void *        data  = nullptr;
-        int64_t             ne10  = 0;
-        uint64_t            epoch = 0;
-        uint64_t            used  = 0;
-    };
-
-    slot     slots[n_slots];
-    char *   buf   = nullptr;
-    uint64_t epoch = 1;
-    uint64_t tick  = 0;
-};
-
-static std::mutex ggml_cuda_mmvq_q8_mutex;
-static std::unordered_map<const ggml_backend_cuda_context *, ggml_cuda_mmvq_q8_cache> ggml_cuda_mmvq_q8_caches;
-
-static ggml_cuda_mmvq_q8_cache & ggml_cuda_mmvq_q8_get(const ggml_backend_cuda_context * ctx) {
-    std::lock_guard<std::mutex> lock(ggml_cuda_mmvq_q8_mutex);
-    return ggml_cuda_mmvq_q8_caches[ctx];
+// evaluation (Inkling 2 feeds one normed input to up to six projections). The cache lives in the backend context:
+// every graph compute starts a new epoch, every node that writes memory overlapping a cached source drops that copy
+// (see ggml_cuda_mmvq_q8_cache_invalidate), and the cache is bypassed while concurrent streams are in use.
+void ggml_cuda_mmvq_q8_cache_new_graph(ggml_backend_cuda_context & ctx) {
+    ctx.q8_cache.epoch++;
 }
 
-void ggml_cuda_mmvq_q8_cache_new_graph(ggml_backend_cuda_context & ctx) {
-    ggml_cuda_mmvq_q8_get(&ctx).epoch++;
+void ggml_cuda_mmvq_q8_cache_invalidate(ggml_backend_cuda_context & ctx, const ggml_tensor * written) {
+    auto & cache = ctx.q8_cache;
+    if (!written->data || !cache.buf) {
+        return;
+    }
+    const char * w0 = (const char *) written->data;
+    const char * w1 = w0 + ggml_nbytes(written);
+    for (auto & sl : cache.slots) {
+        if (sl.epoch == cache.epoch && (const char *) sl.data < w1 && w0 < (const char *) sl.data + sl.nbytes) {
+            sl.epoch = 0;
+        }
+    }
 }
 
 static bool ggml_cuda_mmvq_q8_cache_enabled() {
