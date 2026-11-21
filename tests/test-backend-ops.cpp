@@ -4398,6 +4398,158 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
 };
 
 
+// GGML_OP_INK_REL_BIAS
+struct test_ink_rel_bias : public test_case {
+    const ggml_type type_mask;
+    const ggml_type type_dst;
+    const int64_t   n_rel;
+    const int64_t   n_head;
+    const int64_t   n_kv;
+    const int64_t   n_tokens;
+    const int64_t   n_stream;
+
+    std::string vars() override {
+        return VARS_TO_STR7(type_mask, type_dst, n_rel, n_head, n_kv, n_tokens, n_stream);
+    }
+
+    test_ink_rel_bias(ggml_type type_mask = GGML_TYPE_F16, ggml_type type_dst = GGML_TYPE_F16, int64_t n_rel = 1025,
+            int64_t n_head = 24, int64_t n_kv = 256, int64_t n_tokens = 4, int64_t n_stream = 1)
+        : type_mask(type_mask), type_dst(type_dst), n_rel(n_rel), n_head(n_head), n_kv(n_kv), n_tokens(n_tokens), n_stream(n_stream) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * table = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_rel, n_head, n_tokens);
+        ggml_tensor * sinks = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_head, n_tokens);
+        ggml_tensor * idx   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, n_tokens);
+        ggml_tensor * mask  = ggml_new_tensor_4d(ctx, type_mask, n_kv, n_tokens/n_stream, 1, n_stream);
+        ggml_tensor * out   = ggml_ink_rel_bias(ctx, table, sinks, idx, mask, type_dst);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); i++) {
+                    data[i] = rand() % n_rel;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// Inkling 2 graph patterns that the CUDA backend fuses; built with the same ggml calls as src/models/inkling2.cpp
+struct test_ink_pattern : public test_case {
+    const std::string pattern;
+    const int64_t     n_tokens;
+    const int64_t     k;  // stacked blocks (mix), queries (mix) or heads (clip)
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "INK_" + pattern;
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(pattern, n_tokens, k);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_ink_pattern(std::string pattern = "clip", int64_t n_tokens = 1, int64_t k = 1)
+        : pattern(std::move(pattern)), n_tokens(n_tokens), k(k) {}
+
+    ggml_tensor * clip(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * scale, float threshold) {
+        if (scale) {
+            cur = ggml_mul(ctx, cur, scale);
+        }
+        ggml_tensor * norm = ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, cur)));
+        norm = ggml_scale_bias(ctx, norm, 1.0f, 1e-6f);
+        ggml_tensor * factor = ggml_div(ctx, ggml_fill(ctx, norm, threshold), norm);
+        return ggml_mul(ctx, cur, ggml_clamp(ctx, factor, 0.0f, 1.0f));
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t E = 256;
+        ggml_tensor * out = nullptr;
+        if (pattern == "clip" || pattern == "clip_scaled") {
+            ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, k, n_tokens);
+            ggml_tensor * scale = pattern == "clip_scaled" ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, k) : nullptr;
+            out = clip(ctx, ggml_scale(ctx, x, 4.0f), scale, 3.0f);
+        } else if (pattern == "situ") {
+            ggml_tensor * gu = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*E, 8, n_tokens);
+            ggml_tensor * g  = ggml_view_3d(ctx, gu, E, 8, n_tokens, gu->nb[1], gu->nb[2], 0);
+            ggml_tensor * u  = ggml_view_3d(ctx, gu, E, 8, n_tokens, gu->nb[1], gu->nb[2], E*ggml_element_size(gu));
+            const float beta = 4.0f, lb = 25.0f;
+            ggml_tensor * act = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, g, 1.0f/beta)), beta);
+            act = ggml_mul(ctx, act, ggml_sigmoid(ctx, g));
+            u = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, u, 1.0f/lb)), lb);
+            out = ggml_mul(ctx, act, u);
+        } else if (pattern == "ctrl") {
+            ggml_tensor * cur  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, n_tokens);
+            ggml_tensor * msg  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, n_tokens);
+            ggml_tensor * down = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*E, 16);
+            ggml_tensor * wg   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 16, E);
+            ggml_tensor * wf   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 16, E);
+            ggml_tensor * gate = ggml_concat(ctx, ggml_rms_norm(ctx, cur, 1e-6f), ggml_rms_norm(ctx, msg, 1e-6f), 0);
+            gate = ggml_mul_mat(ctx, down, gate);
+            ggml_tensor * gain   = ggml_tanh(ctx, ggml_mul_mat(ctx, wg, gate));
+            ggml_tensor * forget = ggml_tanh(ctx, ggml_mul_mat(ctx, wf, gate));
+            out = ggml_add(ctx, ggml_sub(ctx, cur, ggml_mul(ctx, forget, cur)), ggml_mul(ctx, gain, msg));
+        } else if (pattern == "mix") {
+            // k blocks stacked one by one, then mixed with cur by 3 queries
+            ggml_tensor * stack = nullptr;
+            for (int64_t b = 0; b < k; ++b) {
+                ggml_tensor * blk = ggml_reshape_3d(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, n_tokens), E, 1, n_tokens);
+                stack = stack ? ggml_concat(ctx, stack, blk, 1) : blk;
+            }
+            ggml_tensor * cur    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, n_tokens);
+            ggml_tensor * query  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, 3);
+            ggml_tensor * states = ggml_reshape_3d(ctx, cur, E, 1, n_tokens);
+            if (stack) {
+                states = ggml_concat(ctx, stack, states, 1);
+            }
+            states = ggml_rms_norm(ctx, states, 1e-6f);
+            ggml_tensor * queries = ggml_repeat(ctx, query, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, E, query->ne[1], n_tokens));
+            ggml_tensor * scores  = ggml_soft_max_ext(ctx, ggml_mul_mat(ctx, states, queries), nullptr, 1.0f/sqrtf(E), 0.0f);
+            out = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, states)), scores);
+        } else if (pattern == "conv" || pattern == "dconv") {
+            // the convolve() graph with its state store, for one sequence
+            const int64_t n_conv = 4, C = E, n_heads = 8;
+            ggml_tensor * hist  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_conv - 1, C);
+            ggml_tensor * state = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (n_conv - 1)*C);
+            ggml_tensor * w     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_conv, C);
+            ggml_tensor * in    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, n_tokens);
+            ggml_tensor * wcur  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, C);
+            ggml_tensor * cur   = ggml_mul_mat(ctx, wcur, in);
+            ggml_tensor * past  = ggml_view_3d(ctx, hist, n_conv - 1, C, 1, hist->nb[1], hist->nb[1]*C, 0);
+            ggml_tensor * x     = ggml_transpose(ctx, ggml_reshape_3d(ctx, cur, C, n_tokens, 1));
+            x = ggml_concat(ctx, past, x, 0);
+            ggml_tensor * last = ggml_view_3d(ctx, x, n_conv - 1, C, 1, x->nb[1], x->nb[2], n_tokens*ggml_element_size(x));
+            ggml_tensor * store = ggml_cpy(ctx, last, ggml_view_1d(ctx, state, (n_conv - 1)*C, 0));
+            ggml_tensor * co = ggml_reshape_2d(ctx, ggml_ssm_conv(ctx, x, w), C, n_tokens);
+            if (pattern == "dconv") {
+                ggml_tensor * wd  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, E, n_conv*n_heads);
+                ggml_tensor * dyn = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, wd, in), n_conv, n_heads, n_tokens);
+                for (int64_t lag = 0; lag < n_conv; ++lag) {
+                    ggml_tensor * tap = ggml_view_3d(ctx, dyn, 1, n_heads, n_tokens, dyn->nb[1], dyn->nb[2], lag*dyn->nb[0]);
+                    ggml_tensor * win = ggml_view_3d(ctx, x, n_tokens, C, 1, x->nb[1], x->nb[2], (n_conv - 1 - lag)*x->nb[0]);
+                    win = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_transpose(ctx, win)), C/n_heads, n_heads, n_tokens);
+                    co = ggml_add(ctx, co, ggml_reshape_2d(ctx, ggml_mul(ctx, win, tap), C, n_tokens));
+                }
+            }
+            // the state store is visited first, right after the concat, as in the model graph
+            ggml_tensor * keep = ggml_scale(ctx, ggml_sum(ctx, store), 0.0f);
+            ggml_tensor * main_out = ggml_scale(ctx, ggml_add(ctx, cur, co), 0.3f);
+            out = ggml_add(ctx, ggml_repeat(ctx, keep, main_out), main_out);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
@@ -9023,6 +9175,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre(128, 257));
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 21));
 
+    for (ggml_type tm : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
+        for (ggml_type td : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
+            test_cases.emplace_back(new test_ink_rel_bias(tm, td));
+        }
+    }
+    test_cases.emplace_back(new test_ink_rel_bias(GGML_TYPE_F16, GGML_TYPE_F16, 1025, 24, 1280, 1));
+    test_cases.emplace_back(new test_ink_rel_bias(GGML_TYPE_F16, GGML_TYPE_F16, 1025, 24, 512, 8, 2));
+    for (int64_t t : { 1, 5 }) {
+        test_cases.emplace_back(new test_ink_pattern("clip", t, 8));
+        test_cases.emplace_back(new test_ink_pattern("clip_scaled", t, 24));
+        test_cases.emplace_back(new test_ink_pattern("situ", t));
+        test_cases.emplace_back(new test_ink_pattern("ctrl", t));
+        test_cases.emplace_back(new test_ink_pattern("mix", t, 0));
+        test_cases.emplace_back(new test_ink_pattern("mix", t, 1));
+        test_cases.emplace_back(new test_ink_pattern("mix", t, 7));
+        test_cases.emplace_back(new test_ink_pattern("conv", t));
+        test_cases.emplace_back(new test_ink_pattern("dconv", t));
+    }
     test_cases.emplace_back(new test_dsv4_hc_post(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17));
     test_cases.emplace_back(new test_dsv4_hc_post(128, 257));
