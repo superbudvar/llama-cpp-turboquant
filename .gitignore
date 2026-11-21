@@ -165,6 +165,7 @@ AGENTS.local.md
 *.db
 .beads-credential-key
 .beads/proxieddb/
+.beads.gate.lock
 
 # Agent runtime state and fit probe artifacts
 .agents/
