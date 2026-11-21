@@ -431,6 +431,7 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_TOP_K_MASK,
+        GGML_OP_INK_REL_BIAS,
 
         GGML_OP_UNARY,
 
@@ -2553,6 +2554,19 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // Inkling 2 per-head attention mask from a relative-position bias table:
+    //   table [n_rel, n_head, n_tokens] F32, sinks [n_head, n_tokens] F32 (any shape with that many elements),
+    //   idx [n_kv, n_tokens] I32, mask [n_kv, n_tokens/n_stream, 1, n_stream] F32 or F16
+    //   -> [n_kv, n_tokens/n_stream, n_head, n_stream] of type
+    //   result[j, t', h, s] = table[idx[j, t], h, t] - sinks[h, t] + mask[j, t', 0, s], with t = s*(n_tokens/n_stream) + t'
+    GGML_API struct ggml_tensor * ggml_ink_rel_bias(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * table,
+            struct ggml_tensor  * sinks,
+            struct ggml_tensor  * idx,
+            struct ggml_tensor  * mask,
+            enum ggml_type        type);
 
     // top-k sparse attention mask: keep the mask cells of the live picks and the extra cells, set the rest to -inf
     //

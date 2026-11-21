@@ -7,6 +7,34 @@
 #include <cstdint>
 #include <type_traits>
 #include <limits>
+#include <mutex>
+#include <unordered_map>
+#include <type_traits>
+
+// only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
+// has little exposed latency left to hide and the extra requests cost more than they save.
+// For perf data, see https://github.com/ggml-org/llama.cpp/pull/26705#issuecomment-5569335031
+#if __CUDA_ARCH__ == GGML_CUDA_CC_GB10
+// returns true only for those quants that benefit from prefetch and false otherwise
+static constexpr __host__ __device__ bool mmvq_should_prefetch(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS:
+            return true;
+        default:
+            return false;
+    }
+}
+#endif
 
 // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
 // has little exposed latency left to hide and the extra requests cost more than they save.
@@ -545,12 +573,13 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 case GGML_TYPE_Q4_1:
                 case GGML_TYPE_Q5_0:
                 case GGML_TYPE_Q5_1:
-                case GGML_TYPE_Q8_0:
                     return 8;
+                case GGML_TYPE_Q8_0:
+                    return 2; // with 4 rows per block, see calc_rows_per_block
                 case GGML_TYPE_Q6_K:
                     return 2;
                 case GGML_TYPE_IQ4_NL:
-                    return 8;
+                    return 1; // with 4 rows per block
                 default:
                     return 1;
             }
@@ -1565,6 +1594,45 @@ static void mul_mat_vec_q_switch_type(
         default:
             GGML_ABORT("fatal error");
     }
+}
+
+// q8_1 copies of recently quantized single-column inputs, reused by later matmuls of the same input within one graph
+// evaluation (Inkling 2 feeds one normed input to up to six projections). The epoch moves at every graph compute, so a
+// copy never outlives the evaluation; a captured CUDA graph replays the same quantize-or-reuse sequence.
+struct ggml_cuda_mmvq_q8_cache {
+    static constexpr int     n_slots   = 4;
+    static constexpr int64_t max_ne10  = 8192;
+    static constexpr size_t  slot_size = max_ne10/QK8_1*sizeof(block_q8_1);
+
+    struct slot {
+        const ggml_tensor * t     = nullptr;
+        const void *        data  = nullptr;
+        int64_t             ne10  = 0;
+        uint64_t            epoch = 0;
+        uint64_t            used  = 0;
+    };
+
+    slot     slots[n_slots];
+    char *   buf   = nullptr;
+    uint64_t epoch = 1;
+    uint64_t tick  = 0;
+};
+
+static std::mutex ggml_cuda_mmvq_q8_mutex;
+static std::unordered_map<const ggml_backend_cuda_context *, ggml_cuda_mmvq_q8_cache> ggml_cuda_mmvq_q8_caches;
+
+static ggml_cuda_mmvq_q8_cache & ggml_cuda_mmvq_q8_get(const ggml_backend_cuda_context * ctx) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_mmvq_q8_mutex);
+    return ggml_cuda_mmvq_q8_caches[ctx];
+}
+
+void ggml_cuda_mmvq_q8_cache_new_graph(ggml_backend_cuda_context & ctx) {
+    ggml_cuda_mmvq_q8_get(&ctx).epoch++;
+}
+
+static bool ggml_cuda_mmvq_q8_cache_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_NO_Q8_CACHE") == nullptr;
+    return enabled;
 }
 
 void ggml_cuda_mul_mat_vec_q(

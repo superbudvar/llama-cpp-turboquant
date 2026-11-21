@@ -13,6 +13,8 @@ struct topk_moe_config {
     bool delayed_softmax;
     int  n_groups;
     int  n_group_used;
+    float norm_mul; // wt_sum = max(wt_sum*norm_mul + norm_add, clamp_val)
+    float norm_add;
 };
 
 // Warp-local softmax used for both the pre-top-k logits and the post-top-k delayed path.
@@ -334,7 +336,7 @@ __global__ void topk_moe_cuda(const float *         logits,
 
     if (config.with_norm) {
         wt_sum              = warp_reduce_sum<warp_size>(wt_sum);
-        wt_sum              = max(wt_sum, clamp_val);
+        wt_sum              = max(wt_sum*config.norm_mul + config.norm_add, clamp_val);
         const float inv_sum = 1.0f / wt_sum;
 
         for (int i = 0; i < experts_per_thread; i++) {
@@ -463,7 +465,12 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
     const bool with_norm = clamp != nullptr;
 
     float clamp_val = -INFINITY;
-    if (clamp) {
+    float norm_mul  = 1.0f;
+    float norm_add  = 0.0f;
+    if (clamp && clamp->op == GGML_OP_SCALE) {
+        norm_mul = ggml_get_op_params_f32(clamp, 0);
+        norm_add = ggml_get_op_params_f32(clamp, 1);
+    } else if (clamp) {
         clamp_val = ggml_get_op_params_f32(clamp, 0);
     }
 
@@ -474,6 +481,8 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
     config.delayed_softmax   = args.delayed_softmax;
     config.n_groups          = args.n_groups;
     config.n_group_used      = args.n_group_used;
+    config.norm_mul          = norm_mul;
+    config.norm_add          = norm_add;
 
     if (bias) {
         launch_topk_moe_cuda<true>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used, clamp_val,
