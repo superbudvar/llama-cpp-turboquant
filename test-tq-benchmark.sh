@@ -14,7 +14,7 @@
 set -euo pipefail
 
 # === CONFIG ===
-BUILD="$HOME/projects/projects2/llamacpp/llama-cpp-turboquant/build"
+BUILD="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/build"
 BIN="$BUILD/bin"
 SERVER="$BIN/llama-server"
 QUANT="$BIN/llama-quantize"
