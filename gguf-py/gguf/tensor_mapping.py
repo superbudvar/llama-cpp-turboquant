@@ -408,9 +408,6 @@ class TensorNameMap:
             "model.layers.{bid}.attn.gate_attn",         # inkling2
         ),
 
-        MODEL_TENSOR.ATTN_VRES_LAMBDA: (
-            "model.layers.{bid}.self_attn.value_res_lambda",  # ricursive
-        ),
 
         MODEL_TENSOR.ATTN_REL: (
             "model.layers.{bid}.self_attn.r_proj",  # inkling2
@@ -785,86 +782,11 @@ class TensorNameMap:
             "model.attn_res.mlp_queries.{bid}",    # inkling2
         ),
 
-        MODEL_TENSOR.STREAM_EMBD: (
-            "stream_embeddings",  # metis16
-        ),
-        MODEL_TENSOR.DEPTH_MEM_STATE_WRITE: (
-            "depth_memory.state_write",  # metis16
-        ),
-        MODEL_TENSOR.DEPTH_MEM_META_WRITE: (
-            "depth_memory.metadata_write",  # metis16
-        ),
-        MODEL_TENSOR.DEPTH_MEM_QUERY: (
-            "depth_memory.query",  # metis16
-        ),
-        MODEL_TENSOR.DEPTH_MEM_KEY: (
-            "depth_memory.key",  # metis16
-        ),
-        MODEL_TENSOR.DEPTH_MEM_VALUE: (
-            "depth_memory.value",  # metis16
-        ),
-        MODEL_TENSOR.DEPTH_MEM_OUT: (
-            "depth_memory.output",  # metis16
-        ),
-        MODEL_TENSOR.DEPTH_MEM_ROUTE_STATE: (
-            "depth_memory.route_state",  # metis16
-        ),
-        MODEL_TENSOR.DEPTH_MEM_ROUTE_RETR: (
-            "depth_memory.route_retr",  # metis16
-        ),
-        MODEL_TENSOR.DEPTH_MEM_ROUTE_DIFF: (
-            "depth_memory.route_diff",  # metis16
-        ),
-        MODEL_TENSOR.DEPTH_MEM_ROUTE_HIST: (
-            "depth_memory.route_hist",  # metis16
-        ),
-        MODEL_TENSOR.DEPTH_MEM_ROUTE: (
-            "depth_memory.route_projection",  # metis16
-        ),
-        MODEL_TENSOR.DEPTH_MEM_STREAM_GATE: (
-            "depth_memory.stream_gate",  # metis16
-        ),
-        MODEL_TENSOR.CONT_HIDDEN_STATE: (
-            "continuation.hidden_state",  # metis16
-        ),
-        MODEL_TENSOR.CONT_HIDDEN_RETR: (
-            "continuation.hidden_retr",  # metis16
-        ),
-        MODEL_TENSOR.CONT_HIDDEN_DIFF: (
-            "continuation.hidden_diff",  # metis16
-        ),
-        MODEL_TENSOR.CONT_HIDDEN_ROUTE: (
-            "continuation.hidden_route",  # metis16
-        ),
-        MODEL_TENSOR.CONT_HIDDEN: (
-            "continuation.hidden",  # metis16
-        ),
-        MODEL_TENSOR.CONT_OUTPUT: (
-            "continuation.output",  # metis16
-        ),
-        MODEL_TENSOR.ATTN_PASS_LORA_DOWN: (
-            "layers.{bid}.mixer.pass_lora_down",  # metis16
-        ),
-        MODEL_TENSOR.ATTN_PASS_LORA_UP: (
-            "layers.{bid}.mixer.pass_lora_up",  # metis16
-        ),
-        MODEL_TENSOR.ATTN_PASS_GATE: (
-            "layers.{bid}.mixer.pass_gates",  # metis16
-        ),
-        MODEL_TENSOR.FFN_EXP_EMBD: (
-            "layers.{bid}.moe.expert_embeddings",  # metis16
-        ),
 
 
 
 
-        MODEL_TENSOR.FFN_PRE_EXP_NORM: (
-            "model.layers.{bid}.mlp.pre_expert_norm",                      # muse-spark
-        ),
 
-        MODEL_TENSOR.FFN_POST_EXP_NORM: (
-            "model.layers.{bid}.mlp.experts.post_expert_norm",             # muse-spark
-        ),
 
         # Feed-forward down
         MODEL_TENSOR.FFN_DOWN: (
@@ -1760,10 +1682,6 @@ class TensorNameMap:
             "model.vision_embedder.patch_ln{bid}", # gemma4 unified
         ),
 
-        MODEL_TENSOR.V_ENC_EMBD_CLS_POS: (
-            "model.vision_tower.embeddings.cls_position_embedding", # inkling2
-            "model.visual.backbone.embeddings.cls_position_embedding", # inkling2
-        ),
 
         MODEL_TENSOR.V_ENC_EMBD_POS: (
             "model.vision_tower.vision_model.embeddings.position_embedding", # Granite4Vision
