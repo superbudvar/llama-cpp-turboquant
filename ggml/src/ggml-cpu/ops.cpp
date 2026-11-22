@@ -9951,7 +9951,8 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         (k->type == GGML_TYPE_F32 || ggml_get_type_traits(k->type)->to_float != nullptr) &&
         (v->type == GGML_TYPE_F32 || ggml_get_type_traits(v->type)->to_float != nullptr);
     const bool kv_is_quantized = ggml_is_quantized(k->type) || ggml_is_quantized(v->type);
-    bool use_grouped = !use_ref && q->type == GGML_TYPE_F32 && kv_is_quantized && kv_has_to_float &&
+    // the grouped path does not apply the relative bias, the per-row path does
+    bool use_grouped = !use_ref && dst->src[6] == nullptr && q->type == GGML_TYPE_F32 && kv_is_quantized && kv_has_to_float &&
                        neq3 == 1 && nek3 == 1 && nev3 == 1 && nek2 == nev2 && neq2 % nek2 == 0 &&
                        gqa_rows >= 2 && gqa_rows <= (int64_t) ggml_fa_tile_config::Q && DV >= (int64_t) ggml_fa_tile_config::Q &&
                        neq1 < (int64_t) ggml_fa_tile_config::Q;

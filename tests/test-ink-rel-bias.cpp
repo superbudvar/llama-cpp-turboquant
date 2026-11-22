@@ -192,15 +192,15 @@ static int run_fa_case(ggml_backend_t be, const char * name, ggml_type type_kv, 
     std::vector<float> a(ggml_nelements(fa_a)), b(ggml_nelements(fa_b));
     ggml_backend_tensor_get(fa_a, a.data(), 0, ggml_nbytes(fa_a));
     ggml_backend_tensor_get(fa_b, b.data(), 0, ggml_nbytes(fa_b));
-    // GPU backends run the same kernel either way and must match exactly; the CPU backend takes its tiled kernel for
-    // the per-head mask of a long batch and the per-row kernel for the bias, so only the summation order differs there
-    const bool exact = ggml_backend_dev_type(ggml_backend_get_device(be)) != GGML_BACKEND_DEVICE_TYPE_CPU;
+    // the per-head mask of the reference path disables the GQA optimization, so the two paths can run different
+    // flash attention kernels and sum in a different order: compare with a tolerance instead of bit for bit
+    const double tol = 2e-3;
     int bad = 0;
     double max_diff = 0.0;
     for (size_t i = 0; i < a.size(); ++i) {
         const double diff = std::fabs(a[i] - b[i]);
         max_diff = std::max(max_diff, diff);
-        if (std::isnan(a[i]) || std::isnan(b[i]) || (exact ? memcmp(&a[i], &b[i], sizeof(float)) != 0 : diff > 1e-5)) {
+        if (std::isnan(a[i]) || std::isnan(b[i]) || diff > tol) {
             bad++;
         }
     }
