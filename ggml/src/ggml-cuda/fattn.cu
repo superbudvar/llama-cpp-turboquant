@@ -3177,7 +3177,7 @@ static bool ggml_cuda_fattn_turbo56_pair_supported(ggml_type k, ggml_type v) {
 #endif // GGML_CUDA_FA_ALL_QUANTS
 }
 
-static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
+static best_fattn_kernel ggml_cuda_get_best_fattn_kernel_impl(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
     return BEST_FATTN_KERNEL_NONE;
@@ -3354,15 +3354,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 #endif // GGML_USE_HIP
 
-    // Inkling 2 relative bias: only the vector and tile kernels compute it, both per head
-    if (dst->src[6]) {
-        if (!mask || mask->ne[2] != 1) {
-            return BEST_FATTN_KERNEL_NONE;
-        }
-        const bool vec_ok = can_use_vector_kernel && Q->ne[1] <= 2 &&
-            (!ggml_is_quantized(K->type) || ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) != nullptr);
-        return vec_ok ? BEST_FATTN_KERNEL_VEC : BEST_FATTN_KERNEL_TILE;
-    }
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
@@ -3464,6 +3455,24 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         }
     }
     return BEST_FATTN_KERNEL_TILE;
+}
+
+// The Inkling 2 relative bias is computed by the vector and the tile kernels, both per head.
+// The tile kernel dequantizes K/V into shared memory and handles every type, the vector kernel
+// needs an instantiation for the head size and the types, which the dispatch above checks.
+static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
+    if (dst->src[6]) {
+        const ggml_tensor * mask = dst->src[3];
+        if (!mask || mask->ne[2] != 1) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel_impl(device, dst);
+        if (kernel == BEST_FATTN_KERNEL_VEC || kernel == BEST_FATTN_KERNEL_TILE) {
+            return kernel;
+        }
+        return BEST_FATTN_KERNEL_TILE;
+    }
+    return ggml_cuda_get_best_fattn_kernel_impl(device, dst);
 }
 
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
