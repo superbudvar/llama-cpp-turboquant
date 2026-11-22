@@ -61,7 +61,13 @@ void llama_model_inkling2_loop::load_arch_tensors(llama_model_loader & ml) {
         }
     }
 
+}
+
+void llama_model_inkling2_loop::post_arch_tensors(llama_model_loader &) {
     // share the physical weights, each cache slot keeps its own KV and conv state
+    // this runs after the generic pass that attaches the .scale tensors, so the shared
+    // slots carry them: the later passes through the core would otherwise run the
+    // NVFP4 experts without their per-expert scales
     for (int il = n_phys; il < (int) hparams.n_layer(); ++il) {
         layers[il] = layers[layer_phys(il)];
     }

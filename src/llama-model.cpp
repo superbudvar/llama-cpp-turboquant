@@ -1688,6 +1688,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
     }
+
+    // the generic pass attached the .scale tensors, the model can now share layers
+    post_arch_tensors(ml);
+
     ml.done_getting_tensors();
 
     // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.

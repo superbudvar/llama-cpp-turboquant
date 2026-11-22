@@ -882,6 +882,20 @@ void ggml_cuda_flash_attn_ext_vec_partial_case_impl(
     const dim3 blocks(Q->ne[1], nparts, Q->ne[2]*Q->ne[3]);
     const dim3 threads(WARP_SIZE, nwarps, 1);
     const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
+
+    ggml_cuda_fattn_rel_bias rel_bias;
+    if (dst->src[6]) {
+        GGML_ASSERT(mask && mask->ne[2] == 1 && Q->ne[3] == 1);
+        rel_bias.table  = (const float   *) dst->src[6]->data;
+        rel_bias.sinks  = (const float   *) dst->src[7]->data;
+        rel_bias.kpos   = (const int32_t *) dst->src[8]->data;
+        rel_bias.qpos   = (const int32_t *) dst->src[9]->data;
+        rel_bias.n_rel  = dst->src[6]->ne[0];
+        rel_bias.n_head = dst->src[6]->ne[1];
+        rel_bias.extent = ggml_get_op_params_i32(dst, 5);
+        rel_bias.head0  = ggml_get_op_params_i32(dst, 6);
+    }
+
     ggml_cuda_kernel_launch(kernel, launch_params,
         (const char *) Q->data,
         (const char *) K->data,
@@ -896,7 +910,8 @@ void ggml_cuda_flash_attn_ext_vec_partial_case_impl(
         K->ne[0], K->ne[1], K->ne[2], K->ne[3], K->nb[1], K->nb[2], K->nb[3],
         V->nb[1], V->nb[2], V->nb[3],
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0);
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        rel_bias);
     CUDA_CHECK(cudaGetLastError());
 }
 
