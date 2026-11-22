@@ -630,9 +630,6 @@ struct llama_model {
     struct ggml_tensor * output_b        = nullptr;
     struct ggml_tensor * output_norm_enc = nullptr;
 
-    // kimi-k3 final cross-layer residual mix
-    struct ggml_tensor * output_res_score = nullptr;
-
     // NVFP4 per-tensor scale2, input_scale for LM head
     struct ggml_tensor * output_s    = nullptr;
     struct ggml_tensor * output_in_s = nullptr;

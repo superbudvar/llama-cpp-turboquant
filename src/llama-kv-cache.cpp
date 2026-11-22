@@ -2623,65 +2623,6 @@ void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatc
     ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
 }
 
-void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
-    const uint32_t n_tokens = ubatch.n_tokens;
-
-    res.clear();
-    res.resize(n_tokens*n, LLAMA_TOKEN_NULL);
-
-    if (n == 0) {
-        return;
-    }
-
-    // note: apply_ubatch() has already stored the current ubatch, so the cells cover the tokens
-    //       of this very ubatch as well, which is what we want
-    // the nearest cell at or before a position also resolves M-RoPE gaps, where multiple tokens
-    // share the same temporal pos
-
-    // an embd (multimodal) ubatch can repeat one position for a whole image, so positions
-    // do not encode the token order; resolve its predecessors by ubatch order instead
-    // same for a mixed ubatch
-    const bool by_order = !ubatch.token || ubatch.is_mixed();
-
-    std::vector<uint32_t> ord; // index among the ubatch tokens of the same seq
-    std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idx;
-
-    if (by_order) {
-        ord.resize(n_tokens);
-        for (uint32_t i = 0; i < n_tokens; ++i) {
-            auto & v = seq_idx[ubatch.seq_id[i][0]];
-            ord[i] = v.size();
-            v.push_back(i);
-        }
-    }
-
-    for (uint32_t i = 0; i < n_tokens; ++i) {
-        // TODO: a token that belongs to more than one sequence has an ambiguous history.
-        //       the n-gram architectures have to reject such batches
-        const llama_seq_id seq_id = ubatch.seq_id[i][0];
-
-        for (uint32_t j = 0; j < n; ++j) {
-            const llama_pos d = (llama_pos) (n - j);
-
-            llama_pos p;
-            if (by_order) {
-                const auto & v = seq_idx[seq_id];
-                const int64_t k = (int64_t) ord[i] - d;
-                // k >= 0: an earlier token of this very ubatch; k < 0: before the chunk
-                p = k >= 0 ? ubatch.pos[v[k]] : ubatch.pos[v[0]] + (llama_pos) k;
-            } else {
-                p = ubatch.pos[i] - d;
-            }
-
-            if (p < 0) {
-                continue;
-            }
-
-            res[i*n + j] = v_cells[seq_to_stream[seq_id]].seq_pos_tok_le(seq_id, p);
-        }
-    }
-}
-
 void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
     if (!dst) {
         // rotation disabled for this cache (attn_rot_k == false): the graph
@@ -3705,6 +3646,3 @@ void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const lla
     kv->set_input_relative_pos(dst, ubatch, extent);
 }
 
-void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
-    kv->get_prev_tokens(ubatch, n, res);
-}

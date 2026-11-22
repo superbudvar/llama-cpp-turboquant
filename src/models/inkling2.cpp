@@ -3,6 +3,7 @@
 
 void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
+    hparams.n_ff_exp = hparams.n_ff_exp_arr[0];
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_RELATIVE_LENGTH, hparams.n_relative);
     ml.get_key(LLM_KV_ATTENTION_RELATIVE_EXTENT, hparams.n_relative_extent);
@@ -44,8 +45,8 @@ void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
     uint64_t max_channels = 0;
     for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
         if (!hparams.n_head_kv(il) || hparams.n_head(il) % hparams.n_head_kv(il) ||
-            hparams.n_embd_head_k(il) != hparams.n_embd_head_v(il) || !hparams.n_expert_used(il) ||
-            hparams.n_expert_used(il) > hparams.n_expert || !hparams.n_ff_exp(il)) {
+            hparams.n_embd_head_k(il) != hparams.n_embd_head_v(il) || !hparams.n_expert_used_arr[il] ||
+            hparams.n_expert_used_arr[il] > hparams.n_expert || !hparams.n_ff_exp_arr[il]) {
             throw std::runtime_error("inkling2: invalid attention or expert dimensions");
         }
         max_channels = std::max<uint64_t>(max_channels, 2ull * hparams.n_embd_k_gqa(il) + 2ull * hparams.n_embd);
@@ -105,13 +106,13 @@ void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
         l.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
         l.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, 0);
         l.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED);
-        l.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", i), {n_embd, 2*hparams.n_ff_exp(i), n_expert}, 0);
-        l.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {hparams.n_ff_exp(i), n_embd, n_expert}, 0);
+        l.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", i), {n_embd, 2*hparams.n_ff_exp_arr[i], n_expert}, 0);
+        l.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {hparams.n_ff_exp_arr[i], n_embd, n_expert}, 0);
     }
 }
 
 std::unique_ptr<llm_graph_context> llama_model_inkling2::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(params);
+    return std::make_unique<graph>(*this, params);
 }
 
 class llm_graph_input_inkling2_pos : public llm_graph_input_i {
@@ -226,10 +227,10 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
     tau = ggml_log(ctx0, ggml_clamp(ctx0, ggml_scale(ctx0, tau, 1.0f/hparams.n_log_scale_floor), 1.0f, INFINITY));
     tau = ggml_reshape_3d(ctx0, ggml_scale_bias(ctx0, tau, hparams.f_log_scale_alpha, 1.0f), 1, 1, n_tokens);
 
-    ggml_tensor * cur = build_inp_embd(model.tok_embd);
+    ggml_tensor * cur = build_inp_embd(model->tok_embd);
     // important: do not normalize raw embeddings input (i.e. encoded image embeddings)
     if (ubatch.token) {
-        cur = build_norm(cur, model.tok_norm, nullptr, LLM_NORM_RMS, -1);
+        cur = build_norm(cur, model->tok_norm, nullptr, LLM_NORM_RMS, -1);
     }
 
     return cur;
@@ -239,7 +240,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         ggml_tensor * messages, const loop_layer * loop) {
     GGML_ASSERT(!messages == !loop);
 
-    const auto & l = model.layers[il];
+    const auto & l = model->layers[il];
 
     const bool    swa = hparams.is_swa(il);
     const int64_t nh  = hparams.n_head(il);
@@ -299,7 +300,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         q = ggml_mul(ctx0, q, tau);
         r = ggml_mul(ctx0, r, tau);
     }
-    auto * mask = swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw;
+    auto * mask = swa ? attn->get_kq_mask_swa() : attn->get_kq_mask();
     const int64_t streams = mask->ne[3];
     const int64_t n_kv = distances[swa]->ne[0];
     auto * sinks = build_lora_mm(l.attn_sink_proj, inputs[0]);
@@ -340,8 +341,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     }
     cur = build_norm(cur, l.ffn_norm, nullptr, LLM_NORM_RMS, il);
     cur = build_moe_ffn(cur, l.ffn_gate_inp, nullptr, nullptr, l.ffn_down_exps, l.ffn_exp_probs_b,
-            hparams.n_expert, hparams.n_expert_used(il), LLM_FFN_SITU, true, hparams.expert_weights_scale,
-            LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID, il, nullptr, l.ffn_gate_up_exps);
+            hparams.n_expert, hparams.n_expert_used_arr[il], LLM_FFN_SITU, true, hparams.expert_weights_scale,
+            LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID, il, nullptr, l.ffn_gate_up_exps,
+            l.ffn_up_exps_s, l.ffn_gate_exps_s, l.ffn_down_exps_s);
     cur = convolve(cur, l.ffn_post_conv, nullptr, state, history, recr, 2*kv + n_embd);
     cur = ggml_add(ctx0, residual, cur);
     cb(cur, "l_out", il);
@@ -350,14 +352,16 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 }
 
 void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks) {
-    cur = ggml_reshape_2d(ctx0, mix(blocks, cur, model.output_res_query), n_embd, n_tokens);
-    cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+    cur = ggml_reshape_2d(ctx0, mix(blocks, cur, model->output_res_query), n_embd, n_tokens);
+    cur = build_norm(cur, model->output_norm, nullptr, LLM_NORM_RMS, -1);
     if (inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
     res->t_embd = cur;
-    cur = build_lora_mm(model.output, cur);
-    ggml_prec_set_acc(cur, GGML_PREC_F32);
+    cur = build_lora_mm(model->output, cur);
+    if (cur->op == GGML_OP_MUL_MAT) {
+        ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
+    }
     const float cap = hparams.f_final_logit_softcapping;
     cur = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/cap)), cap);
     cur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, hparams.n_vocab_unpadded, cur->ne[1], cur->nb[1], 0));
@@ -365,7 +369,7 @@ void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vec
     cb(cur, "result_output", -1);
 }
 
-llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_context(params) {
+llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params), model(&model) {
     ggml_tensor * cur = build_inputs();
 
     std::vector<ggml_tensor *> blocks;
@@ -374,4 +378,6 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
     }
 
     build_output(cur, blocks);
+
+    ggml_build_forward_expand(gf, res->t_logits);
 }

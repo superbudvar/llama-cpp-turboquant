@@ -447,10 +447,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_MISTRAL4:
         case LLM_ARCH_MELLUM:
         case LLM_ARCH_LAGUNA:
-        case LLM_ARCH_MAPLE:
-        case LLM_ARCH_MUSE_SPARK:
         case LLM_ARCH_KOLIBRI1:
-        case LLM_ARCH_METIS16:
         case LLM_ARCH_INKLING2:
         case LLM_ARCH_INKLING2_LOOP:
             return true;

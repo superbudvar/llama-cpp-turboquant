@@ -87,6 +87,11 @@ struct llama_hparams {
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_kv_arr;
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_ff_arr;
 
+    // per-layer expert feed-forward size
+    std::array<uint32_t, LLAMA_MAX_LAYERS> n_ff_exp_arr;
+    // per-layer top-k expert routing count
+    std::array<uint32_t, LLAMA_MAX_LAYERS> n_expert_used_arr;
+
     uint32_t n_layer_dense_lead = 0;
     uint32_t n_lora_q           = 0;
     uint32_t n_lora_kv          = 0;
@@ -143,6 +148,10 @@ struct llama_hparams {
     float    yarn_beta_slow   =  1.0f;
 
     std::array<int, 4> rope_sections;
+
+    // Per-layer RoPE enable flags (1 = use RoPE, 0 = NoPE)
+    // by default, all layers use RoPE (controlled by rope_finetuned)
+    std::array<uint32_t, LLAMA_MAX_LAYERS> rope_pattern;
 
     // Sliding Window Attention (SWA)
     llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
