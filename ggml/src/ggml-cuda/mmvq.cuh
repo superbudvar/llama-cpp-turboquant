@@ -36,6 +36,5 @@ void ggml_cuda_moe_cache_mmv_fused(
     int64_t slot_stride_bytes, int64_t n_hits, int64_t act_rows,
     float up_min, float up_max, float gate_min, float gate_max,
     cudaStream_t stream);
-// the single-column q8_1 input cache of ggml_cuda_mul_mat_vec_q: a new graph evaluation, and a node that wrote memory
-void ggml_cuda_mmvq_q8_cache_new_graph(ggml_backend_cuda_context & ctx);
+// the single-column q8_1 input cache of ggml_cuda_mul_mat_vec_q: a node that wrote memory
 void ggml_cuda_mmvq_q8_cache_invalidate(ggml_backend_cuda_context & ctx, const ggml_tensor * written);

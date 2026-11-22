@@ -1510,6 +1510,7 @@ struct ggml_backend_cuda_context {
         const void *        data = nullptr;      // ... and its data pointer
         uint64_t            epoch = 0;           // valid only within this graph eval
         size_t              size = 0;            // quantized bytes
+        size_t              src_bytes = 0;       // bytes of the source, to detect an overlapping write
         int64_t             ne10_padded = 0;     // layout keys
         ggml_type           type = GGML_TYPE_COUNT;
         std::vector<retired_buf> retired;        // outgrown buffers, freed at teardown (captured graphs may still use them)

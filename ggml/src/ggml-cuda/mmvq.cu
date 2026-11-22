@@ -1229,31 +1229,20 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
-// q8_1 copies of recently quantized single-column inputs, reused by later matmuls of the same input within one graph
-// evaluation (Inkling 2 feeds one normed input to up to six projections). The cache lives in the backend context:
-// every graph compute starts a new epoch, every node that writes memory overlapping a cached source drops that copy
-// (see ggml_cuda_mmvq_q8_cache_invalidate), and the cache is bypassed while concurrent streams are in use.
-void ggml_cuda_mmvq_q8_cache_new_graph(ggml_backend_cuda_context & ctx) {
-    ctx.q8_cache.epoch++;
-}
-
+// Drop the cached q8_1 copy of an activation when a node writes over its memory:
+// the copy is the quantization of qc.src1, so it goes stale when the source is written.
 void ggml_cuda_mmvq_q8_cache_invalidate(ggml_backend_cuda_context & ctx, const ggml_tensor * written) {
-    auto & cache = ctx.q8_cache;
-    if (!written->data || !cache.buf) {
+    auto & qc = ctx.q8_cache;
+    if (!written->data || !qc.ptr || !qc.data) {
         return;
     }
     const char * w0 = (const char *) written->data;
     const char * w1 = w0 + ggml_nbytes(written);
-    for (auto & sl : cache.slots) {
-        if (sl.epoch == cache.epoch && (const char *) sl.data < w1 && w0 < (const char *) sl.data + sl.nbytes) {
-            sl.epoch = 0;
-        }
+    const char * c0 = (const char *) qc.data;
+    const char * c1 = c0 + qc.src_bytes;
+    if (c0 < w1 && w0 < c1) {
+        qc.epoch = 0;   // never matches again
     }
-}
-
-static bool ggml_cuda_mmvq_q8_cache_enabled() {
-    static const bool enabled = getenv("GGML_CUDA_NO_Q8_CACHE") == nullptr;
-    return enabled;
 }
 
 void ggml_cuda_mul_mat_vec_q(
@@ -1380,6 +1369,7 @@ void ggml_cuda_mul_mat_vec_q(
             qc.data        = src1->data;
             qc.epoch       = ctx.graph_epoch;
             qc.size        = q8_bytes;
+            qc.src_bytes   = ggml_nbytes(src1);
             qc.ne10_padded = ne10_padded;
             qc.type        = src0->type;
         } else {
