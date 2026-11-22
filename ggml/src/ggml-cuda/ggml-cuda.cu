@@ -5044,6 +5044,12 @@ struct ggml_cuda_ink_match {
     float p[5] = {};
 };
 
+static bool ggml_cuda_fusion_disabled() {
+    static const bool disabled = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr &&
+                                 atoi(getenv("GGML_CUDA_DISABLE_FUSION")) == 1;
+    return disabled;
+}
+
 static bool ggml_cuda_ink_enabled() {
     static const bool enabled = getenv("GGML_INK_NO_FUSE") == nullptr && !ggml_cuda_fusion_disabled();
     return enabled;
@@ -6545,10 +6551,6 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
 // tensors of one branch stay alive until the join node. Off by default.
 static void ggml_cuda_graph_optimize_concurrency(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
 
-    GGML_UNUSED(params);
-
-    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
-
 #ifdef USE_CUDA_GRAPH
     const uint64_t graph_key = ggml_cuda_graph_get_key(cgraph);
     const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
@@ -6797,18 +6799,6 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 
     const bool disable_fusion = ggml_cuda_fusion_disabled();
 
-    auto add_alloc_deps = [&](size_t start, size_t last_node) {
-
-        for (size_t i = start; i < last_node; ++i) {
-            params->add_alloc_dep(params->user_data, cgraph->nodes[i], cgraph->nodes[last_node]);
-
-            for (int j = 0; j < GGML_MAX_SRC; ++j) {
-                if (cgraph->nodes[i]->src[j]) {
-                    params->add_alloc_dep(params->user_data, cgraph->nodes[i]->src[j], cgraph->nodes[last_node]);
-                }
-            }
-        }
-    };
 
     if (!disable_fusion && ggml_cuda_ink_enabled()) {
         // keep only what a fused Inkling kernel reads (and the matmuls it materializes) alive until its output;
@@ -6837,140 +6827,6 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         }
     }
 
-    if (!disable_fusion) {
-        // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
-        // TODO: consolidate fusion paths in graph_optimize and graph_compute
-        ggml_cuda_set_device(cuda_ctx->device);
-        for (int i = 0; i + 5 < cgraph->n_nodes; ++i) {
-            if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT_ID) {
-                continue;
-            }
-            for (int j = i + 3; j + 2 < cgraph->n_nodes; ++j) {
-                if (cgraph->nodes[j]->op == GGML_OP_MUL_MAT_ID && cgraph->nodes[j + 1]->op == GGML_OP_MUL_MAT_ID) {
-                    break;
-                }
-                if (cgraph->nodes[j]->op != GGML_OP_MUL_MAT || !ggml_cuda_match_shared_expert(cgraph, i, j)) {
-                    continue;
-                }
-                // Group both outputs before allocation so the shared result cannot alias intervening nodes.
-                std::rotate(cgraph->nodes + i + 3, cgraph->nodes + j, cgraph->nodes + j + 3);
-                ggml_tensor * up = cgraph->nodes[i + 2]->src[1];
-                params->add_alloc_dep(params->user_data, up->src[1], cgraph->nodes[i + 5]);
-                params->add_alloc_dep(params->user_data, up->src[2], cgraph->nodes[i + 5]);
-                i += 5;
-                break;
-            }
-        }
-        for (int i = 0; i < cgraph->n_nodes; ++i) {
-            // Keep the inputs of the fused gate/up/GLU MMQ kernel alive until the GLU so that they cannot alias its output (under op offload the weights are buffer copies).
-            if (i + 2 < cgraph->n_nodes && cgraph->nodes[i + 2]->op == GGML_OP_GLU) {
-                ggml_tensor * glu  = cgraph->nodes[i + 2];
-                ggml_tensor * gate = glu->src[0];
-                ggml_tensor * up   = glu->src[1];
-                const bool ok = (gate == cgraph->nodes[i] && up == cgraph->nodes[i + 1]) || (gate == cgraph->nodes[i + 1] && up == cgraph->nodes[i]);
-                if (ok && ggml_cuda_mul_mat_q_fusion_matches(up, gate, glu, cuda_ctx->device)) {
-                    add_alloc_deps(i, i + 2);
-                    i += 2;
-                    continue;
-                }
-            }
-            // Same with the NVFP4 scales: MUL_MAT(gate), MUL(gate scale), MUL_MAT(up), MUL(up scale), GLU.
-            if (i + 4 < cgraph->n_nodes && cgraph->nodes[i + 4]->op == GGML_OP_GLU) {
-                ggml_tensor * glu        = cgraph->nodes[i + 4];
-                ggml_tensor * gate_scale = cgraph->nodes[i + 1];
-                ggml_tensor * up_scale   = cgraph->nodes[i + 3];
-                if (glu->src[0] == gate_scale && glu->src[1] == up_scale &&
-                        ggml_cuda_mul_mat_q_fusion_matches(cgraph->nodes[i + 2], cgraph->nodes[i], glu, cuda_ctx->device, up_scale, gate_scale) &&
-                        ggml_cuda_get_mul_mat_scale(gate_scale, cgraph->nodes[i]) && ggml_cuda_get_mul_mat_scale(up_scale, cgraph->nodes[i + 2])) {
-                    add_alloc_deps(i, i + 4);
-                    i += 4;
-                    continue;
-                }
-            }
-            // Same with per-expert NVFP4 scales: MUL_MAT_ID, RESHAPE, REPEAT, GET_ROWS, MUL for gate and for up, GLU.
-            if (i + 10 < cgraph->n_nodes && cgraph->nodes[i + 10]->op == GGML_OP_GLU) {
-                ggml_tensor * glu        = cgraph->nodes[i + 10];
-                ggml_tensor * gate_scale = cgraph->nodes[i + 4];
-                ggml_tensor * up_scale   = cgraph->nodes[i + 9];
-                if (glu->src[0] == gate_scale && glu->src[1] == up_scale &&
-                        ggml_cuda_mul_mat_q_fusion_matches(cgraph->nodes[i + 5], cgraph->nodes[i], glu, cuda_ctx->device, up_scale, gate_scale) &&
-                        ggml_cuda_get_mul_mat_id_scale(cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3], gate_scale, cgraph->nodes[i]) &&
-                        ggml_cuda_get_mul_mat_id_scale(cgraph->nodes[i + 6], cgraph->nodes[i + 7], cgraph->nodes[i + 8], up_scale, cgraph->nodes[i + 5])) {
-                    add_alloc_deps(i, i + 10);
-                    i += 10;
-                    continue;
-                }
-            }
-
-            ggml_cuda_moe_weighted_reduction_match match;
-            if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
-                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);
-                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.weights), match.dst);
-                if (match.expert_scale != nullptr) {
-                    params->add_alloc_dep(
-                        params->user_data, const_cast<ggml_tensor *>(match.expert_scale), match.dst);
-                }
-                i += match.node_count - 1;
-            }
-
-            if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
-                    cgraph->nodes[i]->op == GGML_OP_ARGSORT) {
-                ggml_cuda_topk_moe_args args;
-                const bool              can_fuse = ggml_cuda_topk_moe_fusion(cgraph, i, args);
-                std::vector<ggml_op>    ops;
-                ops.reserve(13);  // max ops; avoids gcc -Wstringop-overflow false positive
-
-                const ggml_tensor * node = cgraph->nodes[i];
-
-                if (can_fuse) {
-                    const ggml_tensor * logits  = node->src[0];
-                    ggml_tensor *       weights = nullptr;
-                    ggml_tensor *       ids     = nullptr;
-
-                    if (!args.delayed_softmax) {
-                        int out_nodes[2];  // nodes which can't be elided
-
-                        if (args.sigmoid) {
-                            ops.insert(ops.end(), { GGML_OP_UNARY });
-                        } else if (args.sqrt_softplus) {
-                            ops.insert(ops.end(), { GGML_OP_UNARY, GGML_OP_SQRT });
-                        } else {
-                            ops.insert(ops.end(), { GGML_OP_SOFT_MAX });
-                        }
-                        const int i_probs = i + (int) ops.size() - 1;  // last node of the gating activation
-
-                        if (args.prob_bias) {
-                            ops.insert(ops.end(), { GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_ARGSORT, GGML_OP_VIEW,
-                                                    GGML_OP_GET_ROWS });
-                            out_nodes[0] = i_probs + 4;
-                        } else {
-                            ops.insert(ops.end(), { GGML_OP_RESHAPE, GGML_OP_ARGSORT, GGML_OP_VIEW, GGML_OP_GET_ROWS });
-                            out_nodes[0] = i_probs + 3;
-                        }
-                        ids = cgraph->nodes[out_nodes[0]];
-
-                        if (args.norm) {
-                            ops.insert(ops.end(),
-                                       { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, args.norm_scale_bias ? GGML_OP_SCALE : GGML_OP_CLAMP, GGML_OP_DIV, GGML_OP_RESHAPE });
-                        }
-                        if (args.scale) {
-                            ops.insert(ops.end(), { GGML_OP_SCALE });
-                        }
-
-                        weights      = cgraph->nodes[i + ops.size() - 1];
-                        out_nodes[1] = i + ops.size() - 1;
-
-                        if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
-                                ggml_cuda_should_use_topk_moe(node, logits, weights, ids)) {
-
-                            add_alloc_deps(i, i + ops.size());
-                            i += ops.size() - 1;
-                        }
-                    }
-                }
-            }
-        }
-    }
 
 #ifdef USE_CUDA_GRAPH
     const uint64_t graph_key = ggml_cuda_graph_get_key(cgraph);

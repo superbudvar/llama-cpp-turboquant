@@ -250,7 +250,7 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
     }
 
     if (config.with_norm) {
-        wt_sum              = warp_reduce_sum<warp_size>(wt_sum);
+        wt_sum              = warp_reduce_sum(wt_sum);
         wt_sum              = max(wt_sum*config.norm_mul + config.norm_add, clamp_val);
         const float inv_sum = 1.0f / wt_sum;
 
