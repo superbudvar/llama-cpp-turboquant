@@ -147,6 +147,11 @@ public:
     }
 };
 
+// a view used as a plain tensor: copy only when it is not contiguous
+ggml_tensor * llama_model_inkling2::graph::view_cont(ggml_tensor * view) {
+    return ggml_is_contiguous(view) ? view : ggml_cont(ctx0, view);
+}
+
 ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor * scale, float threshold) {
     if (scale) {
         cur = ggml_mul(ctx0, cur, scale);

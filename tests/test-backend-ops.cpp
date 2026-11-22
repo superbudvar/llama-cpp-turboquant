@@ -478,6 +478,7 @@ static std::string var_to_str(ggml_scale_mode mode) {
 #define VARS_TO_STR15(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o) VAR_TO_STR(a) + "," + VARS_TO_STR14(b, c, d, e, f, g, h, i, j, k, l, m, n, o)
 #define VARS_TO_STR16(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p) VAR_TO_STR(a) + "," + VARS_TO_STR15(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p)
 #define VARS_TO_STR17(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q) VAR_TO_STR(a) + "," + VARS_TO_STR16(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q)
+#define VARS_TO_STR18(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r) VAR_TO_STR(a) + "," + VARS_TO_STR17(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r)
 
 #ifdef GGML_USE_SYCL
 static bool inline _isinf(float f) {
@@ -4620,7 +4621,7 @@ struct test_ink_fa_rel_bias : public test_case {
         kpos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_kv);
         qpos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, mask, 1.0f/sqrtf(D), 0.0f, 0.0f);
-        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
         ggml_flash_attn_ext_set_rel_bias(out, table, sinks, kpos, qpos, extent, head0);
         ggml_set_name(out, "out");
         return out;
@@ -4672,11 +4673,6 @@ struct test_ink_review : public test_case {
     }
 
     bool run_whole_graph() override { return true; }
-
-    // q8_stale mutates its input during the graph, so repeated runs differ by design
-    bool deterministic(ggml_backend_t backend) override {
-        return mode != "q8_stale" && test_case::deterministic(backend);
-    }
 
     explicit test_ink_review(std::string mode) : mode(std::move(mode)) {}
 
@@ -8062,9 +8058,11 @@ struct test_flash_attn_ext : public test_case {
     const bool kv_view; // create K/V as views of a larger buffer (like a KV cache)
     const bool v_is_view_of_k;
     const int64_t n_kv_max;
+    const int64_t q_head_padding;
+    const int64_t mask_heads;
 
     std::string vars() override {
-        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max);
+        return VARS_TO_STR18(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max, q_head_padding) + ",mask_heads=" + std::to_string(mask_heads);
     }
 
     double max_nmse_err() override {
@@ -8081,9 +8079,9 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0)
+                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0, int64_t q_head_padding = 0, int64_t mask_heads = 1)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max) {}
+          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max), q_head_padding(q_head_padding), mask_heads(mask_heads) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -8108,7 +8106,11 @@ struct test_flash_attn_ext : public test_case {
             return t;
         };
 
-        ggml_tensor * q = create_permuted(GGML_TYPE_F32, hsk_padded, nb, nh*nr23[0], nr23[1], false);
+        ggml_tensor * q = create_permuted(GGML_TYPE_F32, hsk_padded + q_head_padding, nb, nh*nr23[0], nr23[1], false);
+        if (q_head_padding > 0) {
+            ggml_set_name(q, "q_padded");
+            q = ggml_view_4d(ctx, q, hsk_padded, q->ne[1], q->ne[2], q->ne[3], q->nb[1], q->nb[2], q->nb[3], 0);
+        }
         ggml_set_name(q, "q");
 
         ggml_tensor * k = create_permuted(type_K,        hsk_padded, kv, nh,         nr23[1], kv_view); // the K tensor is usually a view of the K cache
@@ -8183,6 +8185,22 @@ struct test_flash_attn_ext : public test_case {
 
     bool grad_precise() override {
         return true;
+    }
+};
+
+// the Q logits are large, the softmax has to keep the max in a stable way
+struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
+    static constexpr int q_range = 20;
+
+    using test_flash_attn_ext::test_flash_attn_ext;
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",q_range=" + std::to_string(q_range);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+        init_tensor_uniform(ggml_get_tensor(ctx, "q"), -(float) q_range, (float) q_range);
     }
 };
 
@@ -9440,8 +9458,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     // the Inkling 2 router: 128 experts, sigmoid with bias, top 8, sum + eps normalization, scale
-    test_cases.emplace_back(new test_topk_moe({128, 1, 1, 1}, 8, true, true, GATING_FUNC_SIGMOID, 8.0f, 1, true));
-    test_cases.emplace_back(new test_topk_moe({128, 7, 1, 1}, 8, true, true, GATING_FUNC_SIGMOID, 8.0f, 1, true));
+    test_cases.emplace_back(new test_topk_moe({128, 1, 1, 1}, 8, true, true, GATING_FUNC_SIGMOID, 8.0f));
+    test_cases.emplace_back(new test_topk_moe({128, 7, 1, 1}, 8, true, true, GATING_FUNC_SIGMOID, 8.0f));
     test_cases.emplace_back(new test_ink_pattern("mix", 1, 3, 127));
     test_cases.emplace_back(new test_ink_pattern("mix", 4, 3, 127));
     test_cases.emplace_back(new test_ink_pattern("mix1", 1, 7));

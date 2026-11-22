@@ -589,7 +589,6 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
-        GGML_OP_TOP_K_MASK,
         GGML_OP_INK_REL_BIAS,
 
         GGML_OP_UNARY,
@@ -2715,19 +2714,6 @@ extern "C" {
     // score:  [n_pick,  ne1, ne2, ne3] f32, can be NULL: a pick is live when its score is above -inf, else every pick is live
     // blocks: [n_blk,   n_pick]        i32, can be NULL: the member cells of each pick, else a pick is a cell
     // extra:  [n_extra, ne1, ne2, ne3] i32, can be NULL: cells of each row kept without a pick
-    // res:    [n_kv,    ne1, ne2, ne3] same type as mask
-    //
-    // res[c, i] = mask[c, i % m] when c is a cell of a live pick of row i or an extra cell of row i, else -inf
-    // picks and cells out of range are skipped
-    //
-    GGML_API struct ggml_tensor * ggml_top_k_mask(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * mask,
-            struct ggml_tensor  * top_k,
-            struct ggml_tensor  * score,
-            struct ggml_tensor  * blocks,
-            struct ggml_tensor  * extra);
-
     // custom operators
 
     typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);
