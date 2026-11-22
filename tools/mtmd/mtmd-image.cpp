@@ -4,6 +4,9 @@
 #include <cmath>
 #include <vector>
 
+// round up to the next multiple of n
+#define MTMD_ALIGN(x, n) ((((x) + (n) - 1) / (n)) * (n))
+
 void mtmd_image_preproc_out::append(const clip_hparams & hparams, const clip_image_u8 & img, bool normalized) {
     clip_image_f32 dst;
     dst.from_u8(img);
@@ -137,6 +140,57 @@ struct img_tool {
                 dst.set_pixel(j, i, image.get_pixel(x + j, y + i));
             }
         }
+    }
+
+    struct calc_size_opt {
+        int align_size = 1;
+        int min_pixels = 0;   // 0 = disabled
+        int max_pixels = 0;   // 0 = disabled
+        // applied before min/max_pixels, so min_pixels can push an edge back above longest_edge
+        int longest_edge = 0; // 0 = disabled
+        bool round_half_even = false; // Python round() instead of std::round
+    };
+
+    // calculate the size of the **resized** image, while preserving the aspect ratio and
+    // aligning to the nearest multiple of align_size ("smart_resize" in transformers code)
+    static clip_image_size calc_size_preserved_ratio(const clip_image_size & inp_size, const calc_size_opt & opts) {
+        GGML_ASSERT(opts.align_size > 0);
+        const int width  = inp_size.width;
+        const int height = inp_size.height;
+        if (width <= 0 || height <= 0) {
+            return {0, 0};
+        }
+
+        auto round_by_factor = [f = opts.align_size, even = opts.round_half_even](float x) {
+            const float q = x / static_cast<float>(f);
+            return static_cast<int>(even ? std::nearbyint(q) : std::round(q)) * f;
+        };
+        auto ceil_by_factor  = [f = opts.align_size](float x) { return static_cast<int>(std::ceil(x / static_cast<float>(f))) * f; };
+        auto floor_by_factor = [f = opts.align_size](float x) { return static_cast<int>(std::floor(x / static_cast<float>(f))) * f; };
+
+        int w_bar, h_bar;
+        if (opts.longest_edge > 0) {
+            const float scale = std::min(static_cast<float>(opts.longest_edge) / width,
+                                          static_cast<float>(opts.longest_edge) / height);
+            w_bar = ceil_by_factor(width  * scale);
+            h_bar = ceil_by_factor(height * scale);
+        } else {
+            // always align up first
+            w_bar = std::max(opts.align_size, round_by_factor(width));
+            h_bar = std::max(opts.align_size, round_by_factor(height));
+        }
+
+        if (opts.max_pixels > 0 && h_bar * w_bar > opts.max_pixels) {
+            const auto beta = std::sqrt(static_cast<float>(height) * width / opts.max_pixels);
+            h_bar = std::max(opts.align_size, floor_by_factor(height / beta));
+            w_bar = std::max(opts.align_size, floor_by_factor(width  / beta));
+        } else if (opts.min_pixels > 0 && h_bar * w_bar < opts.min_pixels) {
+            const auto beta = std::sqrt(static_cast<float>(opts.min_pixels) / (static_cast<float>(height) * width));
+            h_bar = ceil_by_factor(height * beta);
+            w_bar = ceil_by_factor(width * beta);
+        }
+
+        return {w_bar, h_bar};
     }
 
     // calculate the size of the **resized** image, while preserving the aspect ratio
@@ -1678,10 +1732,10 @@ mtmd_image_preproc_out mtmd_image_preprocessor_muse_glimmer::preprocess(const cl
 // mtmd_image_preprocessor_inkling2v
 //
 
-mtmd_image_preproc_out mtmd_image_preprocessor_inkling2v::preprocess(const mtmd_image_u8 & input) const {
+mtmd_image_preproc_out mtmd_image_preprocessor_inkling2v::preprocess(const clip_image_u8 & input) {
     const int align = hparams.patch_size * hparams.n_merge;
     auto size = input.get_size();
-    mtmd_image_u8 resized;
+    clip_image_u8 resized;
     const bool too_large = hparams.image_max_pixels > 0 &&
         int64_t(MTMD_ALIGN(size.width, align)) * MTMD_ALIGN(size.height, align) > hparams.image_max_pixels;
     if (too_large) {
@@ -1692,10 +1746,10 @@ mtmd_image_preproc_out mtmd_image_preprocessor_inkling2v::preprocess(const mtmd_
         size = img_tool::calc_size_preserved_ratio(size, opts);
         img_tool::resize(input, resized, size, hparams.image_resize_algo, PAD_NONE);
     }
-    const mtmd_image_u8 & img = too_large ? resized : input;
+    const clip_image_u8 & img = too_large ? resized : input;
     const int width  = MTMD_ALIGN(size.width,  align);
     const int height = MTMD_ALIGN(size.height, align);
-    mtmd_image_f32 padded;
+    clip_image_f32 padded;
     padded.set_size({width, height}, img.is_placeholder(), false);
     if (!img.is_placeholder()) {
         std::vector<float> pixels(size_t(width) * height * 3, -1.0f);
@@ -1720,7 +1774,7 @@ mtmd_image_preproc_out mtmd_image_preprocessor_inkling2v::preprocess(const mtmd_
 //#define MTMD_DEBUG_FUNCTIONS
 
 #ifdef MTMD_DEBUG_FUNCTIONS
-static void mtmd_image_write_image_to_ppm(const mtmd_image_u8& img, const std::string& filename) {
+static void mtmd_image_write_image_to_ppm(const clip_image_u8& img, const std::string& filename) {
     std::ofstream file(filename, std::ios::binary);
     if (!file.is_open()) {
         LOG_ERR("Failed to open file for writing: %s\n", filename.c_str());
@@ -1741,7 +1795,7 @@ static void mtmd_image_write_image_to_ppm(const mtmd_image_u8& img, const std::s
     file.close();
 }
 
-static void mtmd_image_save_to_bmp(const mtmd_image_u8& img, const std::string& filename) {
+static void mtmd_image_save_to_bmp(const clip_image_u8& img, const std::string& filename) {
     std::ofstream file(filename, std::ios::binary);
     if (!file.is_open()) {
         LOG_ERR("Failed to open file for writing: %s\n", filename.c_str());
@@ -1820,7 +1874,7 @@ static void mtmd_image_save_to_bmp(const mtmd_image_u8& img, const std::string& 
 }
 
 // debug function to convert f32 to u8
-static void mtmd_image_convert_f32_to_u8(const mtmd_image_f32& src, mtmd_image_u8& dst) {
+static void mtmd_image_convert_f32_to_u8(const clip_image_f32& src, clip_image_u8& dst) {
     dst.set_size(src.get_size(), false);
     const auto & src_buf = src.get_ro_buf();
     std::vector<uint8_t> dst_buf(src.n_elements());
