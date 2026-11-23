@@ -23,6 +23,11 @@ struct ggml_moe_cache_config {
     int32_t min_devices;
     // -1 selects the provider policy; 0..8 is a fixed total per node.
     int32_t overlap_cpu_rows;
+    // optional expert profile: the routing counts of an earlier run, used to
+    // seed the admission order. The provider writes the counts back when
+    // profile_save_path is set.
+    const char * profile_path;
+    const char * profile_save_path;
 };
 
 struct ggml_moe_cache_device_caps {
@@ -168,7 +173,8 @@ GGML_API struct ggml_moe_cache_api ggml_moe_cache_get(const void * owner);
 // provider for direct CPU users.
 GGML_API struct ggml_moe_cache_api ggml_moe_cache_active(void);
 GGML_API void ggml_backend_sched_set_moe_cache(
-        ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode, size_t budget_mib);
+        ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode, size_t budget_mib,
+        const char * profile_path, const char * profile_save_path);
 
 #ifdef __cplusplus
 }

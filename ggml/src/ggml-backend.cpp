@@ -2574,9 +2574,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
 }
 
 void ggml_backend_sched_set_moe_cache(
-        ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode, size_t budget_mib) {
+        ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode, size_t budget_mib,
+        const char * profile_path, const char * profile_save_path) {
     GGML_ASSERT(sched);
-    if (mode == GGML_MOE_CACHE_MODE_UNSPECIFIED) {
+    if (mode == GGML_MOE_CACHE_MODE_UNSPECIFIED && !profile_path && !profile_save_path) {
+        // the scheduler already created a session with the provider defaults
         return;
     }
 
@@ -2597,7 +2599,8 @@ void ggml_backend_sched_set_moe_cache(
     // Probe the providers against this scheduler's backend set and pick the
     // first one that can create a session, retrying another provider when
     // session_create returns null.
-    const int automatic = mode == GGML_MOE_CACHE_MODE_AUTO ? 1 : 0;
+    const int automatic = mode == GGML_MOE_CACHE_MODE_AUTO ? 1
+        : (mode == GGML_MOE_CACHE_MODE_UNSPECIFIED ? -1 : 0);
     bool provider_tried = false;
     for (const ggml_moe_cache_api & api :
             ggml_moe_cache_provider_candidates(cache_backends, sched->n_backends)) {
@@ -2606,6 +2609,8 @@ void ggml_backend_sched_set_moe_cache(
             continue;
         }
         provider_tried = true;
+        config.profile_path = profile_path;
+        config.profile_save_path = profile_save_path;
         void * session = api.session_create(cache_backends, sched->n_backends, &config);
         if (session) {
             sched->moe_cache_session = session;

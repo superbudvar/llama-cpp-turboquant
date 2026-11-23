@@ -495,6 +495,8 @@ struct common_moe_cache_params {
     size_t budget_mib          = 0;
     bool mode_explicit         = false;
     bool fit_selected          = false;
+    std::string profile_path;      // expert profile to seed the cache
+    std::string profile_save_path; // path to write the expert profile at teardown
 };
 
 struct common_params {

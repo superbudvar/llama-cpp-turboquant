@@ -2821,6 +2821,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_MOE_CACHE"));
+
+    add_opt(common_arg(
+        {"--moe-cache-profile"}, "PATH",
+        "expert profile to seed the MoE cache with (the routing counts of an earlier run)",
+        [](common_params & params, const std::string & value) {
+            params.moe_cache.profile_path = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_PROFILE"));
+
+    add_opt(common_arg(
+        {"--moe-cache-profile-save"}, "PATH",
+        "write the MoE cache expert profile at teardown (the routing counts of this run)",
+        [](common_params & params, const std::string & value) {
+            params.moe_cache.profile_save_path = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_PROFILE_SAVE"));
+
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"

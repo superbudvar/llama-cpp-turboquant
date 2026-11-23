@@ -31,6 +31,7 @@ static void moe_cache_register_stub(const void * owner) {
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <fstream>
 #include <iterator>
 #include <limits>
 #include <memory>
@@ -159,6 +160,144 @@ struct moe_cache_demand {
     size_t expert_size = 0;
 };
 
+// Expert profile: the per layer routing counts of an earlier run. The counts
+// seed the admission order, so the experts that the model routes to most
+// reach the pool without waiting for the demand to build up.
+struct moe_cache_profile {
+    static constexpr uint32_t version = 1;
+
+    int n_layers = 0;
+    int n_expert = 0;
+    std::vector<uint32_t> counts;
+
+    bool empty() const {
+        return counts.empty();
+    }
+
+    void ensure_size(int layers, int experts) {
+        if (layers <= n_layers && experts <= n_expert) {
+            return;
+        }
+        const int new_layers = layers > n_layers ? layers : n_layers;
+        const int new_expert = experts > n_expert ? experts : n_expert;
+        std::vector<uint32_t> grown((size_t) new_layers * new_expert, 0);
+        for (int layer = 0; layer < n_layers; layer++) {
+            std::copy_n(counts.begin() + (size_t) layer * n_expert,
+                        n_expert, grown.begin() + (size_t) layer * new_expert);
+        }
+        counts.swap(grown);
+        n_layers = new_layers;
+        n_expert = new_expert;
+    }
+
+    uint32_t get(int layer, int expert) const {
+        if (layer < 0 || layer >= n_layers || expert < 0 || expert >= n_expert) {
+            return 0;
+        }
+        return counts[(size_t) layer * n_expert + expert];
+    }
+
+    void record(int layer, int expert) {
+        if (layer < 0 || layer >= n_layers || expert < 0 || expert >= n_expert) {
+            return;
+        }
+        uint32_t & count = counts[(size_t) layer * n_expert + expert];
+        if (count < UINT32_MAX) {
+            count++;
+        }
+    }
+
+    // the experts of one layer, most routed first
+    std::vector<int> hot_experts(int layer, int limit) const {
+        std::vector<int> experts;
+        if (layer < 0 || layer >= n_layers) {
+            return experts;
+        }
+        for (int expert = 0; expert < n_expert; expert++) {
+            if (get(layer, expert) > 0) {
+                experts.push_back(expert);
+            }
+        }
+        std::sort(experts.begin(), experts.end(), [this, layer](int a, int b) {
+            const uint32_t ca = get(layer, a);
+            const uint32_t cb = get(layer, b);
+            if (ca != cb) {
+                return ca > cb;
+            }
+            return a < b;
+        });
+        if ((int) experts.size() > limit) {
+            experts.resize(limit);
+        }
+        return experts;
+    }
+};
+
+static bool moe_cache_profile_load(const char * path, moe_cache_profile & profile) {
+    static const char magic[8] = { 'T', 'Q', 'M', 'O', 'E', 'C', 'P', 'F' };
+
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return false;
+    }
+
+    char     file_magic[8] = {};
+    uint32_t version  = 0;
+    uint32_t n_layers = 0;
+    uint32_t n_expert = 0;
+    uint32_t reserved = 0;
+
+    file.read(file_magic, sizeof(file_magic));
+    file.read((char *) &version,  sizeof(version));
+    file.read((char *) &n_layers, sizeof(n_layers));
+    file.read((char *) &n_expert, sizeof(n_expert));
+    file.read((char *) &reserved, sizeof(reserved));
+
+    if (!file || memcmp(file_magic, magic, sizeof(magic)) != 0 ||
+        version != moe_cache_profile::version ||
+        n_layers == 0 || n_layers > 65535 || n_expert == 0 || n_expert > 65535) {
+        return false;
+    }
+
+    std::vector<uint32_t> counts((size_t) n_layers * n_expert);
+    file.read((char *) counts.data(), (std::streamsize) (counts.size() * sizeof(uint32_t)));
+    if (!file) {
+        return false;
+    }
+
+    profile.n_layers = (int) n_layers;
+    profile.n_expert = (int) n_expert;
+    profile.counts   = std::move(counts);
+    return true;
+}
+
+static bool moe_cache_profile_save(const char * path, const moe_cache_profile & profile) {
+    static const char magic[8] = { 'T', 'Q', 'M', 'O', 'E', 'C', 'P', 'F' };
+
+    if (profile.empty()) {
+        return false;
+    }
+
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file) {
+        return false;
+    }
+
+    const uint32_t version  = moe_cache_profile::version;
+    const uint32_t n_layers = (uint32_t) profile.n_layers;
+    const uint32_t n_expert = (uint32_t) profile.n_expert;
+    const uint32_t reserved = 0;
+
+    file.write(magic, sizeof(magic));
+    file.write((const char *) &version,  sizeof(version));
+    file.write((const char *) &n_layers, sizeof(n_layers));
+    file.write((const char *) &n_expert, sizeof(n_expert));
+    file.write((const char *) &reserved, sizeof(reserved));
+    file.write((const char *) profile.counts.data(),
+               (std::streamsize) (profile.counts.size() * sizeof(uint32_t)));
+    return file.good();
+}
+
 struct moe_cache_config {
     bool enabled = true;
     bool automatic = true;
@@ -184,6 +323,8 @@ struct moe_cache_config {
     bool force_dedicated_mmv = false;
     int overlap_cpu_rows = -1;
     bool overlap_cpu_rows_explicit = false;
+    std::string profile_path;
+    std::string profile_save_path;
     std::string fail_stage;
 };
 
@@ -276,6 +417,11 @@ struct moe_cache_session {
     std::unordered_map<int, int> layer_devices;
     std::unordered_map<const void *, int> tensor_devices;
 
+    // expert profile: the routing counts of an earlier run, and the tensors
+    // whose hot experts were already queued from it
+    moe_cache_profile profile;
+    std::unordered_set<const void *> prefetched_tensors;
+
     std::mutex mu;
     std::mutex fill_mu;
     std::condition_variable cv;
@@ -344,6 +490,7 @@ struct moe_cache_node {
     int64_t n_expert = 0;
     int64_t n_tokens = 0;
     int wtype = -1;
+    int layer = -1;
     std::unique_lock<std::mutex> dispatch_lock;
     moe_cache_pin pins[2 * moe_cache_node_rows_max];
     int n_pins = 0;
@@ -351,8 +498,11 @@ struct moe_cache_node {
     bool dispatched = false;
 };
 
-static std::mutex g_registry_mu;
-static std::unordered_set<moe_cache_session *> g_sessions;
+static void moe_cache_prefetch_profile(
+        moe_cache_session & session, moe_cache_device & device, moe_cache_pool & pool,
+        int pool_index, const void * host_base, int layer, int64_t n_expert);
+
+static std::mutex g_registry_mu;static std::unordered_set<moe_cache_session *> g_sessions;
 static std::atomic<int> g_session_count{0};
 struct moe_cache_physical_budget {
     int participants = 0;
@@ -1600,6 +1750,12 @@ static void * moe_cache_session_create(
             config.max_batch = supplied_config->max_batch;
             config.min_compute_capability = supplied_config->min_compute_capability;
             config.overlap_cpu_rows = supplied_config->overlap_cpu_rows;
+            if (supplied_config->profile_path) {
+                config.profile_path = supplied_config->profile_path;
+            }
+            if (supplied_config->profile_save_path) {
+                config.profile_save_path = supplied_config->profile_save_path;
+            }
         }
         if (!config.enabled) {
             MOE_CACHE_LOG("[moe-cache] disabled by environment (GGML_CUDA_MOE_CACHE=0 or GGML_CUDA_MOE_CACHE_MODE=off)\n");
@@ -1611,6 +1767,17 @@ static void * moe_cache_session_create(
             return nullptr;
         }
         session->config = std::move(config);
+
+        if (!session->config.profile_path.empty()) {
+            if (moe_cache_profile_load(session->config.profile_path.c_str(), session->profile)) {
+                MOE_CACHE_LOG("[moe-cache] loaded expert profile '%s' (%d layers, %d experts)\n",
+                        session->config.profile_path.c_str(),
+                        session->profile.n_layers, session->profile.n_expert);
+            } else {
+                MOE_CACHE_LOG("[moe-cache] could not read the expert profile '%s'\n",
+                        session->config.profile_path.c_str());
+            }
+        }
 
         std::unordered_set<int> seen_devices;
         size_t default_min_expert_bytes = moe_cache_expert_bytes_ampere_min;
@@ -1798,6 +1965,17 @@ static void moe_cache_session_destroy(void * opaque) {
         std::unique_lock<std::mutex> dispatch_lock(device_ptr->dispatch_mu);
         moe_cache_free_device(*device_ptr);
         moe_cache_budget_unregister(*device_ptr);
+    }
+
+    if (!session->config.profile_save_path.empty()) {
+        if (moe_cache_profile_save(session->config.profile_save_path.c_str(), session->profile)) {
+            MOE_CACHE_LOG("[moe-cache] wrote the expert profile '%s' (%d layers, %d experts)\n",
+                    session->config.profile_save_path.c_str(),
+                    session->profile.n_layers, session->profile.n_expert);
+        } else {
+            MOE_CACHE_LOG("[moe-cache] could not write the expert profile '%s'\n",
+                    session->config.profile_save_path.c_str());
+        }
     }
 
     delete session;
@@ -2265,6 +2443,14 @@ static void * moe_cache_begin(
         source->bytes = std::max(source->bytes, tensor_size);
         source->references++;
         session->active_nodes++;
+
+        if (has_layer) {
+            session->profile.ensure_size(layer + 1, (int) n_expert);
+            if (session->prefetched_tensors.insert(host_base).second) {
+                moe_cache_prefetch_profile(
+                        *session, *selected, *pool, pool_index, host_base, layer, n_expert);
+            }
+        }
     }
 
     moe_cache_device & device = *selected;
@@ -2319,6 +2505,7 @@ static void * moe_cache_begin(
     node->n_expert = n_expert;
     node->n_tokens = n_tokens;
     node->wtype = wtype;
+    node->layer = layer;
     node->dispatch_lock = std::move(dispatch_lock);
     return node.release();
 }
@@ -2363,7 +2550,7 @@ static int moe_cache_overlap_rows(const moe_cache_node & node, int n_ids) {
 static int moe_cache_lookup_or_queue_locked(
         moe_cache_session & session, moe_cache_device & device,
         moe_cache_pool & pool, int pool_index, const void * host_base,
-        int32_t expert, size_t expert_size, int & inserts_left,
+        int32_t expert, size_t expert_size, int layer, int & inserts_left,
         bool & wake_worker) {
     const moe_cache_key key{host_base, expert};
     auto found = pool.map.find(key);
@@ -2373,6 +2560,7 @@ static int moe_cache_lookup_or_queue_locked(
     }
 
     moe_cache_demand * demand = nullptr;
+    const bool known = device.demand_count.find(key) != device.demand_count.end();
     try {
         demand = &device.demand_count[key];
     } catch (...) {
@@ -2380,6 +2568,11 @@ static int moe_cache_lookup_or_queue_locked(
         return -1;
     }
     demand->expert_size = expert_size;
+    if (!known && session.profile.get(layer, expert) > 0) {
+        // the expert was hot in the profile: it does not have to wait for the
+        // demand to build up before it is admitted
+        demand->count = 1;
+    }
     if (demand->count < std::numeric_limits<uint16_t>::max()) {
         demand->count++;
     }
@@ -2502,9 +2695,11 @@ static int moe_cache_plan(
             continue;
         }
 
+        session.profile.record(node->layer, expert);
+
         const int slot_index = moe_cache_lookup_or_queue_locked(
                 session, device, pool, node->pool_index,
-                node->host_base, expert, node->expert_size,
+                node->host_base, expert, node->expert_size, node->layer,
                 inserts_left, wake_worker);
         if (slot_index < 0) {
             device.misses++;
@@ -2548,6 +2743,38 @@ static int moe_cache_plan(
         session.cv.notify_all();
     }
     return hits;
+}
+
+// Queue the experts that the profile marks as hot for this layer, so that the
+// pool holds them before the model routes to them. The caller holds the session
+// lock.
+static void moe_cache_prefetch_profile(
+        moe_cache_session & session, moe_cache_device & device, moe_cache_pool & pool,
+        int pool_index, const void * host_base, int layer, int64_t n_expert) {
+    if (session.profile.empty() || layer < 0 || pool.free_slots.empty()) {
+        return;
+    }
+
+    const size_t max_experts = std::min<size_t>(pool.free_slots.size(), 512);
+    const std::vector<int> hot = session.profile.hot_experts(layer, (int) max_experts);
+    if (hot.empty()) {
+        return;
+    }
+
+    int  inserts_left = (int) std::min<size_t>(hot.size(), pool.free_slots.size());
+    bool wake_worker  = false;
+    for (int expert : hot) {
+        if (expert >= n_expert) {
+            continue;
+        }
+        moe_cache_lookup_or_queue_locked(
+                session, device, pool, pool_index, host_base, expert,
+                pool.expert_size, layer, inserts_left, wake_worker);
+    }
+
+    if (wake_worker) {
+        session.cv.notify_all();
+    }
 }
 
 static int moe_cache_dispatch_internal(
@@ -3140,7 +3367,7 @@ static void * moe_cache_fused_begin(
 
                 const int up_slot = moe_cache_lookup_or_queue_locked(
                         *session, *selected, *pool, pool_index,
-                        up->data, expert, up->expert_size,
+                        up->data, expert, up->expert_size, up_layer,
                         inserts_left, wake_worker);
                 if (up_slot >= 0) {
                     moe_cache_slot & slot = pool->slots[up_slot];
@@ -3155,7 +3382,7 @@ static void * moe_cache_fused_begin(
 
                 const int gate_slot = moe_cache_lookup_or_queue_locked(
                         *session, *selected, *pool, pool_index,
-                        gate->data, expert, gate->expert_size,
+                        gate->data, expert, gate->expert_size, up_layer,
                         inserts_left, wake_worker);
                 if (gate_slot >= 0) {
                     moe_cache_slot & slot = pool->slots[gate_slot];

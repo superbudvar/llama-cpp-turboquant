@@ -57,6 +57,8 @@ struct llama_cparams {
     bool     gdn_replay;      // DRC: ingredient-replay rollback instead of full K-snapshots (opt-in)
     enum llama_moe_cache_mode moe_cache_mode;
     size_t moe_cache_budget_mib;
+    const char * moe_cache_profile_path;
+    const char * moe_cache_profile_save_path;
 
     bool mtp_chain;               // DECODER_MTP: chain rows in-graph from the first row's inputs
 

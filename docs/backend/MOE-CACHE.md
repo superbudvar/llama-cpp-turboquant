@@ -123,6 +123,39 @@ By default:
 
 The default maximum is eight tokens. Larger prompt-processing nodes bypass the cache, while single-token decode and current speculative verification batches remain eligible in `auto`, `on`, and fixed-budget modes.
 
+## Expert profile
+
+The cache learns which experts the model routes to. The learning costs hits at the start of a
+session: an expert is only admitted after it was missed once or twice, and its copy to VRAM
+happens in the background, so the first uses of a hot expert are misses.
+
+An expert profile carries the routing counts of an earlier run. With a profile, the experts that
+the model routes to most are queued into the pool as soon as the pool exists, and they are
+admitted without waiting for the demand to build up.
+
+`--moe-cache-profile PATH` reads a profile, `--moe-cache-profile-save PATH` writes the counts of
+the run at teardown. Both take a path; the environment variables are
+`LLAMA_ARG_MOE_CACHE_PROFILE` and `LLAMA_ARG_MOE_CACHE_PROFILE_SAVE`.
+
+The file is a small binary blob: an 8 byte magic (`TQMOECPF`), a version, the layer count, the
+expert count, and one 32 bit counter per layer and expert. The counters are the number of times
+the model routed to that expert of that layer during the run that wrote the file.
+
+A profile is tied to the model that wrote it: the layer and expert counts have to match, and the
+expert indices have to belong to the same model. A profile from another model is ignored with a
+message in the log.
+
+Measured on a 35B A3B MoE model in IQ3_S, one llama task at a time, the same placement in both
+arms, with the cache active:
+
+| run | residency hits | admissions |
+| --- | ---: | ---: |
+| without a profile | 66.5% | 2466 |
+| with the profile of the first run | 82.8% | 44 |
+
+The admissions are the misses that had to be queued and copied; with the profile the hot experts
+are already in the pool.
+
 ## DeepSeek V4 Flash and MXFP4
 
 The DeepSeek V4 Flash GGUF uses the conventional `ffn_gate_exps`, `ffn_up_exps`, and `ffn_down_exps` tensors. These names contain `_exps`, and CPU-resident canonical weights reach the regular `MUL_MAT_ID` path, so the MXFP4 experts are compatible with the cache. For this model, the gate and up projections have `(n_in, n_out) = (4096, 2048)` and the down projection has `(n_in, n_out) = (2048, 4096)`. Each projection occupies 4,456,448 bytes per expert.

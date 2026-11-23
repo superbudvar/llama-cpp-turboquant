@@ -1871,6 +1871,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
         }
     }
     cparams.moe_cache_budget_mib = params.moe_cache.budget_mib;
+    cparams.moe_cache_profile_path = params.moe_cache.profile_path.c_str();
+    cparams.moe_cache_profile_save_path = params.moe_cache.profile_save_path.c_str();
 
     return cparams;
 }
