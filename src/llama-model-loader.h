@@ -115,6 +115,9 @@ struct llama_model_loader {
         std::set<std::string>                  tensors;
     } lazy;
 
+    // keep the MoE expert weights in the canonical layout (the MoE cache reads them by stride)
+    bool canonical_moe_experts = false;
+
     llama_files files;
     llama_ftype ftype;
     llama_fver  fver;

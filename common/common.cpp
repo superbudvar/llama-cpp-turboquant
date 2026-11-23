@@ -1769,6 +1769,9 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
+    // the MoE cache reads the expert weights with their canonical strides, so the
+    // experts stay out of the repacked buffers while the other weights keep theirs
+    mparams.canonical_moe_experts = params.moe_cache.mode != COMMON_MOE_CACHE_MODE_OFF;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;

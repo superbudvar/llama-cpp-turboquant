@@ -1019,7 +1019,7 @@ static void common_params_fit_impl(
         overrides[0] = {common_moe_cache_tensor_override_pattern(), ggml_backend_cpu_buffer_type()};
         overrides[1] = {nullptr, nullptr};
         candidate.tensor_buft_overrides = overrides;
-        candidate.use_extra_bufts = false;
+        candidate.canonical_moe_experts = true;
     };
 
     auto get_cache_candidate_memory = [&](const std::vector<uint32_t> & layers,
@@ -1437,7 +1437,7 @@ static void common_params_fit_impl(
                     }
                     candidate_overrides[n_overrides] = {nullptr, nullptr};
                     candidate.tensor_buft_overrides = candidate_overrides.data();
-                    candidate.use_extra_bufts = false;
+                    candidate.canonical_moe_experts = true;
 
                     // Evaluate memory and cache for this candidate
                     std::vector<ggml_backend_dev_t> candidate_devs;
@@ -1497,7 +1497,7 @@ static void common_params_fit_impl(
                     }
                     tensor_buft_overrides[n_overrides] = {nullptr, nullptr};
                     mparams->tensor_buft_overrides = tensor_buft_overrides;
-                    mparams->use_extra_bufts = false;
+                    mparams->canonical_moe_experts = true;
                     moe_cache->fit_selected = true;
 
                     const int n_kept = total_layers - best_n_evict;

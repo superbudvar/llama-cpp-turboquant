@@ -571,7 +571,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -ngl, --n-gpu-layers <n>                          (default: %s)\n", join(cmd_params_defaults.n_gpu_layers, ",").c_str());
     printf("  -ncmoe, --n-cpu-moe <n>                           (default: %s)\n", join(cmd_params_defaults.n_cpu_moe, ",").c_str());
     printf("  --moe-cache <auto|on|soft|off|0|MiB>             (default: %s)\n", join(cmd_params_defaults.moe_cache, ",").c_str());
-    printf("                                                    on and fixed budgets disable weight repacking\n");
+    printf("                                                    the expert weights keep the canonical layout\n");
     printf("  --repack <auto|on|off|0|1>                    weight repacking policy (default: %s)\n", join(cmd_params_defaults.repack, ",").c_str());
     printf("  -nr, --no-repack                              equivalent to --repack off\n");
     printf("  -sm, --split-mode <none|layer|row|tensor>         (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
@@ -1444,6 +1444,7 @@ struct cmd_params_instance {
         mparams.tensor_split  = tensor_split.data();
         mparams.no_host       = no_host;
         mparams.use_extra_bufts = repack;
+        mparams.canonical_moe_experts = moe_cache != "off";
 
         if (n_cpu_moe <= 0) {
             if (tensor_buft_overrides.empty()) {

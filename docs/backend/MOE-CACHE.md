@@ -59,17 +59,21 @@ To verify the cache actually engaged, look for `[moe-cache] enabled` in the log.
 
 Use `--moe-cache MODE` with programs that use the common argument parser:
 
-| Mode | Cache budget | Weight repacking | Device requirements |
+| Mode | Cache budget | Weight layout | Device requirements |
 | --- | --- | --- | --- |
-| `auto` | Free VRAM minus the reserve | Preserved unless cache-aware fit selects canonical CPU experts | At least one eligible selected CUDA device that clears the 1 GiB automatic slab floor, compute capability 8.0 or newer |
-| `on` | Free VRAM minus the reserve | Disabled | At least one eligible selected CUDA device, compute capability 7.0 or newer |
-| `N` | At most `N` MiB per device, after the reserve | Disabled | Same as `on` |
-| `soft` | Fit first tries spare VRAM with stock placement, evicting experts only as needed | Preserved unless cache-aware fit selects canonical CPU experts | Same as `on` |
-| `off` or `0` | No cache session | Preserved unless changed separately | None |
+| `auto` | Free VRAM minus the reserve | Experts canonical, other weights repacked | At least one eligible selected CUDA device that clears the 1 GiB automatic slab floor, compute capability 8.0 or newer |
+| `on` | Free VRAM minus the reserve | Experts canonical, other weights repacked | At least one eligible selected CUDA device, compute capability 7.0 or newer |
+| `N` | At most `N` MiB per device, after the reserve | Experts canonical, other weights repacked | Same as `on` |
+| `soft` | Fit first tries spare VRAM with stock placement, evicting experts only as needed | Experts canonical, other weights repacked | Same as `on` |
+| `off` or `0` | No cache session | Stock | None |
 
-`auto` is the default. When the complete model fits, or dense weights do not fit without routed experts, normal placement and repacking are preserved. When routed experts must spill and a cache is feasible, cache-aware fit keeps canonical expert weights in host memory, puts all dense layers on the main GPU when possible, and preserves the remaining VRAM for cache pools. Use `on` or a positive budget to force canonical CPU weights when automatic placement is not wanted. `soft` is like `on` with a gentler fit: it first tries to keep stock placement and fit the cache into spare VRAM, evicting experts only as needed. Compute capability floors are evaluated by CUDA and HIP devices; the Metal and Vulkan providers always report Ampere-class capability (800).
+`auto` is the default. When the complete model fits, or dense weights do not fit without routed experts, normal placement is preserved. When routed experts must spill and a cache is feasible, cache-aware fit keeps canonical expert weights in host memory, puts all dense layers on the main GPU when possible, and preserves the remaining VRAM for cache pools. Use `on` or a positive budget to force canonical CPU weights when automatic placement is not wanted. `soft` is like `on` with a gentler fit: it first tries to keep stock placement and fit the cache into spare VRAM, evicting experts only as needed. Compute capability floors are evaluated by CUDA and HIP devices; the Metal and Vulkan providers always report Ampere-class capability (800).
 
-A single device is eligible for `auto` when free VRAM minus the reserve clears the 1 GiB automatic slab floor. Below that floor `auto` stays dormant so small pools do not thrash; shrink `GGML_CUDA_MOE_CACHE_RESERVE_MB` (default 3072 MiB) to give the floor room on a constrained card.
+### Weight layout
+
+The cache reads the expert weights with their canonical strides, so the experts have to stay in a host buffer that keeps the file layout. The CPU weight repacking changes that layout, so the loader keeps the expert tensors out of the repacked buffers when a cache session is possible. The other weights keep the repacked layout, which the CPU matvec kernels use.
+
+A model whose experts are in a type that the CPU repacker does not touch, for example the i-quants, is unaffected: those tensors were canonical already. A model with experts in `Q4_0`, `Q4_K`, `Q5_K`, `Q6_K`, `Q2_K`, `IQ4_NL`, `MXFP4` or `Q8_0` keeps those expert tensors canonical and repacks the rest. Without this, the repacked expert tensors land in the `CPU_REPACK` buffer, which is not host visible, and the eligibility probe rejects them: the cache disables itself while the repacking still costs the CPU its faster matvec path.
 
 A single device is eligible for `auto` when free VRAM minus the reserve clears the 1 GiB automatic slab floor. Below that floor `auto` stays dormant so small pools do not thrash; shrink `GGML_CUDA_MOE_CACHE_RESERVE_MB` (default 3072 MiB) to give the floor room on a constrained card.
 
@@ -162,7 +166,7 @@ Measure this model with three separate `llama-bench` arms and otherwise identica
 
 1. `--moe-cache off --repack on`: optimized CPU-expert baseline.
 2. `--moe-cache off --repack off`: canonical CPU-expert baseline.
-3. `--moe-cache on --repack off`, or a fixed cache budget with `--repack off`: cache arm.
+3. `--moe-cache on --repack on`, or a fixed cache budget: cache arm.
 
 Other programs that use the common argument parser spell the repacking switches as `--repack` and `--no-repack` rather than `--repack on` and `--repack off`.
 
@@ -263,7 +267,7 @@ The following environment variables are implementation controls, not a stable co
 | `GGML_CUDA_MOE_CACHE_OVERLAP_CPU_ROWS` | automatic | Rows retained on CPU only when every row is resident; an explicit value from `0` through `8` overrides the size-aware policy |
 | `GGML_CUDA_MOE_CACHE_MIN_CC` | mode dependent | Override the minimum compute capability encoded as `major * 100 + minor * 10` |
 
-Directly setting `GGML_CUDA_MOE_CACHE_MODE`, `GGML_CUDA_MOE_CACHE`, or `GGML_CUDA_MOE_CACHE_BUDGET_MB` controls the provider only when a program leaves the mode unspecified. Common applications do this for their implicit `auto` default, so provider settings affect fit and runtime consistently. An explicit `--moe-cache` or `LLAMA_ARG_MOE_CACHE` value takes precedence and also controls the model loader's repacking choice. `llama-bench` applies its selected cache arm before every model instance and overwrites the three raw backend variables; use `--moe-cache` or `LLAMA_ARG_MOE_CACHE` to select its benchmark mode.
+Directly setting `GGML_CUDA_MOE_CACHE_MODE`, `GGML_CUDA_MOE_CACHE`, or `GGML_CUDA_MOE_CACHE_BUDGET_MB` controls the provider only when a program leaves the mode unspecified. Common applications do this for their implicit `auto` default, so provider settings affect fit and runtime consistently. An explicit `--moe-cache` or `LLAMA_ARG_MOE_CACHE` value takes precedence and also selects the expert weight layout. `llama-bench` applies its selected cache arm before every model instance and overwrites the three raw backend variables; use `--moe-cache` or `LLAMA_ARG_MOE_CACHE` to select its benchmark mode.
 
 Keep `GGML_OP_OFFLOAD_MIN_BATCH` above the decode batch size. Setting it to `1` can make the scheduler offload the complete `MUL_MAT_ID` operation to the GPU before the CPU path can split cache hits from misses.
 
@@ -299,7 +303,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 ./build/bin/llama-bench \
     -sm layer -ts 1/0/0 --moe-cache off,4096 --repack off -v -o json
 ```
 
-Adjust `4096` to the intended per-device MiB cap. A layer split with trailing zero shares keeps dense work on the first GPU while still creating every selected backend for cache use. `-sm none` creates only the main backend and is not a valid multi-GPU cache-capacity comparison. `llama-bench` records the effective repack setting and rejects repacking with cache `on` or a fixed budget.
+Adjust `4096` to the intended per-device MiB cap. A layer split with trailing zero shares keeps dense work on the first GPU while still creating every selected backend for cache use. `-sm none` creates only the main backend and is not a valid multi-GPU cache-capacity comparison. `llama-bench` records the effective repack setting.
 
 Use a long enough timed generation to amortize graph discovery and inspect both throughput variation and the final cache counters. Repeat the process after a cold process start when cold-start behavior matters. Do not infer a gain from hit rate alone: activation transfers, result transfers, fill traffic, GPU speed, PCIe speed, and CPU memory bandwidth all affect the result.
 

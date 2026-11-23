@@ -1023,7 +1023,7 @@ const struct ggml_tensor * llama_model_loader::check_tensor_dims(
 }
 
 // checks if the weight tensor can be used with the specified buffer type and device
-static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w, ggml_op op, ggml_backend_buffer_type_t buft, ggml_backend_dev_t dev) {
+static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w, ggml_op op, ggml_backend_buffer_type_t buft, ggml_backend_dev_t dev, bool canonical_moe_experts) {
     GGML_ASSERT(w != nullptr);
 
     if (op == GGML_OP_NONE) {
@@ -1159,6 +1159,15 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
             GGML_ABORT("%s: missing test for op %s for tensor %s", __func__, ggml_op_name(op), w->name);
     }
 
+    // The MoE cache reads the expert weights with their canonical strides, so the
+    // experts have to stay in a host buffer. The CPU repack buffer is not host
+    // visible and stores a different layout, so it cannot hold the experts.
+    if (canonical_moe_experts && op == GGML_OP_MUL_MAT_ID &&
+        ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU &&
+        !ggml_backend_buft_is_host(buft)) {
+        return false;
+    }
+
     // create a temporary dummy buffer for the weight so that supports_op can check the buffer type
     GGML_ASSERT(w->buffer == nullptr);
     w->buffer = ggml_backend_buft_alloc_buffer(buft, 0);
@@ -1170,12 +1179,12 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
 }
 
 // find the first buffer type in the list that can use the tensor
-static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op, const buft_list_t * buft_list) {
+static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op, const buft_list_t * buft_list, bool canonical_moe_experts) {
     GGML_ASSERT(!buft_list->empty());
     for (const auto & cur : *buft_list) {
         ggml_backend_dev_t cur_dev = cur.first;
         ggml_backend_buffer_type_t cur_buft = cur.second;
-        if (weight_buft_supported(hparams, tensor, op, cur_buft, cur_dev)) {
+        if (weight_buft_supported(hparams, tensor, op, cur_buft, cur_dev, canonical_moe_experts)) {
             return cur_buft;
         }
     }
@@ -1345,7 +1354,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 if (std::regex_search(tensor_name, pattern)) {
                     if (overrides->buft == ggml_backend_cpu_buffer_type()) {
                         // when overriding to a CPU buffer, consider the extra buffer types
-                        buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+                        buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu, canonical_moe_experts);
                         if (use_mmap) {
                             static std::once_flag once;
                             std::call_once(once, [] {
@@ -1366,7 +1375,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         if (!buft) {
-            buft = select_weight_buft(hparams, t_meta, op, buft_list);
+            buft = select_weight_buft(hparams, t_meta, op, buft_list, canonical_moe_experts);
             if (!buft) {
                 throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
             }

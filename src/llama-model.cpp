@@ -1768,6 +1768,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (load_mode = %s)\n",
         __func__, load_mode_name);
 
+    if (ml.canonical_moe_experts && hparams.n_expert > 0) {
+        LLAMA_LOG_INFO("%s: keeping the MoE expert weights in the canonical layout (the MoE cache reads them by stride)\n",
+            __func__);
+    }
+
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
     for (const auto & dev : devices) {
@@ -3689,6 +3694,7 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.canonical_moe_experts       =*/ false,
     };
 
     return result;
