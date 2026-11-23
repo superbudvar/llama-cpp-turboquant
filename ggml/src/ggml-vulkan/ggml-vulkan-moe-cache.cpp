@@ -967,6 +967,16 @@ static void * vk_moe_session_create(void * const * backends, int n_backends,
         // first begin; a context that never uses the cache allocates none.
         session->devices.push_back(std::move(dev));
 
+        // On UMA the host weights are already in the device memory, so there is
+        // no transfer for the cache to remove.
+        if (session->devices.back()->host_mapped) {
+            if (config.automatic) {
+                MOE_CACHE_LOG("[moe-cache] session dormant: the device memory is host visible, there is no transfer to cache\n");
+                return nullptr;
+            }
+            MOE_CACHE_LOG("[moe-cache] the device memory is host visible, the cache has no transfer to remove\n");
+        }
+
         moe_cache_session * result = session.get();
         try {
             std::lock_guard<std::mutex> lock(g_registry_mu);

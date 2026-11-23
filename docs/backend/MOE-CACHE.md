@@ -88,7 +88,7 @@ With default settings, a node must satisfy all of these conditions:
 - The operation is the regular CPU `MUL_MAT_ID` path with F32 activations, optionally in an exact supported gate/up/SwiGLU subgraph.
 - The weight tensor name contains `_exps` or `_chexps`.
 - The weight type is supported by the backend quantized matvec kernel.
-- One expert meets the selected devices' effective size floor. The default is 512 KiB when every selected device is compute capability 8.0 or newer and 1 MiB otherwise. An explicit threshold remains authoritative.
+- One expert meets the selected devices' effective size floor. The default is 512 KiB when every selected device is compute capability 8.0 or newer and 1 MiB otherwise. An explicit threshold remains authoritative. The floor never exceeds the largest expert slab of the model, so a model whose experts are all smaller than the floor is still served: the floor exists to skip the experts that do not pay for their transfer, not to exclude a model completely.
 - The graph node contains no more than the configured maximum token batch and no more than 64 routed rows. The default maximum is eight tokens in every active mode.
 - The selected device can hold a pool of at least 64 experts of that shape. Entries are aggregated across same-shape tensors, so an individual tensor may contain fewer than 64 experts.
 - In `auto`, each selected device has at least 1 GiB available for aggregate cache slabs after dispatch scratch. Forced modes retain the 64-slot floor for explicit capacity experiments.
@@ -259,6 +259,13 @@ The Ampere admission floor is 512 KiB rather than the earlier permissive 64 KiB.
 Automatic policy also requires at least 1 GiB of aggregate slab capacity per device. On OLMoE Q2_K, 160, 256, and 512 MiB caps regressed to 179.66, 203.12, and 235.29 t/s because small pools thrashed. A 640 MiB cap reached parity at 245.25 t/s, 768 MiB reached 254.21 t/s, and 1 GiB reached 268.89 t/s. This device-level floor does not replace the 64-slot shape floor: Llama-4's 22.5 MiB experts require more than 1 GiB to hold 64 slots, and 70 slots per device still improved decode from 25.97 to 31.21 t/s. Fixed modes remain available for deliberate smaller-capacity sweeps.
 
 Prompt processing remained on the stock path. In a reverse-order Qwen3.6 2048-token prompt test, auto reached 589.07 t/s and off reached 589.38 t/s, a 0.05% difference. A dense Qwen3.5-4B control reached 182.05 t/s in auto versus 182.68 t/s off. These small differences are within run variation and show that dormant or bypassed operation does not impose a material throughput cost on the tested system.
+
+### Devices without a transfer
+
+The cache removes a host to device transfer of the expert weights. A device whose memory is host
+visible, a unified memory device, has no such transfer: the host weights are already in the
+device memory. The Vulkan provider detects that case and declines the automatic mode, and warns
+in the explicit modes.
 
 ## Concurrency, fallback, and lifetime
 

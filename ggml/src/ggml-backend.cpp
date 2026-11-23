@@ -2575,7 +2575,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
 void ggml_backend_sched_set_moe_cache(
         ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode, size_t budget_mib,
-        const char * profile_path, const char * profile_save_path) {
+        const char * profile_path, const char * profile_save_path,
+        size_t min_expert_bytes) {
     GGML_ASSERT(sched);
     if (mode == GGML_MOE_CACHE_MODE_UNSPECIFIED && !profile_path && !profile_save_path) {
         // the scheduler already created a session with the provider defaults
@@ -2611,6 +2612,11 @@ void ggml_backend_sched_set_moe_cache(
         provider_tried = true;
         config.profile_path = profile_path;
         config.profile_save_path = profile_save_path;
+        if (min_expert_bytes > 0) {
+            // the caller resolved the floor against the model
+            config.min_expert_bytes = min_expert_bytes;
+            config.min_expert_explicit = 1;
+        }
         void * session = api.session_create(cache_backends, sched->n_backends, &config);
         if (session) {
             sched->moe_cache_session = session;

@@ -759,7 +759,8 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
 static bool llama_model_has_cacheable_moe_weights(const llama_model &                 model,
                                                   llama_moe_cache_mode                mode,
                                                   size_t                              budget_mib,
-                                                  const std::vector<ggml_backend_t> & backends) {
+                                                  const std::vector<ggml_backend_t> & backends,
+                                                  size_t * effective_min_expert_bytes = nullptr) {
     // Probe the provider that owns the model's backends; fall back to the
     // thread's active provider (first registered).
     ggml_moe_cache_api api = ggml_moe_cache_active();
@@ -822,7 +823,24 @@ static bool llama_model_has_cacheable_moe_weights(const llama_model &           
             continue;
         }
         largest_expert_bytes = std::max(largest_expert_bytes, tensor->nb[2]);
-        if (tensor->nb[2] < min_expert_bytes) {
+    }
+    // the floor cannot be larger than the experts of the model itself, or the
+    // model would be excluded by a threshold that none of its experts reaches
+    const size_t floor_bytes = std::min(min_expert_bytes, largest_expert_bytes);
+    if (effective_min_expert_bytes) {
+        *effective_min_expert_bytes = floor_bytes;
+    }
+
+    for (const auto & entry : model.tensors_by_name) {
+        const std::string & name   = entry.first;
+        const ggml_tensor * tensor = entry.second;
+        if (!tensor || (name.find("_exps") == std::string::npos &&
+                        name.find("_chexps") == std::string::npos) ||
+            ggml_n_dims(tensor) != 3 || tensor->ne[0] <= 0 ||
+            tensor->ne[1] <= 0 || tensor->ne[2] <= 0) {
+            continue;
+        }
+        if (tensor->nb[2] < floor_bytes) {
             continue;
         }
 
@@ -843,7 +861,7 @@ static bool llama_model_has_cacheable_moe_weights(const llama_model &           
         }
     }
     LLAMA_LOG_INFO("%s: MoE cache disabled (no cacheable expert tensors found; largest expert slab=%zu KiB, minimum=%zu KiB)\n",
-            __func__, largest_expert_bytes >> 10, min_expert_bytes >> 10);
+            __func__, largest_expert_bytes >> 10, floor_bytes >> 10);
     return false;
 }
 
@@ -858,8 +876,10 @@ void llama_context::sched_new(const sched_params & params) {
     sched.reset(ggml_backend_sched_new(
             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), params.max_nodes, params.parallel, params.op_offload));
 
+    size_t moe_cache_min_expert_bytes = 0;
     const bool moe_cache_eligible = llama_model_has_cacheable_moe_weights(
-        model, (llama_moe_cache_mode) cparams.moe_cache_mode, cparams.moe_cache_budget_mib, backend_ptrs);
+        model, (llama_moe_cache_mode) cparams.moe_cache_mode, cparams.moe_cache_budget_mib, backend_ptrs,
+        &moe_cache_min_expert_bytes);
     const ggml_moe_cache_mode moe_cache_mode =
         moe_cache_eligible ? (ggml_moe_cache_mode) cparams.moe_cache_mode : GGML_MOE_CACHE_MODE_OFF;
     const char * moe_cache_requested = "provider";
@@ -879,7 +899,8 @@ void llama_context::sched_new(const sched_params & params) {
     LLAMA_LOG_INFO("%s: MoE cache requested=%s resolved=%s\n", __func__, moe_cache_requested,
                    moe_cache_eligible ? moe_cache_requested : "off");
     ggml_backend_sched_set_moe_cache(sched.get(), moe_cache_mode, cparams.moe_cache_budget_mib,
-            cparams.moe_cache_profile_path, cparams.moe_cache_profile_save_path);
+            cparams.moe_cache_profile_path, cparams.moe_cache_profile_save_path,
+            moe_cache_eligible ? moe_cache_min_expert_bytes : 0);
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
@@ -964,8 +985,6 @@ void llama_context::sched_reserve() {
                     /*.parallel   =*/ false,
                     /*.op_offload =*/ cparams.op_offload,
                 });
-                ggml_backend_sched_set_moe_cache(sched.get(), moe_cache_mode, cparams.moe_cache_budget_mib,
-                        cparams.moe_cache_profile_path, cparams.moe_cache_profile_save_path);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {

@@ -498,7 +498,7 @@ struct moe_cache_node {
     bool dispatched = false;
 };
 
-static void moe_cache_prefetch_profile(
+static int moe_cache_prefetch_profile(
         moe_cache_session & session, moe_cache_device & device, moe_cache_pool & pool,
         int pool_index, const void * host_base, int layer, int64_t n_expert);
 
@@ -2446,9 +2446,12 @@ static void * moe_cache_begin(
 
         if (has_layer) {
             session->profile.ensure_size(layer + 1, (int) n_expert);
-            if (session->prefetched_tensors.insert(host_base).second) {
-                moe_cache_prefetch_profile(
+            if (session->prefetched_tensors.find(host_base) == session->prefetched_tensors.end()) {
+                const int queued = moe_cache_prefetch_profile(
                         *session, *selected, *pool, pool_index, host_base, layer, n_expert);
+                if (queued > 0) {
+                    session->prefetched_tensors.insert(host_base);
+                }
             }
         }
     }
@@ -2747,22 +2750,23 @@ static int moe_cache_plan(
 
 // Queue the experts that the profile marks as hot for this layer, so that the
 // pool holds them before the model routes to them. The caller holds the session
-// lock.
-static void moe_cache_prefetch_profile(
+// lock. Returns the number of experts that were queued.
+static int moe_cache_prefetch_profile(
         moe_cache_session & session, moe_cache_device & device, moe_cache_pool & pool,
         int pool_index, const void * host_base, int layer, int64_t n_expert) {
     if (session.profile.empty() || layer < 0 || pool.free_slots.empty()) {
-        return;
+        return 0;
     }
 
     const size_t max_experts = std::min<size_t>(pool.free_slots.size(), 512);
     const std::vector<int> hot = session.profile.hot_experts(layer, (int) max_experts);
     if (hot.empty()) {
-        return;
+        return 0;
     }
 
     int  inserts_left = (int) std::min<size_t>(hot.size(), pool.free_slots.size());
     bool wake_worker  = false;
+    const int queued   = inserts_left;
     for (int expert : hot) {
         if (expert >= n_expert) {
             continue;
@@ -2775,6 +2779,7 @@ static void moe_cache_prefetch_profile(
     if (wake_worker) {
         session.cv.notify_all();
     }
+    return queued - inserts_left;
 }
 
 static int moe_cache_dispatch_internal(
@@ -3288,6 +3293,7 @@ static void * moe_cache_fused_begin(
     node->n_expert = up->n_expert;
     node->n_tokens = n_tokens;
     node->wtype = up->type;
+    node->layer = up_layer;
     node->dispatch_lock = std::move(dispatch_lock);
     node->planned = true;
 
@@ -3310,6 +3316,7 @@ static void * moe_cache_fused_begin(
                 if (expert < 0 || expert >= up->n_expert) {
                     continue;
                 }
+                session->profile.record(up_layer, expert);
                 const auto up_found = pool->map.find({up->data, expert});
                 const auto gate_found = pool->map.find({gate->data, expert});
                 if (up_found != pool->map.end() &&
