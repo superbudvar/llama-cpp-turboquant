@@ -1,9 +1,16 @@
 # Inkling 2 Mini on RDNA3: notes for this branch
 
-This branch carries experimental patches on top of `b12600` that make Inkling 2 Mini
+This branch carries experimental patches on top of the upstream sync base
+`sync/upstream-8d60873df` (the merge of upstream master `8d60873df` into the
+TurboQuant fork) that make Inkling 2 Mini
 (`inkling2_loop`) faster and able to run longer contexts on an AMD RX 7900 XTX through
 HIP/ROCm. It is not an upstream PR. It is shared so people can see the numbers, try
 it, and reuse whatever is useful.
+
+The numbers below were measured on the older `b12600` base. The port to the sync base
+was verified on an RX 9060 XT (gfx1200): the perplexity at `-c 4096` stays within 0.03%
+of the sync base (5.2322 against 5.2366), and the full `test-backend-ops` sweep and
+`test-ink-rel-bias` pass.
 
 Tested only on: RX 7900 XTX (gfx1100, 24 GB), ROCm 7.2.1, Ubuntu 24.04 container,
 `ggml-org/Inkling-2-Mini-GGUF` IQ4_NL with `mmproj-F16`. **Not tested on NVIDIA** or on
