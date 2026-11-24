@@ -1419,29 +1419,6 @@ struct ggml_tensor_extra_gpu {
 struct ggml_cuda_graph;
 struct ggml_cuda_stream_context;
 
-// q8_1 copies of single-column matmul inputs, reused within one graph evaluation (see mmvq.cu)
-struct ggml_cuda_q8_cache {
-    static constexpr int     n_slots   = 4;
-    static constexpr int64_t max_ne10  = 8192;
-    static constexpr size_t  slot_size = max_ne10/QK8_1*sizeof(block_q8_1);
-
-    struct slot {
-        const ggml_tensor * t      = nullptr;
-        const void *        data   = nullptr;
-        size_t              nbytes = 0;
-        int64_t             ne10   = 0;
-        size_t              nb1    = 0;
-        uint64_t            epoch  = 0;
-        uint64_t            used   = 0;
-    };
-
-    slot     slots[n_slots];
-    char *   buf   = nullptr; // device memory, freed with the context
-    uint64_t epoch  = 1;
-    uint64_t tick   = 0;
-    bool     bypass = false; // set while the graph runs branches on concurrent streams
-};
-
 struct ggml_backend_cuda_context {
     int device;
     std::string name;

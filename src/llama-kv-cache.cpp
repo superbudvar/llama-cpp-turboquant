@@ -4016,4 +4016,3 @@ void llama_kv_cache_context::set_input_cell_pos(ggml_tensor * dst, const llama_u
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
     kv->get_prev_tokens(ubatch, n, res);
 }
-}
