@@ -102,12 +102,12 @@ Using the `-d <n>` option, each test can be run at a specified context depth, pr
 
 `--repack <auto|on|off>` selects the weight repacking policy (default: `auto`). The legacy values `0` and `1` are still accepted and mean `off` and `auto`. `-nr` and `--no-repack` replace the repack policy with `off`. Like the other list-valued options, `--repack` accepts several policies, and each policy runs as a separate test.
 
-The repacking policy and the MoE cache mode interact. The MoE cache reads the expert weights with their canonical strides, so the canonical weights are required when the cache is active:
+The repacking policy and the MoE cache mode interact. The MoE cache reads the expert weights with their canonical strides, so the expert weights keep the canonical layout when a cache mode is active:
 
-- `--moe-cache auto`, `off` and `soft` keep the repacking policy.
-- `--moe-cache on` and a fixed MiB budget force the canonical weights and disable the repacking. `--repack on` is an error for these modes.
+- `--moe-cache off` keeps the repacking policy.
+- `--moe-cache auto`, `soft` and `on`, and a fixed MiB budget, keep the expert weights canonical and let every other weight keep the repacked layout.
 
-The `soft` mode keeps the policy because it can run with the stock placement. The fit planner disables the repacking itself when it selects a placement that evicts experts.
+The fit planner sets the same canonical expert layout when it selects a cache-aware placement.
 
 Use `--repack off` for a canonical-weight baseline, for example `--moe-cache off,4096 --repack off`.
 

@@ -310,10 +310,6 @@ static std::string parse_moe_cache_mode(const std::string & value) {
     return std::to_string(budget_mb);
 }
 
-static bool moe_cache_mode_forces_canonical_weights(const std::string & mode) {
-    return mode == "on" || (mode != "auto" && mode != "off" && mode != "soft");
-}
-
 static common_moe_cache_params common_moe_cache_from_bench_mode(const std::string & mode) {
     common_moe_cache_params result;
     result.mode_explicit = true;
@@ -346,13 +342,9 @@ static std::string parse_repack_mode(const std::string & value) {
     throw std::invalid_argument("expected auto, on, off, 0, or 1");
 }
 
-static bool get_effective_repack(const std::string & cache_mode, const std::string & repack_mode) {
-    if (moe_cache_mode_forces_canonical_weights(cache_mode)) {
-        if (repack_mode == "on") {
-            throw std::invalid_argument("repack=on is incompatible with MoE cache on or a fixed cache budget");
-        }
-        return false;
-    }
+static bool get_effective_repack(const std::string & repack_mode) {
+    // the MoE cache modes keep the expert weights canonical, so the other
+    // weights can keep the repacked layout
     return repack_mode != "off";
 }
 
@@ -1382,18 +1374,6 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
         params.n_gen_warmup = 0;
     }
 
-    // reject repack policies that the MoE cache modes cannot support
-    for (const auto & cache_mode : params.moe_cache) {
-        for (const auto & repack_mode : params.repack) {
-            try {
-                (void) get_effective_repack(cache_mode, repack_mode);
-            } catch (const std::invalid_argument & e) {
-                fprintf(stderr, "error: %s\n", e.what());
-                exit(1);
-            }
-        }
-    }
-
     return params;
 }
 
@@ -1580,7 +1560,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .embeddings            = */ embd,
                 /* .no_op_offload         = */ nopo,
                 /* .no_host               = */ noh,
-                /* .repack                = */ get_effective_repack(mc, rpk),
+                /* .repack                = */ get_effective_repack(rpk),
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
             };
@@ -1620,7 +1600,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .embeddings            = */ embd,
                 /* .no_op_offload         = */ nopo,
                 /* .no_host               = */ noh,
-                /* .repack                = */ get_effective_repack(mc, rpk),
+                /* .repack                = */ get_effective_repack(rpk),
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
             };
@@ -1660,7 +1640,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .embeddings            = */ embd,
                 /* .no_op_offload         = */ nopo,
                 /* .no_host               = */ noh,
-                /* .repack                = */ get_effective_repack(mc, rpk),
+                /* .repack                = */ get_effective_repack(rpk),
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
             };
@@ -2276,8 +2256,7 @@ struct markdown_printer : public printer {
         if (params.no_host.size() > 1 || params.no_host != cmd_params_defaults.no_host) {
             fields.emplace_back("no_host");
         }
-        if (params.repack_explicit || params.repack.size() > 1 || params.repack != cmd_params_defaults.repack ||
-            std::any_of(params.moe_cache.begin(), params.moe_cache.end(), moe_cache_mode_forces_canonical_weights)) {
+        if (params.repack_explicit || params.repack.size() > 1 || params.repack != cmd_params_defaults.repack) {
             fields.emplace_back("repack");
         }
         if (params.fit_params_target.size() > 1 || params.fit_params_target != cmd_params_defaults.fit_params_target) {
